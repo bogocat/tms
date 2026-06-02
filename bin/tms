@@ -778,7 +778,7 @@ issue_preview() {
 
     echo "── Issue: $gh_repo#$num ──"
     echo ""
-    gh issue view "$num" --repo "$gh_repo" --json title,body,labels,state,url 2>/tmp/tms-preview-gh-err.log | \
+    gh issue view "$num" --repo "$gh_repo" --json title,body,labels,state,url 2>/dev/null | \
         python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -788,12 +788,12 @@ print(f\"URL:    {d['url']}\")
 print(f\"Labels: {' '.join(l['name'] for l in d.get('labels',[]))}\")
 print()
 print(d.get('body','')[:2000])
-" 2>/tmp/tms-preview-py-err.log
+" 2>/dev/null
 
     echo ""
     echo "── Linked PRs ──"
     gh pr list --repo "$gh_repo" --state open --search "issue:$num" \
-        --json number,title,reviewDecision,url 2>/tmp/tms-preview-gh2-err.log | \
+        --json number,title,reviewDecision,url 2>/dev/null | \
         python3 -c "
 import json, sys
 prs = json.load(sys.stdin)
@@ -803,7 +803,7 @@ for pr in prs:
     rd = pr.get('reviewDecision','') or 'open'
     print(f\"  PR #{pr['number']}: {pr['title']} ({rd})\")
     print(f\"  {pr['url']}\")
-" 2>/tmp/tms-preview-py2-err.log
+" 2>/dev/null
 
     echo ""
     echo "── Active Agent Sessions ──"
@@ -903,18 +903,16 @@ issue_browser() {
 
     local selected
     stty -ixon 2>/dev/null  # enable ctrl+s passthrough
-    export -f issue_preview issue_repos _cached_session_map _issue_session_map
     selected=$(echo "$issue_data" | fzf \
-        --with-shell='bash -c' \
         --header="$fzf_header" \
         --header-first \
         --ansi \
         --no-sort \
-        --preview="issue_preview '{}'" \
+        --preview="tms --preview {}" \
         --preview-window='right:60%:wrap' \
         --bind="enter:accept" \
         --bind="ctrl-o:execute(gh issue view \$(echo {2} | tr -d '#') --web 2>/dev/null)" \
-        --bind="ctrl-p:execute(issue_preview '{}' | less -R)" \
+        --bind="ctrl-p:execute(tms --preview {} | less -R)" \
         --bind="ctrl-e:execute(repo={1}; iss=\$(echo {2} | tr -d '#'); pr=\$(gh pr list --repo bogocat/\$repo --search \"issue:\$iss\" --json number --jq '.[0].number' 2>/dev/null); if [[ -n \"\$pr\" ]]; then tmq review \$repo \$pr; else echo \"No linked PR found for \$repo#\$iss\"; fi)" \
         --bind="ctrl-s:reload(tms ls | tail -n +3)+change-header(sessions: enter=attach  ctrl-x/d=kill  ctrl-k=clean  ctrl-i=issues  ?=help)+change-preview(name=\"\$(echo {} | sed 's/.*\\t//')\"; tmux capture-pane -t \"\$name\" -p -S -40 2>/dev/null | sed 's/^/  /')" \
         --bind="?:execute(printf '%s\n\n' 'KEYBINDINGS' '-----------' 'enter      dispatch agent (via tmq)' 'ctrl-o     open issue in browser' 'ctrl-p     full preview' 'ctrl-e     code review linked PR' 'ctrl-s     back to sessions' 'ctrl-r     force refresh (skip cache)' '?          this help' 'esc        cancel' '' 'STATUS LEGEND (ST column)' '------------------------' '○ dim      open, no agent' '● cyan     active agent, no PR yet' '▶ blue     PR open, not reviewed' '◎ yellow   pending review' '✔ green    reviewed or ready to merge' '✗ red      blocked' '? magenta  question' | less -R)" \
@@ -1051,9 +1049,7 @@ case "${1:-}" in
         fi
 
         stty -ixon 2>/dev/null  # enable ctrl+s passthrough
-        export -f issue_preview issue_repos _cached_session_map _issue_session_map
         selected=$(session_list | fzf \
-            --with-shell='bash -c' \
             --header='enter:attach  ctrl-x/d:kill  ctrl-r:rename  ctrl-k:clean  ctrl-p:peek  ctrl-i:issues  ?:help  esc:cancel' \
             --header-first \
             --ansi \
@@ -1066,7 +1062,7 @@ case "${1:-}" in
             --bind="ctrl-r:become(stty sane; real=\$(echo {} | sed 's/.*\t//'); tms rename \$real; exec tms)" \
             --bind="ctrl-p:execute(real=\$(echo {} | sed 's/.*\t//'); tmux capture-pane -t \"\$real\" -p -S -40 | less -R)" \
             --bind="ctrl-k:execute(tms clean --yes)+reload(tms ls | tail -n +3)" \
-            --bind="ctrl-i:reload(tms issues --raw --all)+change-header(issues (all repos): enter=dispatch  ctrl-o=browser  ctrl-p=preview  ctrl-s=back  ?=help  esc=cancel)+change-preview(issue_preview \"{}\")" \
+            --bind="ctrl-i:reload(tms issues --raw --all)+change-header(issues (all repos): enter=dispatch  ctrl-o=browser  ctrl-p=preview  ctrl-s=back  ?=help  esc=cancel)+change-preview(tms --preview {})" \
             --bind="ctrl-s:reload(tms ls | tail -n +3)+change-header(enter:attach  ctrl-x/d:kill  ctrl-r:rename  ctrl-k:clean  ctrl-p:peek  ctrl-i:issues  ?:help  esc:cancel)+change-preview(name=\"\$(echo {} | sed 's/.*\\t//')\"; tmux capture-pane -t \"\$name\" -p -S -40 2>/dev/null | sed 's/^/  /')" \
             --bind="?:execute(printf '%s\n\n' 'KEYBINDINGS' '-----------' 'enter      attach to session' 'ctrl-x/d   kill session' 'ctrl-r     rename session' 'ctrl-k     clean stale' 'ctrl-i     browse issues' 'ctrl-s     back to sessions' 'ctrl-p     peek terminal' '?          this help' 'esc        cancel' | less -R)" \
             --tac)
@@ -1083,6 +1079,9 @@ case "${1:-}" in
                 attach_session "$real_name"
             fi
         fi
+        ;;
+    --preview)
+        issue_preview "${2:-}"
         ;;
     *)
         echo "Usage: tms [ls|kill <name>|rename <name>|stale|clean|compact|issues [repo|--all|--force]|issues --clear-cache]"
