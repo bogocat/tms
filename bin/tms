@@ -778,7 +778,7 @@ issue_preview() {
 
     echo "── Issue: $gh_repo#$num ──"
     echo ""
-    gh issue view "$num" --repo "$gh_repo" --json title,body,labels,state,url 2>/dev/null | \
+    gh issue view "$num" --repo "$gh_repo" --json title,body,labels,state,url 2>/tmp/tms-preview-gh-err.log | \
         python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -788,12 +788,12 @@ print(f\"URL:    {d['url']}\")
 print(f\"Labels: {' '.join(l['name'] for l in d.get('labels',[]))}\")
 print()
 print(d.get('body','')[:2000])
-" 2>/dev/null
+" 2>/tmp/tms-preview-py-err.log
 
     echo ""
     echo "── Linked PRs ──"
     gh pr list --repo "$gh_repo" --state open --search "issue:$num" \
-        --json number,title,reviewDecision,url 2>/dev/null | \
+        --json number,title,reviewDecision,url 2>/tmp/tms-preview-gh2-err.log | \
         python3 -c "
 import json, sys
 prs = json.load(sys.stdin)
@@ -803,7 +803,7 @@ for pr in prs:
     rd = pr.get('reviewDecision','') or 'open'
     print(f\"  PR #{pr['number']}: {pr['title']} ({rd})\")
     print(f\"  {pr['url']}\")
-" 2>/dev/null
+" 2>/tmp/tms-preview-py2-err.log
 
     echo ""
     echo "── Active Agent Sessions ──"
