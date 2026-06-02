@@ -905,6 +905,7 @@ issue_browser() {
     stty -ixon 2>/dev/null  # enable ctrl+s passthrough
     export -f issue_preview issue_repos _cached_session_map _issue_session_map
     selected=$(echo "$issue_data" | fzf \
+        --with-shell='bash -c' \
         --header="$fzf_header" \
         --header-first \
         --ansi \
@@ -1052,6 +1053,7 @@ case "${1:-}" in
         stty -ixon 2>/dev/null  # enable ctrl+s passthrough
         export -f issue_preview issue_repos _cached_session_map _issue_session_map
         selected=$(session_list | fzf \
+            --with-shell='bash -c' \
             --header='enter:attach  ctrl-x/d:kill  ctrl-r:rename  ctrl-k:clean  ctrl-p:peek  ctrl-i:issues  ?:help  esc:cancel' \
             --header-first \
             --ansi \
