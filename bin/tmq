@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+# tmq — tmux agent queue: spawn a coding agent on a GitHub issue
+#
+# Usage:
+#   tmq <repo> <issue-number> [--agent cc|pi|oc] [--type feature|fix|chore|review]
+#   tmq list                          list known repos
+#   tmq review <repo> <pr-number>     spawn a code review agent on a PR
+#
+# Examples:
+#   tmq distillery 245                  # pi on distillery#245 (default agent)
+#   tmq home-portal 57 --agent cc      # claude on home-portal#57
+#   tmq tower-fleet 78 --type review   # PR review on tower-fleet#78
+#   tmq scripts 5 --type fix           # bugfix on bogocat/scripts#5
+#
+# For feature work on repos that need worktrees (distillery, home-portal,
+# scripts), tmq automatically creates a git worktree. For fixes/chores on
+# main, it uses the main checkout directly.
+
+set -euo pipefail
+
+# ── repo registry ────────────────────────────────────────────────
+# Format: short_name:local_path:github_repo:needs_worktree
+
+declare -A REPO_PATH REPO_GH REPO_WORKTREE
+
+add_repo() {
+    local name=$1 path=$2 gh=$3 wt=${4:-0}
+    REPO_PATH[$name]="$path"
+    REPO_GH[$name]="$gh"
+    REPO_WORKTREE[$name]="$wt"
+}
+
+add_repo distillery   /root/projects/distillery    bogocat/distillery    1
+add_repo home-portal  /root/projects/home-portal   bogocat/home-portal   1
+add_repo tower-fleet  /root/tower-fleet            bogocat/tower-fleet   0
+add_repo scripts      /root/scripts                bogocat/scripts       1
+add_repo palimpsest   /root/projects/palimpsest    bogocat/palimpsest    0
+add_repo rms          /root/projects/rms           bogocat/openrms       0
+add_repo deploy       /root/deploy/distillery      bogocat/distillery    0
+add_repo frame-cache  /root/projects/framecache    bogocat/framecache    0
+
+# ── defaults ─────────────────────────────────────────────────────
+
+DEFAULT_AGENT="pi"
+ISSUE_TYPE="feature"   # feature | fix | chore | review
+
+# ── help ─────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'EOF'
+tmq — spawn a coding agent on a GitHub issue
+
+Usage:
+  tmq <repo> <issue> [--agent cc|pi|oc] [--type feature|fix|chore|review]
+  tmq list
+  tmq review <repo> <pr-number> [--agent cc|pi|oc]
+
+Repos:
+  distillery    home-portal   tower-fleet   scripts
+  palimpsest    rms           deploy        frame-cache
+
+Agents:
+  pi    Pi Coding Agent (default, auto mode)
+  cc    Claude Code (auto mode)
+  oc    Opencode
+
+Types:
+  feature   new feature branch + worktree (default)
+  fix       bugfix, typically on main
+  chore     maintenance, on main
+  review    PR code review (use 'tmq review' shorthand)
+
+EOF
+    exit 0
+}
+
+list_repos() {
+    printf "%-15s %-45s %s\n" "REPO" "PATH" "WORKTREE?"
+    printf "%s\n" "──────────────────────────────────────────────────────────────"
+    for name in "${!REPO_PATH[@]}"; do
+        local wt="no"
+        (( REPO_WORKTREE[$name] == 1 )) && wt="yes"
+        printf "%-15s %-45s %s\n" "$name" "${REPO_PATH[$name]}" "$wt"
+    done
+}
+
+# ── helpers ──────────────────────────────────────────────────────
+
+slugify() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
+}
+
+next_scratch_name() {
+    local prefix=$1
+    local max=-1
+    while IFS= read -r name; do
+        [[ "$name" =~ ^${prefix}([0-9]+)$ ]] || continue
+        local n=${BASH_REMATCH[1]}
+        (( n > max )) && max=$n
+    done <<< "$(tmux list-sessions -F "#{session_name}" 2>/dev/null)"
+    echo "${prefix}$((max + 1))"
+}
+
+# ── issue fetching ───────────────────────────────────────────────
+
+fetch_issue() {
+    local repo=$1 number=$2
+    local gh_repo="${REPO_GH[$repo]}"
+
+    gh issue view "$number" --repo "$gh_repo" --json title,body,labels,state,url 2>/dev/null \
+        || { echo "ERROR: Could not fetch $gh_repo#$number"; exit 1; }
+}
+
+fetch_pr() {
+    local repo=$1 number=$2
+    local gh_repo="${REPO_GH[$repo]}"
+
+    gh pr view "$number" --repo "$gh_repo" --json title,body,state,url,additions,deletions,files 2>/dev/null \
+        || { echo "ERROR: Could not fetch PR $gh_repo#$number"; exit 1; }
+}
+
+# ── prompt construction ──────────────────────────────────────────
+
+build_prompt() {
+    local repo=$1 number=$2 type=$3
+
+    if [[ "$type" == "review" ]]; then
+        local pr_json
+        pr_json=$(fetch_pr "$repo" "$number")
+        local title url state adds dels
+        title=$(echo "$pr_json" | jq -r '.title')
+        url=$(echo "$pr_json" | jq -r '.url')
+        state=$(echo "$pr_json" | jq -r '.state')
+        adds=$(echo "$pr_json" | jq -r '.additions')
+        dels=$(echo "$pr_json" | jq -r '.deletions')
+        local body
+        body=$(echo "$pr_json" | jq -r '.body')
+
+        cat <<PROMPT
+## Code Review: ${REPO_GH[$repo]}#$number
+
+**PR:** $title
+**URL:** $url
+**State:** $state (+$adds -$dels)
+
+### PR Description
+$body
+
+### Review Instructions
+1. Check out the PR branch and review the diff
+2. Evaluate: correctness, architecture, security, performance, test coverage
+3. Classify issues as P0 (must fix), P1 (should fix), P2 (nice to have)
+4. Focus on logic errors and design flaws over style nits
+5. Output a structured review: Summary / P0 Issues / P1 Issues / P2 Notes / Overall
+PROMPT
+    else
+        local issue_json
+        issue_json=$(fetch_issue "$repo" "$number")
+        local title url state labels
+        title=$(echo "$issue_json" | jq -r '.title')
+        url=$(echo "$issue_json" | jq -r '.url')
+        state=$(echo "$issue_json" | jq -r '.state')
+        labels=$(echo "$issue_json" | jq -r '.labels[].name' 2>/dev/null | tr '\n' ' ')
+        local body
+        body=$(echo "$issue_json" | jq -r '.body')
+
+        local type_instruction
+        case "$type" in
+            feature)
+                type_instruction="Implement this feature. Use a feature branch, commit incrementally, and create a PR when done."
+                ;;
+            fix)
+                type_instruction="Fix this bug. Work on main (or a short-lived fix branch). Commit the fix."
+                ;;
+            chore)
+                type_instruction="Complete this maintenance task. Work directly on main."
+                ;;
+        esac
+
+        cat <<PROMPT
+## $type: ${REPO_GH[$repo]}#$number
+
+**Title:** $title
+**URL:** $url
+**State:** $state
+**Labels:** $labels
+
+### Issue Description
+$body
+
+### Instructions
+$type_instruction
+
+Repository: $repo (${REPO_PATH[$repo]})
+Follow the project conventions in CLAUDE.md and institutional memory.
+PROMPT
+    fi
+}
+
+# ── session spawn ────────────────────────────────────────────────
+
+spawn_agent() {
+    local session_name=$1 cwd=$2 prompt=$3 agent=$4 branch=$5
+
+    # Write prompt to file for reference and @file import
+    local prompt_file="/tmp/tmq-prompt-${session_name}.txt"
+    echo "$prompt" > "$prompt_file"
+
+    # Convert agent shorthand
+    local aoe_tool
+    case "$agent" in
+        cc) aoe_tool="claude" ;;
+        pi) aoe_tool="pi" ;;
+        oc) aoe_tool="opencode" ;;
+    esac
+
+    # Build full command line (prompt injection)
+    local cmd_override
+    case "$agent" in
+        cc) cmd_override="claude --dangerously-skip-permissions -p \$(cat '$prompt_file' | jq -Rs .); echo; echo '--- CLAUDE DONE ---'; exec bash" ;;
+        pi) cmd_override="pi @$prompt_file; echo; echo '--- PI DONE ---'; exec bash" ;;
+        oc) cmd_override="cat '$prompt_file' | opencode 2>&1; echo; echo '--- OPENCODE DONE ---'; exec bash" ;;
+    esac
+
+    # Use Agent of Empires if available (session appears in aoe dashboard + web)
+    if command -v aoe &>/dev/null; then
+        local wt_flag=""
+        [[ -n "$branch" ]] && wt_flag="-w $branch"
+
+        aoe add "$cwd" -t "$session_name" --tool "$aoe_tool" \
+            $wt_flag -l --trust-hooks \
+            --cmd-override "$cmd_override" 2>&1
+        echo "Spawned: $session_name ($agent in $cwd) [via aoe]"
+        echo "Prompt:   $prompt_file"
+        echo "Monitor:  aoe status"
+        echo "Attach:   aoe session attach $session_name"
+    else
+        # Fallback: direct tmux spawn (no aoe dashboard visibility)
+        case "$agent" in
+            cc)
+                tmux new-session -d -s "$session_name" -c "$cwd" \
+                    "claude --dangerously-skip-permissions -p \$(cat '$prompt_file' | jq -Rs .); echo; echo '--- CLAUDE DONE ---'; exec bash"
+                ;;
+            pi)
+                tmux new-session -d -s "$session_name" -c "$cwd" \
+                    "pi @$prompt_file; echo; echo '--- PI DONE ---'; exec bash"
+                ;;
+            oc)
+                tmux new-session -d -s "$session_name" -c "$cwd" \
+                    "cat '$prompt_file' | opencode 2>&1; echo; echo '--- OPENCODE DONE ---'; exec bash"
+                ;;
+        esac
+        echo "Spawned: $session_name ($agent in $cwd)"
+        echo "Prompt:   $prompt_file"
+        echo "Attach:   tmux a -t $session_name"
+    fi
+}
+
+# ── worktree management ──────────────────────────────────────────
+
+# Global: set by create_worktree, read by main() for aoe integration
+TMQ_BRANCH=""
+
+create_worktree() {
+    local repo=$1 issue_num=$2 type=$3
+    local path="${REPO_PATH[$repo]}"
+
+    # Only create worktrees for feature branches on worktree repos
+    if (( REPO_WORKTREE[$repo] != 1 )); then
+        git -C "$path" checkout main >/dev/null 2>&1 || true
+        TMQ_BRANCH=""
+        echo "$path"
+        return
+    fi
+
+    if [[ "$type" != "feature" ]]; then
+        git -C "$path" checkout main >/dev/null 2>&1 || true
+        git -C "$path" pull --ff-only >/dev/null 2>&1 || true
+        TMQ_BRANCH=""
+        echo "$path"
+        return
+    fi
+
+    # Feature branch: create worktree
+    local issue_json title branch slug wt_path
+    issue_json=$(fetch_issue "$repo" "$issue_num")
+    title=$(echo "$issue_json" | jq -r '.title')
+    branch="feat/issue-${issue_num}-$(slugify "$title" | cut -c1-30)"
+    TMQ_BRANCH="$branch"
+    slug="wt-${repo}-${issue_num}"
+    wt_path="/root/wt-${slug}"
+
+    # Check if worktree already exists
+    if [[ -d "$wt_path" ]]; then
+        echo "Worktree already exists: $wt_path" >&2
+        echo "$wt_path"
+        return
+    fi
+
+    echo "Creating worktree: $wt_path" >&2
+    echo "  branch: $branch" >&2
+
+    # Ensure main is clean (silence all output to stderr or null)
+    git -C "$path" fetch origin >/dev/null 2>&1
+    git -C "$path" checkout main >/dev/null 2>&1 || true
+    git -C "$path" pull --ff-only origin main >/dev/null 2>&1 || true
+
+    # Create branch from main and worktree
+    git -C "$path" branch "$branch" main >/dev/null 2>&1 || true
+    git -C "$path" worktree add "$wt_path" "$branch" >/dev/null 2>&1
+
+    # Install deps in worktree (per institutional memory gotcha)
+    if [[ -f "$wt_path/package.json" ]]; then
+        echo "  installing deps..." >&2
+        (cd "$wt_path" && bun install --frozen-lockfile >/dev/null 2>&1 || bun install >/dev/null 2>&1) &
+    fi
+
+    echo "$wt_path"
+}
+
+# ── main ─────────────────────────────────────────────────────────
+
+main() {
+    # Parse -- flags
+    local agent="$DEFAULT_AGENT"
+    local type="$ISSUE_TYPE"
+    local repo="" number=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --agent) agent="$2"; shift 2 ;;
+            --type)  type="$2"; shift 2 ;;
+            -h|--help) usage ;;
+            *)
+                if [[ -z "$repo" ]]; then
+                    repo="$1"
+                elif [[ -z "$number" ]]; then
+                    number="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate repo
+    if [[ -z "${REPO_PATH[$repo]:-}" ]]; then
+        echo "Unknown repo: $repo"
+        echo "Known repos: ${!REPO_PATH[*]}"
+        exit 1
+    fi
+
+    # Validate number
+    if [[ -z "$number" ]] || ! [[ "$number" =~ ^[0-9]+$ ]]; then
+        echo "Missing or invalid issue number: ${number:-}"
+        usage
+    fi
+
+    # Validate agent
+    case "$agent" in
+        cc|pi|oc) ;;
+        *) echo "Unknown agent: $agent (use cc, pi, or oc)"; exit 1 ;;
+    esac
+
+    # Validate type
+    case "$type" in
+        feature|fix|chore|review) ;;
+        *) echo "Unknown type: $type (use feature, fix, chore, or review)"; exit 1 ;;
+    esac
+
+    echo "=== tmq: $type ${REPO_GH[$repo]}#$number ($agent) ==="
+
+    # Fetch issue/PR info for display
+    if [[ "$type" == "review" ]]; then
+        local pr_json title
+        pr_json=$(fetch_pr "$repo" "$number")
+        title=$(echo "$pr_json" | jq -r '.title')
+        echo "PR: $title"
+        echo "URL: $(echo "$pr_json" | jq -r '.url')"
+    else
+        local issue_json title
+        issue_json=$(fetch_issue "$repo" "$number")
+        title=$(echo "$issue_json" | jq -r '.title')
+        echo "Issue: $title"
+        echo "URL: $(echo "$issue_json" | jq -r '.url')"
+    fi
+
+    # Set up working directory (worktree for features)
+    local cwd
+    cwd=$(create_worktree "$repo" "$number" "$type")
+
+    # Build the prompt
+    local prompt
+    prompt=$(build_prompt "$repo" "$number" "$type")
+
+    # Determine session name
+    local session_name
+    case "$type" in
+        review) session_name="review-${repo}#${number}" ;;
+        feature) session_name="feat-${repo}#${number}" ;;
+        fix) session_name="fix-${repo}#${number}" ;;
+        chore) session_name="chore-${repo}#${number}" ;;
+    esac
+
+    # Abbreviate agent in session name
+    case "$agent" in
+        cc) session_name="${session_name}-cc" ;;
+        pi) session_name="${session_name}" ;;     # default, no suffix
+        oc) session_name="${session_name}-oc" ;;
+    esac
+
+    # Spawn (via aoe if available, direct tmux fallback)
+    spawn_agent "$session_name" "$cwd" "$prompt" "$agent" "$TMQ_BRANCH"
+}
+
+# ── dispatch ─────────────────────────────────────────────────────
+
+case "${1:-}" in
+    list|ls)
+        list_repos
+        ;;
+    review|pr)
+        shift
+        main "${@}" --type review
+        ;;
+    -h|--help)
+        usage
+        ;;
+    *)
+        if [[ -z "${1:-}" ]]; then
+            usage
+        fi
+        main "$@"
+        ;;
+esac

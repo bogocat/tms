@@ -1,0 +1,5 @@
+[session]
+default_tool = "pi"
+
+[worktree]
+enabled = false

@@ -1,0 +1,699 @@
+#!/usr/bin/env bash
+# tms — tmux session manager with fuzzy preview
+#
+# Usage:
+#   tms                interactive picker → attach
+#   tms ls             list sessions with metadata
+#   tms kill <name>    kill a session
+#   tms rename <name>  rename a session
+#   tms clean          kill stale + compact scratch session numbers
+#   tms stale          list sessions idle >7 days (checks ALL windows)
+#   tms issues [repo]  browse open GitHub issues + dispatch to agents
+#
+# Keybindings in fzf:
+#   enter     attach to session (switch client)
+#   ctrl-x/d  kill session (with confirmation)
+#   ctrl-r    rename session
+#   ctrl-p    preview only (peek without attaching)
+#   ctrl-k    clean stale sessions + compact scratch numbers
+#   ?         show help in preview pane
+
+set -euo pipefail
+
+STALE_DAYS=7
+NOW=$(date +%s)
+
+# ── helpers ──────────────────────────────────────────────────────
+
+session_age_seconds() {
+    local created
+    created=$(tmux display-message -t "$1" -p '#{session_created}' 2>/dev/null) || echo 0
+    echo $((NOW - created))
+}
+
+session_age_human() {
+    local secs=$1
+    if   (( secs < 3600 ));       then echo "$((secs / 60))m ago"
+    elif (( secs < 86400 ));      then echo "$((secs / 3600))h ago"
+    elif (( secs < 604800 ));     then echo "$((secs / 86400))d ago"
+    else                               echo "$((secs / 604800))w ago"
+    fi
+}
+
+detect_agent() {
+    local cmd=$1
+    case "$cmd" in
+        pi)       echo "π" ;;
+        claude)   echo "cc" ;;
+        opencode) echo "oc" ;;
+        python3)  echo "py" ;;
+        bash)     echo "sh" ;;
+        zsh)      echo "sh" ;;
+        *)        echo "${cmd:0:3}" ;;
+    esac
+}
+
+# Check ALL panes in ALL windows. A session is stale only if every
+# pane is sitting at a shell prompt and the session is old + unattached.
+is_session_stale() {
+    local name=$1
+    local age_sec attached
+
+    age_sec=$(session_age_seconds "$name")
+    (( age_sec <= STALE_DAYS * 86400 )) && return 1
+
+    attached=$(tmux list-sessions -F "#{session_attached}" -f "#{==:#{session_name},$name}" 2>/dev/null)
+    (( attached > 0 )) && return 1
+
+    # Check every pane — if ANY pane is running something non-shell, it's active
+    local panes
+    panes=$(tmux list-panes -t "$name" -F "#{pane_current_command}" 2>/dev/null) || return 1
+
+    while IFS= read -r cmd; do
+        [[ -z "$cmd" ]] && continue
+        case "$cmd" in
+            bash|zsh|fish|sh|dash) ;;  # shell prompt = idle
+            *) return 1 ;;              # anything else = active work
+        esac
+    done <<< "$panes"
+
+    return 0  # all panes idle → stale
+}
+
+# ── session metadata ─────────────────────────────────────────────
+
+session_info() {
+    local name=$1
+    local cmd cwd attached wins age_sec
+
+    cmd=$(tmux list-panes -t "$name" -F "#{pane_current_command}" 2>/dev/null | head -1)
+    cwd=$(tmux list-panes -t "$name" -F "#{pane_current_path}" 2>/dev/null | head -1)
+    attached=$(tmux list-sessions -F "#{session_attached}" -f "#{==:#{session_name},$name}" 2>/dev/null)
+    wins=$(tmux list-sessions -F "#{session_windows}" -f "#{==:#{session_name},$name}" 2>/dev/null)
+    age_sec=$(session_age_seconds "$name")
+
+    # Shorten cwd
+    local short_cwd="$cwd"
+    short_cwd="${short_cwd/#\/root/}"
+    short_cwd="${short_cwd/#\/home/}"
+    [[ -z "$short_cwd" ]] && short_cwd="/"
+    short_cwd="${short_cwd#/}"
+
+    local agent_icon
+    agent_icon=$(detect_agent "$cmd")
+
+    local att_marker=" "
+    (( attached > 0 )) && att_marker="*"
+
+    local age_str
+    age_str=$(session_age_human "$age_sec")
+
+    local stale_flag=" "
+    if is_session_stale "$name"; then
+        stale_flag="⚰"
+    fi
+
+    # Show window count and what each window is doing
+    local win_summary=""
+    if (( wins > 1 )); then
+        local win_cmds
+        win_cmds=$(tmux list-windows -t "$name" -F "#{window_index}:#{pane_current_command}" 2>/dev/null | tr '\n' ' ')
+        win_summary=" [$win_cmds]"
+    fi
+
+    # Detect linked issue from session name (feat-<repo>#<num>, fix-<repo>#<num>)
+    local issue="—"
+    if [[ "$name" =~ ^(feat|fix|chore|review)-(.+)#([0-9]+) ]]; then
+        issue="${BASH_REMATCH[2]}#${BASH_REMATCH[3]}"
+    fi
+
+    printf "%-20s %s%-1s %-2s %-4s %-6s %-16s %s%s\n" \
+        "$name" "$att_marker" "$agent_icon" "$wins" "$age_str" "$stale_flag" "$issue" "$short_cwd" "$win_summary"
+}
+
+session_list() {
+    printf "%-20s %-4s %-2s %-5s %-7s %-16s %s\n" "SESSION" " " "AG" "WINS" "AGE" "ISSUE" "CWD"
+    printf "%s\n" "──────────────────────────────────────────────────────────────────────"
+
+    local sessions
+    sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | sort)
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        session_info "$name"
+    done <<< "$sessions"
+}
+
+# ── actions ──────────────────────────────────────────────────────
+
+attach_session() {
+    local name=$1
+    if [[ -n "${TMUX:-}" ]]; then
+        tmux switch-client -t "$name"
+    else
+        tmux attach-session -t "$name"
+    fi
+}
+
+kill_session() {
+    local name=$1 force="${2:-}"
+    if [[ "$force" == "--force" ]]; then
+        tmux kill-session -t "$name" 2>/dev/null && echo "Killed $name." || echo "Failed to kill $name."
+        return
+    fi
+    printf "Kill session '%s'? [y/N] " "$name"
+    read -r ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        tmux kill-session -t "$name" 2>/dev/null && echo "Killed." || echo "Failed."
+    fi
+}
+
+rename_session() {
+    local name=$1
+    printf "New name for '%s': " "$name"
+    read -r newname
+    if [[ -n "$newname" ]]; then
+        tmux rename-session -t "$name" "$newname" 2>/dev/null && echo "Renamed to $newname." || echo "Failed."
+    fi
+}
+
+# ── stale detection (all windows) ────────────────────────────────
+
+stale_sessions() {
+    printf "%-20s %-7s %-4s %s\n" "SESSION" "AGE" "WINS" "WINDOWS"
+    printf "%s\n" "──────────────────────────────────────────────────"
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        if is_session_stale "$name"; then
+            local age_sec wins cwd
+            age_sec=$(session_age_seconds "$name")
+            wins=$(tmux list-sessions -F "#{session_windows}" -f "#{==:#{session_name},$name}" 2>/dev/null)
+            cwd=$(tmux list-panes -t "$name" -F "#{pane_current_path}" 2>/dev/null | head -1)
+            local win_detail
+            win_detail=$(tmux list-windows -t "$name" -F "#{window_index}:#{pane_current_command}" 2>/dev/null | tr '\n' ' ')
+            printf "%-20s %-7s %-4s %s  (%s)\n" \
+                "$name" "$(session_age_human "$age_sec")" "$wins" "$cwd" "$win_detail"
+        fi
+    done <<< "$(tmux list-sessions -F "#{session_name}" 2>/dev/null | sort)"
+}
+
+# ── compact scratch sessions ─────────────────────────────────────
+
+# After killing stale sessions, renumber single-letter-prefix sessions
+# so they're contiguous.  c0,c4,c5 → c0,c1,c2.  Skips attached sessions.
+compact_scratch_sessions() {
+    local prefixes=()
+
+    # Find which single-letter prefixes exist
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        if [[ "$name" =~ ^([a-z])([0-9]+)$ ]]; then
+            local p="${BASH_REMATCH[1]}"
+            # Only collect each prefix once
+            [[ " ${prefixes[*]:-} " != *" $p "* ]] && prefixes+=("$p")
+        fi
+    done <<< "$(tmux list-sessions -F "#{session_name}" 2>/dev/null)"
+
+    for prefix in "${prefixes[@]}"; do
+        local -a remaining=()
+        while IFS= read -r name; do
+            [[ -z "$name" ]] && continue
+            if [[ "$name" =~ ^${prefix}[0-9]+$ ]]; then
+                remaining+=("$name")
+            fi
+        done <<< "$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^${prefix}[0-9]\+$" | sort -V)"
+
+        local idx=0
+        local renamed=0
+        for s in "${remaining[@]}"; do
+            local target="${prefix}${idx}"
+            if [[ "$s" != "$target" ]]; then
+                local att
+                att=$(tmux list-sessions -F "#{session_attached}" -f "#{==:#{session_name},$s}" 2>/dev/null)
+                if (( att > 0 )); then
+                    echo "  skip $s → $target (attached, rename manually)"
+                else
+                    tmux rename-session -t "$s" "$target" 2>/dev/null && \
+                        echo "  $s → $target" && renamed=1
+                fi
+            fi
+            ((idx++))
+        done
+        (( renamed )) && echo "  (${prefix}* compacted)" || true
+    done
+}
+
+# ── issue browser ─────────────────────────────────────────────────
+# tms issues — browse open GitHub issues across repos with pipeline
+# status (open / in progress / pending review / ready to merge).
+
+# Repo registry (mirrors tmq's REPO_GH for GH API)
+issue_repos() {
+    cat <<'EOF'
+distillery:bogocat/distillery
+home-portal:bogocat/home-portal
+tower-fleet:bogocat/tower-fleet
+scripts:bogocat/scripts
+palimpsest:bogocat/palimpsest
+rms:bogocat/openrms
+EOF
+}
+
+# Fetch issues + PRs for a single repo, output NDJSON with pipeline status
+fetch_repo_issues() {
+    local short=$1 gh_repo=$2
+    local tmp=/tmp/tms-issues-$$-$short
+
+    # Fetch open issues + PRs to temp files
+    gh issue list --repo "$gh_repo" --state open \
+        --limit 50 --json number,title,labels,url,createdAt > "$tmp.issues" 2>/dev/null || return
+
+    gh pr list --repo "$gh_repo" --state open \
+        --limit 50 --json number,title,body,headRefName,reviewDecision,url > "$tmp.prs" 2>/dev/null || echo '[]' > "$tmp.prs"
+
+    # Single python pass: enrich issues with PR status
+    python3 - "$tmp.issues" "$tmp.prs" "$short" << 'PYEOF'
+import json, sys, re
+
+with open(sys.argv[1]) as f:
+    issues = json.load(f)
+with open(sys.argv[2]) as f:
+    prs = json.load(f)
+short_name = sys.argv[3]
+
+pr_status = {}
+for pr in prs:
+    # Branch: feat/issue-68-*
+    m = re.search(r'issue-(\d+)', pr.get('headRefName',''))
+    if not m:
+        # Title: "... (#68)"
+        m = re.search(r'\(#(\d+)\)', pr.get('title',''))
+    if not m:
+        # Body: closes/fixes/resolves #68
+        m = re.search(r'(?:close|fix|resolve)[sd]?\s+#(\d+)', pr.get('body',''), re.I)
+    if m:
+        num = int(m.group(1))
+        rd = pr.get('reviewDecision','') or ''
+        status = 'in progress'
+        if rd == 'APPROVED': status = 'ready-to-merge'
+        elif rd in ('REVIEW_REQUIRED','CHANGES_REQUESTED'): status = 'pending-review'
+        pr_status[num] = (pr['number'], status)
+
+for iss in issues:
+    num = iss['number']
+    labels = ' '.join(l['name'] for l in iss.get('labels',[]))
+    status = pr_status.get(num, (None, 'open issue'))[1]
+    out = {
+        'repo': short_name,
+        'number': num,
+        'title': iss['title'],
+        'labels': labels,
+        'status': status,
+    }
+    print(json.dumps(out))
+PYEOF
+    rm -f "$tmp.issues" "$tmp.prs"
+}
+
+# Fetch all issues across repos, output NDJSON
+# Optional $1 filters to a single repo shortname
+fetch_all_issues() {
+    local filter="${1:-}"
+    while IFS=: read -r short gh_repo; do
+        [[ -n "$filter" && "$short" != "$filter" ]] && continue
+        fetch_repo_issues "$short" "$gh_repo" 2>/dev/null
+    done <<< "$(issue_repos)"
+}
+
+# Build session → issue mapping (JSON: repo#num → [agent info])
+_issue_session_map() {
+    local tmp="/tmp/tms-session-map-$$.json"
+    python3 - "$tmp" << 'PYEOF'
+import json, subprocess, re, os, sys
+
+def shell(cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.stdout.strip()
+
+ICONS = {'pi': 'π', 'claude': 'cc', 'opencode': 'oc', 'python3': 'py', 'bash': 'sh', 'zsh': 'sh'}
+REPOS = ['home-portal', 'distillery', 'tower-fleet', 'scripts', 'palimpsest', 'rms', 'deploy']
+
+# Aoe session data (for branch info)
+aoe_data = {}
+try:
+    for s in json.loads(shell(['aoe', 'list', '--json'])):
+        aoe_data[s['title']] = {'tool': s.get('tool',''), 'branch': (s.get('worktree') or {}).get('branch',''), 'path': s.get('path','')}
+except: pass
+
+sessions = [s for s in shell(['tmux', 'list-sessions', '-F', '#{session_name}']).split('\n') if s]
+mapping = {}
+
+for session in sessions:
+    icon = ICONS.get(shell(['tmux','display-message','-t',session,'-p','#{pane_current_command}']), '?')
+
+    # tmq sessions: feat|fix|chore|review-<repo>#<num>[-cc|-oc]
+    m = re.match(r'(feat|fix|chore|review)-(.+?)#(\d+)(-cc|-oc)?$', session)
+    if m:
+        key = f'{m.group(2)}#{m.group(3)}'
+        mapping.setdefault(key, []).append(f'{session} {icon}')
+        continue
+
+    # aoe sessions: aoe_<title>_<uuid>
+    if session.startswith('aoe_'):
+        parts = session.split('_')
+        if len(parts) >= 3:
+            title = '_'.join(parts[1:-1])
+            info = aoe_data.get(title, {})
+            bm = re.match(r'(feat|fix|chore|review)/issue-(\d+)', info.get('branch',''))
+            if bm:
+                num = bm.group(2)
+                path = info.get('path','')
+                repo_name = os.path.basename(path.rstrip('/'))
+                for r in REPOS:
+                    if f'/{r}' in path:
+                        repo_name = r; break
+                key = f'{repo_name}#{num}'
+                mapping.setdefault(key, []).append(f'{session} {icon}')
+        continue
+
+    # scratch: c<n>, o<n>, p<n>
+    m = re.match(r'^([cop])(\d+)$', session)
+    if not m: continue
+    cwd = shell(['tmux','display-message','-t',session,'-p','#{pane_current_path}'])
+    if not cwd or not os.path.isdir(os.path.join(cwd,'.git')): continue
+    branch = shell(['git','-C',cwd,'branch','--show-current'])
+    bm = re.match(r'(feat|fix|chore|review)/issue-(\d+)', branch)
+    if not bm: continue
+    num = bm.group(2)
+    repo_name = os.path.basename(cwd.rstrip('/'))
+    for r in REPOS:
+        if cwd.endswith(f'/{r}') or f'/{r}-worktrees/' in cwd or f'/{r}/' in cwd:
+            repo_name = r; break
+    key = f'{repo_name}#{num}'
+    mapping.setdefault(key, []).append(f'{session} {icon}')
+
+with open(sys.argv[1], 'w') as f:
+    json.dump(mapping, f)
+PYEOF
+    echo "$tmp"
+}
+
+# Format issues for display (fzf input)
+issue_list() {
+    local repo_filter="${1:-}"
+
+    # Build session map (identifies which agents work on which issues)
+    local map_file
+    map_file=$(_issue_session_map)
+
+    printf "%-15s %-5s %-14s %-18s %s\n" "REPO" "#" "STATUS" "AGENT" "TITLE"
+    printf "%s\n" "─────────────────────────────────────────────────────────────────"
+
+    fetch_all_issues "$repo_filter" | while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local repo num title status
+        repo=$(echo "$line" | python3 -c "import json,sys;print(json.load(sys.stdin)['repo'])" 2>/dev/null)
+        num=$(echo "$line" | python3 -c "import json,sys;print(json.load(sys.stdin)['number'])" 2>/dev/null)
+        title=$(echo "$line" | python3 -c "import json,sys;print(json.load(sys.stdin)['title'])" 2>/dev/null)
+        status=$(echo "$line" | python3 -c "import json,sys;print(json.load(sys.stdin)['status'])" 2>/dev/null)
+        [[ -z "$repo" ]] && continue
+
+        # Look up agent sessions for this issue
+        local agent_col="—"
+        if [[ -s "$map_file" ]]; then
+            local sessions_json
+            sessions_json=$(python3 -c "
+import json
+m = json.load(open('$map_file'))
+key = '${repo}#${num}'
+print(json.dumps(m.get(key, [])))
+" 2>/dev/null)
+            if [[ "$sessions_json" != "[]" && -n "$sessions_json" ]]; then
+                # Format: "session1 icon1, session2 icon2"
+                agent_col=$(echo "$sessions_json" | python3 -c "
+import json, sys
+items = json.load(sys.stdin)
+print(', '.join(items[:2]))  # max 2 sessions shown
+" 2>/dev/null)
+            fi
+        fi
+
+        local status_disp
+        case "$status" in
+            "open issue")     status_disp="open issue   " ;;
+            "ready-to-merge") status_disp="ready2merge  " ;;
+            "pending-review") status_disp="pending revw " ;;
+            *)                 status_disp="in progress  " ;;
+        esac
+
+        printf "%-15s %-5s %-14s %-18s %s\n" \
+            "$repo" "#$num" "$status_disp" "$agent_col" "$title"
+    done
+
+    rm -f "$map_file"
+}
+
+# Issue preview (body + linked PRs)
+issue_preview() {
+    local line=$1 repo num
+    repo=$(echo "$line" | awk '{print $1}')
+    num=$(echo "$line" | awk '{print $2}' | tr -d '#')
+
+    local gh_repo
+    gh_repo=$(issue_repos | grep "^${repo}:" | cut -d: -f2)
+
+    echo "── Issue: $gh_repo#$num ──"
+    echo ""
+    gh issue view "$num" --repo "$gh_repo" --json title,body,labels,state,url 2>/dev/null | \
+        python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(f\"Title:  {d['title']}\")
+print(f\"State:  {d['state']}\")
+print(f\"URL:    {d['url']}\")
+print(f\"Labels: {' '.join(l['name'] for l in d.get('labels',[]))}\")
+print()
+print(d.get('body','')[:2000])
+" 2>/dev/null
+
+    echo ""
+    echo "── Linked PRs ──"
+    gh pr list --repo "$gh_repo" --state open --search "issue:$num" \
+        --json number,title,reviewDecision,url 2>/dev/null | \
+        python3 -c "
+import json, sys
+prs = json.load(sys.stdin)
+if not prs:
+    print('(no linked PRs)')
+for pr in prs:
+    rd = pr.get('reviewDecision','') or 'open'
+    print(f\"  PR #{pr['number']}: {pr['title']} ({rd})\")
+    print(f\"  {pr['url']}\")
+" 2>/dev/null
+
+    echo ""
+    echo "── Active Agent Sessions ──"
+    local map_file2
+    map_file2=$(_issue_session_map 2>/dev/null)
+    if [[ -s "$map_file2" ]]; then
+        python3 -c "
+import json
+m = json.load(open('$map_file2'))
+key = '${repo}#${num}'
+sessions = m.get(key, [])
+if not sessions:
+    print('(no active agent sessions)')
+else:
+    for s in sessions:
+        print(f'  {s}')
+" 2>/dev/null
+        rm -f "$map_file2"
+    else
+        echo "(no active agent sessions)"
+    fi
+}
+
+# Interactive issue browser (fzf picker)
+issue_browser() {
+    local repo_filter="${1:-}"
+
+    if ! command -v fzf &>/dev/null; then
+        echo "fzf not found. Install with: apt install fzf"
+        echo ""
+        echo "Available issues:"
+        issue_list "$repo_filter"
+        exit 1
+    fi
+
+    if ! command -v tmq &>/dev/null; then
+        echo "tmq not found (needed to dispatch issues)"
+        exit 1
+    fi
+
+    echo "Fetching issues..." >&2
+    local issue_data
+    issue_data=$(issue_list "$repo_filter")
+
+    # If no TTY, just print the list
+    if [[ ! -t 0 ]]; then
+        echo "$issue_data"
+        return
+    fi
+
+    local selected
+    selected=$(echo "$issue_data" | fzf \
+        --header='enter:dispatch  ctrl-o:browser  ctrl-p:preview  ctrl-s:sessions  ?:help  esc:cancel' \
+        --header-first \
+        --ansi \
+        --no-sort \
+        --preview="issue_preview '{}'" \
+        --preview-window='right:60%:wrap' \
+        --bind="enter:accept" \
+        --bind="ctrl-o:execute(gh issue view \$(echo {2} | tr -d '#') --web 2>/dev/null)" \
+        --bind="ctrl-p:execute(issue_preview '{}' | less -R)" \
+        --bind="ctrl-s:reload(tms ls | tail -n +3)+change-header(sessions: enter=attach  ctrl-x/d=kill  ctrl-k=clean  ctrl-i=issues  ?=help)+change-preview(name=\"\$(echo {} | awk '{print \$1}')\"; tmux capture-pane -t \"\$name\" -p -S -40 2>/dev/null | sed 's/^/  /')" \
+        --bind="?:execute(printf '%s\n\n' 'KEYBINDINGS' '-----------' 'enter      dispatch agent (via tmq)' 'ctrl-o     open issue in browser' 'ctrl-p     full preview' 'ctrl-s     back to sessions' '?          this help' 'esc        cancel' | less -R)" \
+        2>/dev/null || true)
+
+    if [[ -n "$selected" ]]; then
+        local col1 col2
+        col1=$(echo "$selected" | awk '{print $1}')
+        col2=$(echo "$selected" | awk '{print $2}' | tr -d '#')
+        # Smart enter: issues dispatch, sessions attach
+        if echo "$col1" | grep -qE '^(distillery|home-portal|tower-fleet|scripts|palimpsest|rms)$'; then
+            tmq "$col1" "$col2"
+        else
+            attach_session "$col1"
+        fi
+    fi
+}
+
+# ── clean: kill stale + compact ──────────────────────────────────
+
+clean_stale() {
+    local -a to_kill=()
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        if is_session_stale "$name"; then
+            to_kill+=("$name")
+        fi
+    done <<< "$(tmux list-sessions -F "#{session_name}" 2>/dev/null | sort)"
+
+    if ((${#to_kill[@]} == 0)); then
+        echo "No stale sessions found (>${STALE_DAYS}d, all windows idle)."
+        return
+    fi
+
+    echo "Stale sessions (>${STALE_DAYS}d, all windows at shell prompt):"
+    for s in "${to_kill[@]}"; do
+        local wins
+        wins=$(tmux list-sessions -F "#{session_windows}" -f "#{==:#{session_name},$s}" 2>/dev/null)
+        local win_detail
+        win_detail=$(tmux list-windows -t "$s" -F "#{window_index}:#{pane_current_command}" 2>/dev/null | tr '\n' ' ')
+        echo "  $s  (${wins} windows: $win_detail)"
+    done
+    local auto_yes="${2:-}"
+    if [[ "$auto_yes" != "--yes" ]]; then
+        echo ""
+        printf "Kill all %d? [y/N] " "${#to_kill[@]}"
+        read -r ans
+        if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+            echo "Cancelled."
+            return
+        fi
+    fi
+
+    for s in "${to_kill[@]}"; do
+        tmux kill-session -t "$s" 2>/dev/null && echo "  killed $s" || echo "  failed $s"
+    done
+
+    # Offer compaction (skip prompt in --yes mode)
+    if [[ "$auto_yes" != "--yes" ]]; then
+        echo ""
+        printf "Compact scratch session numbers (c0,c1,c2...)? [Y/n] "
+        read -r ans2
+        if [[ "$ans2" =~ ^[Nn]$ ]]; then
+            return
+        fi
+    fi
+    compact_scratch_sessions
+}
+
+# ── main ─────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    ls|list)
+        session_list
+        ;;
+    kill)
+        if [[ -z "${2:-}" ]]; then
+            echo "Usage: tms kill <session-name>"
+            exit 1
+        fi
+        kill_session "$2" "${3:-}"
+        ;;
+    rename)
+        if [[ -z "${2:-}" ]]; then
+            echo "Usage: tms rename <session-name>"
+            exit 1
+        fi
+        rename_session "$2"
+        ;;
+    stale)
+        stale_sessions
+        ;;
+    clean)
+        clean_stale "$@"
+        ;;
+    compact)
+        compact_scratch_sessions
+        ;;
+    issues)
+        if [[ "${2:-}" == "--raw" ]]; then
+            issue_list "${3:-}"
+            return
+        fi
+        issue_browser "${2:-}"
+        ;;
+    "")
+        # Interactive fzf picker
+        if ! command -v fzf &>/dev/null; then
+            echo "fzf not found. Install with: apt install fzf"
+            echo ""
+            echo "Available sessions:"
+            session_list
+            exit 1
+        fi
+
+        selected=$(session_list | fzf \
+            --header='enter:attach  ctrl-x/d:kill  ctrl-r:rename  ctrl-k:clean  ctrl-p:peek  ctrl-i:issues  ?:help  esc:cancel' \
+            --header-first \
+            --ansi \
+            --no-sort \
+            --preview='name=$(echo {} | awk "{print \$1}"); tmux capture-pane -t "$name" -p -S -40 2>/dev/null | sed "s/^/  /"' \
+            --preview-window='right:60%:wrap' \
+            --bind="enter:accept" \
+            --bind="ctrl-x:execute(tms kill {1} --force)+reload(tms ls | tail -n +3)" \
+            --bind="ctrl-d:execute(tms kill {1} --force)+reload(tms ls | tail -n +3)" \
+            --bind="ctrl-r:become(stty sane; tms rename {1}; exec tms)" \
+            --bind="ctrl-p:execute(tmux capture-pane -t {1} -p -S -40 | less -R)" \
+            --bind="ctrl-k:execute(tms clean --yes)+reload(tms ls | tail -n +3)" \
+            --bind="ctrl-i:reload(tms issues --raw)+change-header(issues: enter=dispatch  ctrl-o=browser  ctrl-p=preview  ctrl-s=back  ?=help  esc=cancel)+change-preview(issue_preview \"{}\")" \
+            --bind="?:execute(printf '%s\n\n' 'KEYBINDINGS' '-----------' 'enter      attach to session' 'ctrl-x/d   kill session' 'ctrl-r     rename session' 'ctrl-k     clean stale' 'ctrl-i     browse issues' 'ctrl-p     peek terminal' '?          this help' 'esc        cancel' | less -R)" \
+            --tac)
+
+        if [[ -n "$selected" ]]; then
+            col1=$(echo "$selected" | awk '{print $1}')
+            col2=$(echo "$selected" | awk '{print $2}' | tr -d '#')
+            # Smart enter: issues dispatch via tmq, sessions attach directly
+            if echo "$col1" | grep -qE '^(distillery|home-portal|tower-fleet|scripts|palimpsest|rms)$'; then
+                tmq "$col1" "$col2"
+            else
+                attach_session "$col1"
+            fi
+        fi
+        ;;
+    *)
+        echo "Usage: tms [ls|kill <name>|rename <name>|stale|clean|compact|issues [repo]]"
+        exit 1
+        ;;
+esac
