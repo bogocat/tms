@@ -255,6 +255,7 @@ tower-fleet:bogocat/tower-fleet
 scripts:bogocat/scripts
 palimpsest:bogocat/palimpsest
 rms:bogocat/openrms
+tms:bogocat/tms
 EOF
 }
 

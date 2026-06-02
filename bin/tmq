@@ -38,6 +38,7 @@ add_repo palimpsest   /root/projects/palimpsest    bogocat/palimpsest    0
 add_repo rms          /root/projects/rms           bogocat/openrms       0
 add_repo deploy       /root/deploy/distillery      bogocat/distillery    0
 add_repo frame-cache  /root/projects/framecache    bogocat/framecache    0
+add_repo tms          /root/tms                    bogocat/tms           0
 
 # ── defaults ─────────────────────────────────────────────────────
 
