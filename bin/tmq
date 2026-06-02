@@ -165,16 +165,26 @@ PROMPT
         local body
         body=$(echo "$issue_json" | jq -r '.body')
 
-        local type_instruction
+        local type_instruction lifecycle_instruction
         case "$type" in
             feature)
-                type_instruction="Implement this feature. Use a feature branch, commit incrementally, and create a PR when done."
+                type_instruction="3. **Implement this feature.** You are in a git worktree on branch
+   \`$TMQ_BRANCH\`. Commit incrementally. When the implementation is complete:
+   - Open a PR against main
+   - Report the PR number and URL
+   - **Do NOT delete or remove the worktree.** Your session stays alive —
+     code review will follow in this same session (reviewer may push fixups).
+   - Only after the PR is merged should you clean up."
+                lifecycle_instruction="4. **Lifecycle:** Open PR → wait for review → apply feedback → merge → cleanup.
+   Do not treat the PR as the finish line."
                 ;;
             fix)
-                type_instruction="Fix this bug. Work on main (or a short-lived fix branch). Commit the fix."
+                type_instruction="3. **Fix this bug.** Work on main (or a short-lived fix branch). Commit the fix."
+                lifecycle_instruction=""
                 ;;
             chore)
-                type_instruction="Complete this maintenance task. Work directly on main."
+                type_instruction="3. **Complete this maintenance task.** Work directly on main."
+                lifecycle_instruction=""
                 ;;
         esac
 
@@ -190,9 +200,21 @@ PROMPT
 $body
 
 ### Instructions
+1. **Evaluate scope against ground truth first.** Don't trust the issue's task
+   list at face value — issues rot. Check:
+   - What has already been done? (grep for patterns the issue mentions; scan
+     git log for related commits)
+   - What data actually exists? (query the database to verify assumptions the
+     issue makes about tables, columns, or content)
+   - What's the real delta? (diff between the issue's desired end-state and
+     the current state of the codebase)
+2. **Refine the scope**, report discrepancies, then proceed with the actual
+   remaining work.
 $type_instruction
+$lifecycle_instruction
 
 Repository: $repo (${REPO_PATH[$repo]})
+Worktree:  $TMQ_CWD (branch: $TMQ_BRANCH)
 Follow the project conventions in CLAUDE.md and institutional memory.
 PROMPT
     fi
@@ -259,7 +281,8 @@ spawn_agent() {
 
 # ── worktree management ──────────────────────────────────────────
 
-# Global: set by create_worktree, read by main() for aoe integration
+# Globals: set by create_worktree, read by main() + build_prompt()
+TMQ_CWD=""
 TMQ_BRANCH=""
 
 create_worktree() {
@@ -269,6 +292,7 @@ create_worktree() {
     # Only create worktrees for feature branches on worktree repos
     if (( REPO_WORKTREE[$repo] != 1 )); then
         git -C "$path" checkout main >/dev/null 2>&1 || true
+        TMQ_CWD="$path"
         TMQ_BRANCH=""
         echo "$path"
         return
@@ -277,6 +301,7 @@ create_worktree() {
     if [[ "$type" != "feature" ]]; then
         git -C "$path" checkout main >/dev/null 2>&1 || true
         git -C "$path" pull --ff-only >/dev/null 2>&1 || true
+        TMQ_CWD="$path"
         TMQ_BRANCH=""
         echo "$path"
         return
@@ -288,12 +313,13 @@ create_worktree() {
     title=$(echo "$issue_json" | jq -r '.title')
     branch="feat/issue-${issue_num}-$(slugify "$title" | cut -c1-30)"
     TMQ_BRANCH="$branch"
-    slug="wt-${repo}-${issue_num}"
+    slug="${repo}-${issue_num}"
     wt_path="/root/wt-${slug}"
 
     # Check if worktree already exists
     if [[ -d "$wt_path" ]]; then
         echo "Worktree already exists: $wt_path" >&2
+        TMQ_CWD="$wt_path"
         echo "$wt_path"
         return
     fi
@@ -316,6 +342,7 @@ create_worktree() {
         (cd "$wt_path" && bun install --frozen-lockfile >/dev/null 2>&1 || bun install >/dev/null 2>&1) &
     fi
 
+    TMQ_CWD="$wt_path"
     echo "$wt_path"
 }
 
