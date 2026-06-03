@@ -1435,13 +1435,20 @@ EOF
 
     local title="feat-$repo#$issue_num"
     echo "Importing $session_name → $title ($agent_tool in $cwd)" >&2
-    # No -l/--launch: aoe add's auto-attach fails in non-tty contexts and
-    # the session exists either way. The user can launch from the picker.
+    # No -l/--launch: aoe add's auto-attach fails in non-tty contexts.
+    # We start the session explicitly with `aoe session start` instead.
     if ! aoe add "$cwd" --title "$title" --tool "$agent_tool" --trust-hooks >/dev/null 2>&1; then
         echo "tms import: aoe add failed" >&2
         return 1
     fi
-    echo "  added $title (aoe id: $(aoe session show "$title" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"][:8])' 2>/dev/null || echo '?'))" >&2
+    if ! aoe session start "$title" >/dev/null 2>&1; then
+        echo "tms import: aoe add succeeded but session start failed" >&2
+        echo "  start it manually with: aoe session start $title" >&2
+        return 1
+    fi
+    local aoe_id
+    aoe_id=$(aoe session show "$title" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"][:8])' 2>/dev/null || echo '?')
+    echo "  added + started $title (aoe id: $aoe_id)" >&2
 
     if (( kill_orig )); then
         echo "Killing original session $session_name" >&2
