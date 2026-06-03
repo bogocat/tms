@@ -111,19 +111,23 @@ _aoe_status_map() {
     fi
 
     if ! command -v aoe &>/dev/null; then
-        # No aoe → empty cache, no statuses
-        : > "$AOE_STATUS_CACHE"
-        echo "$AOE_STATUS_CACHE"
-        return
+        # No aoe → empty cache, no statuses. Don't write a file: keep the
+        # 'aoe missing' check live for the next call (a freshly installed
+        # aoe is picked up immediately).
+        return 1
     fi
 
     # Get all aoe session titles, then per-session status.
     # ~15ms per call, so 50 sessions = ~750ms. Acceptable for picker.
+    # Note: per-call timeout=3, so a hung daemon can block up to
+    # 3s * N sessions. The TTL cache hides the slow path after one
+    # healthy collection; a hung daemon will time out per call.
+    local tmp_cache="${AOE_STATUS_CACHE}.new.$$"
     aoe list --json 2>/dev/null | python3 -c "
 import json, subprocess, sys
 try:
     sessions = json.load(sys.stdin)
-except Exception:
+except (json.JSONDecodeError, ValueError):
     sys.exit(0)
 for s in sessions:
     title = s.get('title','')
@@ -137,9 +141,11 @@ for s in sessions:
         if r.returncode == 0:
             d = json.loads(r.stdout)
             print(f'{title}\t{d.get(\"status\",\"unknown\")}')
-    except Exception:
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError, ValueError):
         pass
-" > "$AOE_STATUS_CACHE" 2>/dev/null
+" > "$tmp_cache" 2>/dev/null
+    # Atomic replace so a concurrent reader never sees a half-written file.
+    mv -f "$tmp_cache" "$AOE_STATUS_CACHE"
 
     echo "$AOE_STATUS_CACHE"
 }
@@ -170,30 +176,32 @@ _status_color() {
 }
 
 # Public: resolve the status for a given session.
-# Args: $1 = tmux session name, $2 = status map file path
+# Args: $1 = tmux session name, $2 = status map file path (may be empty)
 # Outputs: "<colored_status_text><reset>"
 _session_status() {
     local name=$1 map_file=$2
-    local status_text=""
 
-    if [[ "$name" == aoe_* ]] && [[ -n "$map_file" && -f "$map_file" ]]; then
-        # Extract the aoe title (compact form) from the tmux name
-        local compact
-        compact=$(compact_session_name "$name")
-        if [[ -n "$compact" ]]; then
-            local hit
-            hit=$(grep -F "${compact}"$'\t' "$map_file" 2>/dev/null | head -1 || true)
-            if [[ -n "$hit" ]]; then
-                local s
-                s=$(echo "$hit" | cut -f2)
-                status_text=$(_format_status "$s")
-                local color
-                color=$(_status_color "$s")
-                printf '\033[%sm%s\033[0m' "$color" "$status_text"
-                return
+    # aoe-managed session: look up in the status map
+    if [[ "$name" == aoe_* ]]; then
+        if [[ -n "$map_file" && -f "$map_file" ]]; then
+            local compact
+            compact=$(compact_session_name "$name")
+            if [[ -n "$compact" ]]; then
+                local hit
+                hit=$(grep -F "${compact}"$'\t' "$map_file" 2>/dev/null | head -1 || true)
+                if [[ -n "$hit" ]]; then
+                    local s color
+                    s=$(echo "$hit" | cut -f2)
+                    local status_text
+                    status_text=$(_format_status "$s")
+                    color=$(_status_color "$s")
+                    printf '\033[%sm%s\033[0m' "$color" "$status_text"
+                    return
+                fi
             fi
         fi
-        # aoe session but no status → still show placeholder
+        # aoe session but no map (aoe missing) or no hit → show placeholder
+        # (NOT the pane-cmd heuristic, which would lie for aoe sessions)
         printf '\033[2m—   \033[0m'
         return
     fi
@@ -549,7 +557,11 @@ _tmq_registry() {
         echo "ERROR: tmq not found (tms needs it for repo registry)" >&2
         return 1
     fi
-    tmq list --machine | tee "$_TMQ_REGISTRY_CACHE"
+    # Atomic write: tee to a temp file then mv, so a concurrent reader
+    # never sees a half-written line.
+    local tmp="${_TMQ_REGISTRY_CACHE}.new.$$"
+    tmq list --machine | tee "$tmp"
+    mv -f "$tmp" "$_TMQ_REGISTRY_CACHE"
 }
 
 # Look up the GitHub slug for a shortname. Outputs `short:gh` lines, filtered.
@@ -576,7 +588,8 @@ detect_repo_from_cwd() {
         fi
     done < <(_tmq_registry)
     if [[ -n "$best" ]]; then echo "$best"; return; fi
-    # Worktree convention: /root/wt-<short>-<num>
+    # Worktree convention: /wt-<short>-<num> anywhere in the path.
+    # Bash =~ is unanchored, so this works for /root/wt-distillery-108.
     if [[ "$dir" =~ /wt-([a-z0-9-]+)-[0-9]+(/|$) ]]; then
         local candidate="${BASH_REMATCH[1]}"
         if _tmq_registry | awk -F'\t' -v c="$candidate" '$1 == c {found=1} END{exit !found}'; then
@@ -765,8 +778,10 @@ def detect_repo_from_path(path):
                 best, bestlen = short, len(p)
     if best:
         return best
-    # Worktree convention: /root/wt-<short>-<num>
-    wm = re.match(r'/wt-([a-z0-9-]+)-\d+(/|$)', path)
+    # Worktree convention: /root/wt-<short>-<num> (or any path containing
+    # /wt-<short>-<num> followed by / or end of string). Use search, not
+    # match — the path may be /root/wt-distillery-108, not /wt-... at pos 0.
+    wm = re.search(r'/wt-([a-z0-9-]+)-\d+(/|$)', path)
     if wm and wm.group(1) in known_shorts:
         return wm.group(1)
     return ''
@@ -812,7 +827,8 @@ try:
                 'path':  s.get('path', ''),
                 'tool':  s.get('tool', ''),
             }
-except: pass
+except (json.JSONDecodeError, ValueError, subprocess.TimeoutExpired, OSError):
+    pass
 
 load_repos()
 mapping = {}
@@ -828,27 +844,17 @@ for session, (cmd, cwd) in ses_info.items():
         continue
 
     # aoe sessions: aoe_<title>_<uuid> — join key is the 8-char id prefix,
-    # which is what aoe appends to the tmux session name. Then we look at
-    # the actual worktree branch (source of truth) to find the issue.
+    # which is what aoe appends to the tmux session name.
+    #
+    # For aoe sessions, the title is the source of truth. We do NOT
+    # fall back to the worktree branch: a session titled "tms issue
+    # filing" on /root/tms should not auto-link to whatever feature
+    # branch the user happens to have checked out there.
     if session.startswith('aoe_'):
         um = re.match(r'^aoe_.+_([0-9a-f]{6,})$', session)
         if um:
             uuid_prefix = um.group(1)[:8]
             info = aoe_by_id.get(uuid_prefix, {})
-            path = info.get('path', '') or cwd
-            branch = ''
-            if path and os.path.isdir(os.path.join(path, '.git')):
-                branch = shell(['git', '-C', path, 'branch', '--show-current'])
-            parsed = parse_issue_branch(branch)
-            if parsed:
-                _type, num = parsed
-                repo_name = detect_repo_from_path(path)
-                if repo_name:
-                    key = f'{repo_name}#{num}'
-                    mapping.setdefault(key, []).append(f'{session} {icon}')
-                    continue
-            # Fall back to parsing the aoe title (handles cases where the
-            # worktree path is a main checkout, e.g. issue triage sessions).
             tp = parse_issue_title(info.get('title', ''))
             if tp:
                 _type, repo_name, num = tp
@@ -859,7 +865,7 @@ for session, (cmd, cwd) in ses_info.items():
     m = re.match(r'^([cop])(\d+)$', session)
     if not m:
         continue
-    if not cwd or not os.path.isdir(os.path.join(cwd, '.git')):
+    if not cwd or not os.path.exists(os.path.join(cwd, '.git')):
         continue
     branch = shell(['git', '-C', cwd, 'branch', '--show-current'])
     parsed = parse_issue_branch(branch)
@@ -1245,7 +1251,7 @@ clean_stale() {
 # in `tms issues` on the next refresh.
 
 new_issue() {
-    local repo_override="" title="" body="" body_file="" labels=()
+    local repo_override="" title="" body="" labels=()
     local web=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1437,15 +1443,16 @@ EOF
     echo "Importing $session_name → $title ($agent_tool in $cwd)" >&2
     # No -l/--launch: aoe add's auto-attach fails in non-tty contexts.
     # We start the session explicitly with `aoe session start` instead.
-    if ! aoe add "$cwd" --title "$title" --tool "$agent_tool" --trust-hooks >/dev/null 2>&1; then
-        echo "tms import: aoe add failed" >&2
+    local aoe_err
+    aoe_err=$(aoe add "$cwd" --title "$title" --tool "$agent_tool" --trust-hooks 2>&1 1>/dev/null) || {
+        echo "tms import: aoe add failed: ${aoe_err:-no stderr}" >&2
         return 1
-    fi
-    if ! aoe session start "$title" >/dev/null 2>&1; then
-        echo "tms import: aoe add succeeded but session start failed" >&2
+    }
+    aoe_err=$(aoe session start "$title" 2>&1 1>/dev/null) || {
+        echo "tms import: aoe add succeeded but session start failed: ${aoe_err:-no stderr}" >&2
         echo "  start it manually with: aoe session start $title" >&2
         return 1
-    fi
+    }
     local aoe_id
     aoe_id=$(aoe session show "$title" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"][:8])' 2>/dev/null || echo '?')
     echo "  added + started $title (aoe id: $aoe_id)" >&2
