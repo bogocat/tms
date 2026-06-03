@@ -713,7 +713,20 @@ _issue_session_map() {
 import json, subprocess, re, os, sys
 
 ICONS = {'pi': '\u03c0', 'claude': 'cc', 'opencode': 'oc', 'python3': 'py', 'bash': 'sh', 'zsh': 'sh'}
-REPOS = ['home-portal', 'distillery', 'tower-fleet', 'scripts', 'palimpsest', 'rms', 'deploy']
+# Loaded from `tmq list --machine` so we don't drift from the canonical registry
+REPOS = []
+def load_repos():
+    global REPOS
+    try:
+        r = subprocess.run(['tmq', 'list', '--machine'],
+                           capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                parts = line.split('\t')
+                if parts and parts[0]:
+                    REPOS.append(parts[0])
+    except Exception:
+        REPOS = ['home-portal', 'distillery', 'tower-fleet', 'scripts', 'palimpsest', 'rms', 'deploy']
 
 def shell(cmd, timeout=5):
     try:
@@ -721,6 +734,56 @@ def shell(cmd, timeout=5):
         return r.stdout.strip()
     except:
         return ''
+
+# Resolve a worktree/cwd path to a registered repo shortname. Longest path
+# match first, so a worktree at /root/wt-distillery-108/... matches distillery
+# (not a longer-named subpath of another repo). Falls back to the
+# /root/wt-<short>-<num> convention if no registered path matches.
+def detect_repo_from_path(path):
+    if not path:
+        return ''
+    try:
+        r = subprocess.run(['tmq', 'list', '--machine'],
+                           capture_output=True, text=True, timeout=3)
+        rows = r.stdout.splitlines() if r.returncode == 0 else []
+    except Exception:
+        rows = []
+    best, bestlen = '', 0
+    known_shorts = set()
+    for row in rows:
+        parts = row.split('\t')
+        if len(parts) < 2:
+            continue
+        short, p = parts[0], parts[1]
+        if not short:
+            continue
+        known_shorts.add(short)
+        if not p:
+            continue
+        if path == p or path.startswith(p + '/'):
+            if len(p) > bestlen:
+                best, bestlen = short, len(p)
+    if best:
+        return best
+    # Worktree convention: /root/wt-<short>-<num>
+    wm = re.match(r'/wt-([a-z0-9-]+)-\d+(/|$)', path)
+    if wm and wm.group(1) in known_shorts:
+        return wm.group(1)
+    return ''
+
+# Parse a (feat|fix|chore|review)/issue-<num>-<slug> branch → (type, num)
+def parse_issue_branch(branch):
+    m = re.match(r'(feat|fix|chore|review)/issue-(\d+)', branch or '')
+    if not m:
+        return None
+    return (m.group(1), m.group(2))
+
+# Parse an aoe title like "feat-home-portal#5" → (type, repo, num)
+def parse_issue_title(title):
+    m = re.match(r'(feat|fix|chore|review)-(.+?)#(\d+)$', title or '')
+    if not m:
+        return None
+    return (m.group(1), m.group(2), m.group(3))
 
 # Single tmux call: all panes → session, command, cwd
 panes_raw = shell(['tmux', 'list-panes', '-a', '-F', '#{session_name}|#{pane_current_command}|#{pane_current_path}'])
@@ -736,13 +799,22 @@ for p in panes:
     if p['session'] not in ses_info:
         ses_info[p['session']] = (p['cmd'], p['cwd'])
 
-# aoe sessions (try, don't block)
-aoe_data = {}
+# aoe sessions: keyed by the 8-char id prefix that aoe uses as the tmux-name
+# suffix. Using the id (not the title) means titles with spaces (e.g.
+# "tms issue filing") still resolve correctly.
+aoe_by_id = {}
 try:
     for s in json.loads(shell(['aoe', 'list', '--json'], timeout=3)):
-        aoe_data[s['title']] = {'tool': s.get('tool',''), 'branch': (s.get('worktree') or {}).get('branch',''), 'path': s.get('path','')}
+        sid = s.get('id', '')
+        if len(sid) >= 8:
+            aoe_by_id[sid[:8]] = {
+                'title': s.get('title', ''),
+                'path':  s.get('path', ''),
+                'tool':  s.get('tool', ''),
+            }
 except: pass
 
+load_repos()
 mapping = {}
 
 for session, (cmd, cwd) in ses_info.items():
@@ -755,38 +827,32 @@ for session, (cmd, cwd) in ses_info.items():
         mapping.setdefault(key, []).append(f'{session} {icon}')
         continue
 
-    # aoe sessions: aoe_<title>_<uuid>
+    # aoe sessions: aoe_<title>_<uuid> — join key is the 8-char id prefix,
+    # which is what aoe appends to the tmux session name. Then we look at
+    # the actual worktree branch (source of truth) to find the issue.
     if session.startswith('aoe_'):
-        parts = session.split('_')
-        if len(parts) >= 3:
-            title = '_'.join(parts[1:-1])
-            info = aoe_data.get(title, {})
-            path = info.get('path','')
-            # Try 1: branch name like feat/issue-68-*
-            bm = re.match(r'(feat|fix|chore|review)/issue-(\d+)', info.get('branch',''))
-            if not bm:
-                # Try 2: aoe title like "feat-home-portal#5" (direct issue ref)
-                bm = re.match(r'(feat|fix|chore|review)-(.+?)#(\d+)', title.replace('_', '#'))
-            if bm:
-                num = bm.group(2) if len(bm.groups()) == 2 else bm.group(3) if len(bm.groups()) == 3 else ''
-                if not num or not num.isdigit():
-                    num = bm.group(3) if len(bm.groups()) >= 3 else ''
-                # Re-extract groups properly: (type, repo, num) or (type, issue-num)
-                if bm.lastindex and bm.lastindex >= 2:
-                    if bm.lastindex == 2:
-                        # Branch match: (type, issue-number-only)
-                        num = bm.group(2)
-                        # Find repo from path
-                        repo_name = os.path.basename(path.rstrip('/'))
-                        for r in REPOS:
-                            if f'/{r}' in path:
-                                repo_name = r; break
-                    else:
-                        # Title match: (type, repo, num)
-                        repo_name = bm.group(2)
-                        num = bm.group(3)
+        um = re.match(r'^aoe_.+_([0-9a-f]{6,})$', session)
+        if um:
+            uuid_prefix = um.group(1)[:8]
+            info = aoe_by_id.get(uuid_prefix, {})
+            path = info.get('path', '') or cwd
+            branch = ''
+            if path and os.path.isdir(os.path.join(path, '.git')):
+                branch = shell(['git', '-C', path, 'branch', '--show-current'])
+            parsed = parse_issue_branch(branch)
+            if parsed:
+                _type, num = parsed
+                repo_name = detect_repo_from_path(path)
+                if repo_name:
                     key = f'{repo_name}#{num}'
                     mapping.setdefault(key, []).append(f'{session} {icon}')
+                    continue
+            # Fall back to parsing the aoe title (handles cases where the
+            # worktree path is a main checkout, e.g. issue triage sessions).
+            tp = parse_issue_title(info.get('title', ''))
+            if tp:
+                _type, repo_name, num = tp
+                mapping.setdefault(f'{repo_name}#{num}', []).append(f'{session} {icon}')
         continue
 
     # scratch: c<n>, o<n>, p<n>
@@ -796,14 +862,13 @@ for session, (cmd, cwd) in ses_info.items():
     if not cwd or not os.path.isdir(os.path.join(cwd, '.git')):
         continue
     branch = shell(['git', '-C', cwd, 'branch', '--show-current'])
-    bm = re.match(r'(feat|fix|chore|review)/issue-(\d+)', branch)
-    if not bm:
+    parsed = parse_issue_branch(branch)
+    if not parsed:
         continue
-    num = bm.group(2)
-    repo_name = os.path.basename(cwd.rstrip('/'))
-    for r in REPOS:
-        if cwd.endswith(f'/{r}') or f'/{r}-worktrees/' in cwd or f'/{r}/' in cwd:
-            repo_name = r; break
+    _type, num = parsed
+    repo_name = detect_repo_from_path(cwd)
+    if not repo_name:
+        continue
     key = f'{repo_name}#{num}'
     mapping.setdefault(key, []).append(f'{session} {icon}')
 
