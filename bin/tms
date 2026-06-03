@@ -1335,6 +1335,126 @@ EOF
     return $rc
 }
 
+# ── import: wrap a legacy c/o/p scratch session as an aoe session ─
+# tms import <scratch-session> <repo> <issue-number> [--kill-original]
+#
+# Reads the legacy session's cwd + agent, then creates a new aoe session
+# at the same cwd with the same tool, titled feat-<repo>#<num>. After it
+# comes up the user can attach to the new session and kill the original.
+# With --kill-original, kills the legacy session non-interactively.
+
+import_session() {
+    local session_name="" repo="" issue_num="" kill_orig=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --kill-original) kill_orig=1; shift ;;
+            -h|--help)
+                cat <<'EOF'
+tms import — wrap a legacy scratch session as an aoe-managed session
+
+Usage:
+  tms import <session-name> <repo> <issue-number> [--kill-original]
+
+Reads <session-name>'s cwd and current agent, then creates a new aoe
+session at the same cwd with the same tool, titled feat-<repo>#<num>.
+Useful for c/o/p scratch sessions that turned out to be real work on
+a specific issue and should be tracked in the aoe dashboard.
+
+After the new session comes up, with --kill-original the script also
+kills the legacy session non-interactively. Without it, the original
+is left running for the user to inspect and clean up manually.
+
+Examples:
+  tms import c5 distillery 245
+  tms import o2 home-portal 92 --kill-original
+EOF
+                return ;;
+            *)
+                if [[ -z "$session_name" ]]; then session_name="$1"
+                elif [[ -z "$repo" ]];       then repo="$1"
+                elif [[ -z "$issue_num" ]];  then issue_num="$1"
+                fi
+                shift ;;
+        esac
+    done
+
+    if [[ -z "$session_name" || -z "$repo" || -z "$issue_num" ]]; then
+        echo "tms import: usage: tms import <session> <repo> <num> [--kill-original]" >&2
+        return 1
+    fi
+    if ! is_known_repo "$repo"; then
+        echo "tms import: unknown repo: $repo" >&2
+        return 1
+    fi
+    if ! [[ "$issue_num" =~ ^[0-9]+$ ]]; then
+        echo "tms import: invalid issue number: $issue_num" >&2
+        return 1
+    fi
+
+    # Look up the legacy session
+    local cwd cmd agent_tool
+    cwd=$(tmux list-panes -t "$session_name" -F "#{pane_current_path}" 2>/dev/null | head -1) || {
+        echo "tms import: session not found: $session_name" >&2
+        return 1
+    }
+    cmd=$(tmux list-panes -t "$session_name" -F "#{pane_current_command}" 2>/dev/null | head -1)
+    case "$cmd" in
+        pi)        agent_tool="pi" ;;
+        claude)    agent_tool="claude" ;;
+        opencode)  agent_tool="opencode" ;;
+        codex)     agent_tool="codex" ;;
+        *)
+            echo "tms import: legacy session isn't running a known agent (cmd=$cmd)" >&2
+            echo "  import manually with: aoe add \"$cwd\" -t feat-$repo#$issue_num --tool <name>" >&2
+            return 1
+            ;;
+    esac
+
+    if [[ -z "$cwd" ]]; then
+        echo "tms import: could not read cwd of $session_name" >&2
+        return 1
+    fi
+
+    # Verify the cwd belongs to the target repo (warn if it doesn't)
+    local cwd_repo
+    cwd_repo=$(detect_repo_from_cwd "$cwd")
+    if [[ -n "$cwd_repo" && "$cwd_repo" != "$repo" ]]; then
+        echo "tms import: warning — cwd $cwd maps to repo '$cwd_repo', not '$repo'" >&2
+        printf "Continue anyway? [y/N] "
+        read -r ans
+        [[ "$ans" =~ ^[Yy]$ ]] || return 1
+    fi
+
+    # Verify the issue exists (cheaper than a typo'd import)
+    local gh_repo
+    gh_repo=$(_tmq_registry | awk -F'\t' -v s="$repo" '$1 == s {print $3; exit}')
+    if ! gh issue view "$issue_num" --repo "$gh_repo" --json number >/dev/null 2>&1; then
+        echo "tms import: $gh_repo#$issue_num not found" >&2
+        return 1
+    fi
+
+    local title="feat-$repo#$issue_num"
+    echo "Importing $session_name → $title ($agent_tool in $cwd)" >&2
+    # No -l/--launch: aoe add's auto-attach fails in non-tty contexts and
+    # the session exists either way. The user can launch from the picker.
+    if ! aoe add "$cwd" --title "$title" --tool "$agent_tool" --trust-hooks >/dev/null 2>&1; then
+        echo "tms import: aoe add failed" >&2
+        return 1
+    fi
+    echo "  added $title (aoe id: $(aoe session show "$title" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"][:8])' 2>/dev/null || echo '?'))" >&2
+
+    if (( kill_orig )); then
+        echo "Killing original session $session_name" >&2
+        tmux kill-session -t "$session_name" 2>/dev/null && echo "  killed $session_name" \
+            || echo "  failed to kill $session_name"
+    else
+        echo "" >&2
+        echo "Original session $session_name is still running. To clean up:" >&2
+        echo "  tms kill $session_name" >&2
+        echo "Or re-run with --kill-original." >&2
+    fi
+}
+
 # ── main ─────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -1367,6 +1487,10 @@ case "${1:-}" in
     new)
         shift
         new_issue "$@"
+        ;;
+    import)
+        shift
+        import_session "$@"
         ;;
     issues)
         if [[ "${2:-}" == "--raw" ]]; then
@@ -1439,7 +1563,7 @@ case "${1:-}" in
         issue_preview "${2:-}"
         ;;
     *)
-        echo "Usage: tms [ls|kill <name>|rename <name>|stale|clean|compact|issues [repo|--all|--force]|issues --clear-cache|new]"
+        echo "Usage: tms [ls|kill <name>|rename <name>|stale|clean|compact|issues [repo|--all|--force]|issues --clear-cache|new|import]"
         exit 1
         ;;
 esac
