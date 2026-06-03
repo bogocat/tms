@@ -1,34 +1,751 @@
 #!/usr/bin/env bash
-# tms — tmux session manager with fuzzy preview
+# tms — GitHub issue browser + tmux session manager
+#
+# Primary use: browse + dispatch agents on issues. Sessions are
+# second-class; use aoe for live session monitoring.
 #
 # Usage:
-#   tms                interactive picker → attach
-#   tms ls             list sessions with metadata
-#   tms kill <name>    kill a session
-#   tms rename <name>  rename a session
-#   tms clean          kill stale + compact scratch session numbers
-#   tms stale          list sessions idle >7 days (checks ALL windows)
-#   tms issues [repo|--all] [--force]  browse issues (auto-detects repo from CWD)
-#          --all      show all repos
-#          --force    skip cache (5-min TTL, /tmp/tms-issues-cache/)
-#          --clear-cache  wipe cached issue data
+#   tms                              issue browser (default)
+#   tms sessions                     session browser
+#   tms issues [repo|--all]          open issue browser directly
+#          --all       show all repos
+#          --force     skip cache (5-min TTL)
+#          --raw       just print rows, no fzf
+#          --clear-cache
+#   tms ls                           list sessions
+#   tms kill <name>                  kill session
+#   tms rename <name>                rename session
+#   tms clean                        kill stale + compact scratch
+#   tms stale                        list idle >7d
+#   tms compact                      renumber c*/o*/p* scratch
+#   tms --preview <row>              render preview pane (internal)
 #
-# Keybindings in fzf:
-#   enter     attach to session (switch client)
-#   ctrl-x/d  kill session (with confirmation)
-#   ctrl-r    rename session
-#   ctrl-p    preview only (peek without attaching)
-#   ctrl-k    clean stale sessions + compact scratch numbers
-#   ?         show help in preview pane
+# Keybindings in issue browser (fzf):
+#   enter        dispatch agent on issue (via tmq)
+#   ctrl-o       open issue in browser
+#   ctrl-p       full preview
+#   ctrl-e       code review linked PR (if any)
+#   ctrl-v       cycle view: All / Active / Yours / Stale
+#   ctrl-r       force refresh (skip cache)
+#   ctrl-s       jump to session browser
+#   ?            help
+#   esc          cancel
 
 set -euo pipefail
 
 STALE_DAYS=7
 NOW=$(date +%s)
 ISSUE_CACHE_DIR=/tmp/tms-issues-cache
-ISSUE_CACHE_TTL=300  # 5 minutes
+ISSUE_CACHE_TTL=300      # 5 min — issues don't change fast
+SESSION_MAP_TTL=15       # 15s — sessions move quickly
 
-# ── helpers ──────────────────────────────────────────────────────
+# GH login (cached per-invocation)
+GH_USER="${TMS_GH_USER:-}"
+if [[ -z "$GH_USER" ]] && command -v gh &>/dev/null; then
+    GH_USER=$(gh api user --jq '.login' 2>/dev/null || echo "")
+fi
+export GH_USER
+
+# ── repo registry (mirrors tmq) ──────────────────────────────────
+
+issue_repos() {
+    cat <<'EOF'
+distillery:bogocat/distillery
+home-portal:bogocat/home-portal
+tower-fleet:bogocat/tower-fleet
+scripts:bogocat/scripts
+palimpsest:bogocat/palimpsest
+rms:bogocat/openrms
+tms:bogocat/tms
+EOF
+}
+
+# Detect repo from cwd (handles worktrees too)
+detect_repo_from_cwd() {
+    local dir="${1:-$PWD}"
+    case "$dir" in
+        */distillery*|*/wt-distillery*/) echo distillery ;;
+        */home-portal*|*/wt-home-portal*/) echo home-portal ;;
+        */tower-fleet*|*/wt-tower-fleet*/)  echo tower-fleet ;;
+        */scripts*|*/wt-scripts*/|*/bogocat/scripts*) echo scripts ;;
+        */palimpsest*|*/wt-palimpsest*/)    echo palimpsest ;;
+        */rms*|*/wt-rms*/)                echo rms ;;
+        */tms*)                           echo tms ;;
+        *)                                echo "" ;;
+    esac
+}
+
+# ── issue fetching (parallel, all states) ────────────────────────
+
+_cache_file() { echo "$ISSUE_CACHE_DIR/$1.ndjson"; }
+_cache_valid() {
+    local cf
+    cf=$(_cache_file "$1")
+    [[ -f "$cf" ]] || return 1
+    local age
+    age=$(($(date +%s) - $(stat -c %Y "$cf" 2>/dev/null || echo 0)))
+    (( age < ISSUE_CACHE_TTL ))
+}
+_write_cache() { mkdir -p "$ISSUE_CACHE_DIR"; cat - > "$(_cache_file "$1")"; }
+_clear_cache() { rm -rf "$ISSUE_CACHE_DIR"; mkdir -p "$ISSUE_CACHE_DIR"; }
+
+# Fetch a single repo: open + closed issues, open PRs. NDJSON out.
+_fetch_repo() {
+    local short=$1 gh_repo=$2
+
+    # All issues (open + closed); stateReason fetched in preview only (not
+    # available via `gh issue list --json`).
+    gh issue list --repo "$gh_repo" --state all --limit 100 \
+        --json number,title,state,labels,url,createdAt,updatedAt,closedAt,assignees 2>/dev/null \
+    | python3 -c "
+import json, sys
+for iss in json.load(sys.stdin):
+    print(json.dumps({
+        'n': iss['number'],
+        't': iss['title'],
+        's': iss['state'],                  # OPEN | CLOSED
+        'l': ' '.join(x['name'] for x in iss.get('labels', [])),
+        'u': iss.get('url',''),
+        'c': iss.get('createdAt',''),
+        'U': iss.get('updatedAt',''),
+        'C': iss.get('closedAt',''),
+        'a': [x.get('login','') for x in iss.get('assignees', [])],
+    }))
+"
+
+    # Open PRs — for status (review state, draft, etc.)
+    gh pr list --repo "$gh_repo" --state open --limit 100 \
+        --json number,title,headRefName,reviewDecision,isDraft,url 2>/dev/null \
+    | python3 -c "
+import json, sys, re
+for pr in json.load(sys.stdin):
+    # Find which issue this PR closes
+    m = re.search(r'issue-(\d+)', pr.get('headRefName',''))
+    issue_num = int(m.group(1)) if m else None
+    rd = pr.get('reviewDecision') or ''
+    draft = pr.get('isDraft', False)
+    state = 'draft' if draft else (
+        'ready-to-merge' if rd == 'APPROVED' else
+        'changes-requested' if rd == 'CHANGES_REQUESTED' else
+        'pending-review' if rd == 'REVIEW_REQUIRED' else
+        'in-progress'
+    )
+    print(json.dumps({
+        'kind': 'pr',
+        'pr': pr['number'],
+        'iss': issue_num,
+        's': state,
+        't': pr['title'],
+        'u': pr.get('url',''),
+    }))
+"
+
+    # Recently closed/merged PRs — for "merged" status on closed issues
+    gh pr list --repo "$gh_repo" --state closed --limit 50 \
+        --json number,state,mergedAt,headRefName 2>/dev/null \
+    | python3 -c "
+import json, sys, re
+for pr in json.load(sys.stdin):
+    m = re.search(r'issue-(\d+)', pr.get('headRefName',''))
+    issue_num = int(m.group(1)) if m else None
+    print(json.dumps({
+        'kind': 'closed-pr',
+        'pr': pr['number'],
+        'iss': issue_num,
+        's': pr.get('state',''),    # MERGED | CLOSED
+        'm': pr.get('mergedAt',''),
+    }))
+"
+}
+
+# Fetch all repos in parallel; emit merged NDJSON, then write per-repo cache.
+fetch_all_issues() {
+    local filter="${1:-}" force="${2:-}"
+
+    mkdir -p "$ISSUE_CACHE_DIR"
+    local -a pids=()
+    local -a outfiles=()
+    local -a repos_fetched=()
+
+    while IFS=: read -r short gh_repo; do
+        [[ -n "$filter" && "$short" != "$filter" ]] && continue
+        if [[ "$force" != "--force" ]] && _cache_valid "$short"; then
+            cat "$(_cache_file "$short")"
+            continue
+        fi
+        local out="/tmp/tms-fetch-$short-$$.ndjson"
+        outfiles+=("$out")
+        repos_fetched+=("$short")
+        ( _fetch_repo "$short" "$gh_repo" | python3 -c "
+import json, sys
+short = '$short'
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    d = json.loads(line)
+    d['repo'] = short
+    print(json.dumps(d))
+" > "$out" 2>/dev/null ) &
+        pids+=($!)
+    done <<< "$(issue_repos)"
+
+    # Wait for parallel fetches
+    for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+    # Emit merged stream to stdout
+    local merged="/tmp/tms-fetch-merged-$$.ndjson"
+    : > "$merged"
+    for f in "${outfiles[@]}"; do
+        [[ -s "$f" ]] && cat "$f" >> "$merged"
+        rm -f "$f"
+    done
+    cat "$merged"
+
+    # Write per-repo cache from merged stream
+    python3 - "$merged" "$ISSUE_CACHE_DIR" "${repos_fetched[@]}" << 'PYEOF' 2>/dev/null || true
+import sys, os, json
+from collections import defaultdict
+merged = sys.argv[1]
+cache_dir = sys.argv[2]
+repos = sys.argv[3:]
+out = defaultdict(list)
+with open(merged) as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try: d = json.loads(line)
+        except Exception: continue
+        r = d.get('repo','')
+        if r: out[r].append(line)
+for r in repos:
+    if r in out:
+        with open(os.path.join(cache_dir, f'{r}.ndjson'), 'w') as f:
+            f.write('\n'.join(out[r]) + '\n')
+PYEOF
+    rm -f "$merged"
+}
+
+# ── session map (which issues have live agents) ──────────────────
+
+_issue_session_map() {
+    local tmp="/tmp/tms-session-map-$$.json"
+    python3 - "$tmp" << 'PYEOF'
+import json, subprocess, re, os, sys
+
+ICONS = {'pi': 'π', 'claude': 'cc', 'opencode': 'oc', 'python3': 'py', 'bash': 'sh', 'zsh': 'sh'}
+REPOS = ['home-portal', 'distillery', 'tower-fleet', 'scripts', 'palimpsest', 'rms', 'deploy', 'tms']
+
+def shell(cmd, timeout=5):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+    except Exception:
+        return ''
+
+panes_raw = shell(['tmux', 'list-panes', '-a', '-F', '#{session_name}|#{pane_current_command}|#{pane_current_path}'])
+ses_info = {}
+for line in panes_raw.split('\n'):
+    if '|' in line:
+        p = line.split('|', 2)
+        ses_info.setdefault(p[0], (p[1], p[2]))
+
+aoe_data = {}
+try:
+    for s in json.loads(shell(['aoe', 'list', '--json'], timeout=3)):
+        aoe_data[s['title']] = {'tool': s.get('tool',''),
+                                'branch': (s.get('worktree') or {}).get('branch',''),
+                                'path': s.get('path','')}
+except Exception:
+    pass
+
+mapping = {}
+for session, (cmd, cwd) in ses_info.items():
+    icon = ICONS.get(cmd, cmd[:3] if cmd else '?')
+
+    # tmq: feat-<repo>#<num>[-cc|-oc]
+    m = re.match(r'(feat|fix|chore|review)-(.+?)#(\d+)(-cc|-oc)?$', session)
+    if m:
+        key = f'{m.group(2)}#{m.group(3)}'
+        mapping.setdefault(key, []).append(f'{session} {icon}')
+        continue
+
+    # aoe: aoe_<title>_<uuid>
+    if session.startswith('aoe_'):
+        parts = session.split('_')
+        if len(parts) >= 3:
+            title = '_'.join(parts[1:-1])
+            info = aoe_data.get(title, {})
+            path = info.get('path', '')
+            branch = info.get('branch', '')
+            repo_name = ''
+            num = ''
+            bm = re.match(r'(feat|fix|chore|review)/issue-(\d+)', branch)
+            if bm:
+                num = bm.group(2)
+                for r in REPOS:
+                    if f'/{r}' in path or path.endswith(f'/{r}'):
+                        repo_name = r; break
+            if not num:
+                bm = re.match(r'(feat|fix|chore|review)-(.+?)#(\d+)', title.replace('_', '#'))
+                if bm:
+                    num = bm.group(3); repo_name = bm.group(2)
+            if num and repo_name:
+                mapping.setdefault(f'{repo_name}#{num}', []).append(f'{session} {icon}')
+        continue
+
+    # scratch: c<n>, o<n>, p<n> — resolve via cwd + branch
+    m = re.match(r'^([cop])(\d+)$', session)
+    if not m:
+        continue
+    if not cwd or not os.path.isdir(os.path.join(cwd, '.git')):
+        continue
+    branch = shell(['git', '-C', cwd, 'branch', '--show-current'])
+    bm = re.match(r'(feat|fix|chore|review)/issue-(\d+)', branch)
+    if not bm:
+        continue
+    num = bm.group(2)
+    repo_name = os.path.basename(cwd.rstrip('/'))
+    for r in REPOS:
+        if cwd.endswith(f'/{r}') or f'/{r}-worktrees/' in cwd or f'/{r}/' in cwd:
+            repo_name = r; break
+    mapping.setdefault(f'{repo_name}#{num}', []).append(f'{session} {icon}')
+
+with open(sys.argv[1], 'w') as f:
+    json.dump(mapping, f)
+PYEOF
+    echo "$tmp"
+}
+
+_cached_session_map() {
+    local cache_file="/tmp/tms-session-map-cache.json"
+    if [[ -f "$cache_file" ]]; then
+        local age=$(($(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0)))
+        if (( age < SESSION_MAP_TTL )); then
+            echo "$cache_file"; return
+        fi
+    fi
+    local map_file
+    map_file=$(_issue_session_map)
+    cp "$map_file" "$cache_file"
+    rm -f "$map_file"
+    echo "$cache_file"
+}
+
+# ── formatting helpers ──────────────────────────────────────────
+
+human_age() {
+    # input: ISO 8601 timestamp; output: relative age (5m / 2h / 3d / 2w / 5mo / 1y)
+    local iso=$1 now=${2:-$NOW}
+    [[ -z "$iso" || "$iso" == "null" ]] && { echo "—"; return; }
+    local ts
+    ts=$(date -d "$iso" +%s 2>/dev/null) || { echo "—"; return; }
+    local diff=$(( now - ts ))
+    (( diff < 0 )) && diff=0
+    if   (( diff < 60 ));       then echo "${diff}s"
+    elif (( diff < 3600 ));     then echo "$((diff / 60))m"
+    elif (( diff < 86400 ));    then echo "$((diff / 3600))h"
+    elif (( diff < 604800 ));   then echo "$((diff / 86400))d"
+    elif (( diff < 2592000 ));  then echo "$((diff / 604800))w"
+    elif (( diff < 31536000 )); then echo "$((diff / 2592000))mo"
+    else                             echo "$((diff / 31536000))y"
+    fi
+}
+
+# ── enrich + format issues for display ───────────────────────────
+
+# view: all | active | yours | stale
+# Output: tab-separated lines, parseable for fzf
+#   visible: REPO  #NN  ST  STATUS  AGENT  AGE  UPD  ★  TITLE
+#   hidden:  <repo>#<num>  (tab-separated, used for dispatch on enter)
+issue_list() {
+    local view="${1:-all}" repo_filter="${2:-}" force_flag="${3:-}"
+    local map_file
+    map_file=$(_cached_session_map 2>/dev/null || echo "")
+
+    local ndjson
+    ndjson=$(fetch_all_issues "$repo_filter" "$force_flag")
+
+    # Write to a temp file so we can pre-process (assign repo to PRs) in one
+    # pass, then format in a second pass. Necessary because the fetch wrapper
+    # already tags lines with repo.
+    local tmp
+    tmp=$(mktemp /tmp/tms-fmt-XXXXXX.ndjson)
+    echo "$ndjson" > "$tmp"
+
+    # Single Python: enrich + format + sort, all in one process
+    python3 - "$view" "$map_file" "$GH_USER" "$NOW" "$tmp" << 'PYEOF'
+import json, sys, os
+from datetime import datetime
+
+view = sys.argv[1]
+map_file = sys.argv[2]
+gh_user = sys.argv[3]
+now = int(sys.argv[4])
+tmp = sys.argv[5]
+
+R='\033[31m'; G='\033[32m'; Y='\033[33m'; B='\033[34m'
+M='\033[35m'; C='\033[36m'; W='\033[37m'; D='\033[2m'; N='\033[0m'; BOLD='\033[1m'
+def color(c, s): return f'{c}{s}{N}'
+
+def parse_ts(s):
+    if not s or s == 'null': return 0
+    try: return int(datetime.fromisoformat(s.replace('Z','+00:00')).timestamp())
+    except Exception: return 0
+
+def human_age(ts):
+    if ts == 0: return '—'
+    diff = max(0, now - ts)
+    if   diff < 60:       return f'{diff}s'
+    elif diff < 3600:     return f'{diff // 60}m'
+    elif diff < 86400:    return f'{diff // 3600}h'
+    elif diff < 604800:   return f'{diff // 86400}d'
+    elif diff < 2592000:  return f'{diff // 604800}w'
+    elif diff < 31536000: return f'{diff // 2592000}mo'
+    else:                 return f'{diff // 31536000}y'
+
+# Load session map
+sessions = {}
+if map_file and os.path.exists(map_file):
+    try: sessions = json.load(open(map_file))
+    except Exception: pass
+
+# Read all lines; separate issues vs prs
+issues = {}   # key (repo,n) -> dict
+prs = {}      # key (repo, iss_n) -> dict
+
+with open(tmp) as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try: d = json.loads(line)
+        except Exception: continue
+
+        if d.get('kind') == 'pr':
+            iss = d.get('iss')
+            repo = d.get('repo','')
+            if iss is not None and repo:
+                prs[(repo, iss)] = d
+            continue
+        if d.get('kind') == 'closed-pr':
+            iss = d.get('iss')
+            repo = d.get('repo','')
+            if iss is not None and repo:
+                # Only set if not already (closed-pr is fallback for issues we don't have PR info for)
+                prs.setdefault((repo, iss), d)
+            continue
+
+        repo = d.get('repo','')
+        n = d.get('n')
+        if not repo or n is None: continue
+        issues[(repo, n)] = {
+            'repo': repo, 'n': n, 't': d.get('t',''),
+            'state': d.get('s','OPEN'),
+            'labels': (d.get('l') or '').lower(),
+            'url': d.get('u',''),
+            'created': parse_ts(d.get('c','')),
+            'updated': parse_ts(d.get('U','')),
+            'closed': parse_ts(d.get('C','')),
+            'assignees': d.get('a',[]) or [],
+        }
+
+# Derive status for each issue
+def derive_status(iss, pr):
+    state = iss['state']
+    labels = iss['labels']
+    key = f'{iss["repo"]}#{iss["n"]}'
+    has_agent = bool(sessions.get(key))
+
+    # Label overrides
+    if 'blocked' in labels:
+        return ('✗', 'blocked', R)
+    if 'question' in labels:
+        return ('?', 'question', M)
+    if 'reviewed' in labels:
+        return ('✔', 'reviewed', G)
+
+    if state == 'OPEN':
+        # Open issue: derive from PR
+        if pr and pr.get('kind') == 'pr':
+            s = pr.get('s','')
+            if s == 'ready-to-merge':   return ('✓', 'ready', G)
+            if s == 'changes-requested': return ('✎', 'changes', R)
+            if s == 'pending-review':   return ('◎', 'review', Y)
+            if s == 'draft':            return ('◐', 'draft', D)
+            if s == 'in-progress':      return ('▶', 'pr open', B)
+        if has_agent:
+            return ('●', 'active', C + BOLD)
+        return ('○', 'open', D)
+
+    # CLOSED
+    if pr and pr.get('s') == 'MERGED':
+        return ('✓', 'merged', G + D)   # dim
+    if pr and pr.get('s') == 'CLOSED':
+        return ('✕', 'closed', R + D)   # dim
+    return ('✕', 'closed', R + D)
+
+# Build rows + apply view filter
+rows = []
+STALE_SECS = 14 * 86400
+RECENT_CLOSED_SECS = 14 * 86400
+
+for (repo, n), iss in issues.items():
+    key = f'{repo}#{n}'
+    pr = prs.get((repo, n))
+    sym, status_text, color_code = derive_status(iss, pr)
+    agents = sessions.get(key, [])
+
+    is_open = iss['state'] == 'OPEN'
+    is_recently_closed = (not is_open) and iss['closed'] > 0 and (now - iss['closed']) < RECENT_CLOSED_SECS
+    has_agent = bool(agents)
+    is_yours = bool(gh_user) and (gh_user in iss['assignees'])
+    is_stale = (is_open
+                and not has_agent
+                and iss['updated'] > 0
+                and (now - iss['updated']) > STALE_SECS
+                and (now - iss['created']) > STALE_SECS)
+
+    # View filter
+    if view == 'active' and not has_agent: continue
+    if view == 'yours' and not is_yours: continue
+    if view == 'stale' and not is_stale: continue
+    # 'all' shows: open + recently closed; older closed filtered out
+    if view == 'all' and not is_open and not is_recently_closed: continue
+
+    rows.append({
+        'repo': repo, 'n': n, 'title': iss['t'],
+        'sym': sym, 'status': status_text, 'color': color_code,
+        'agents': agents, 'is_open': is_open,
+        'created': iss['created'], 'updated': iss['updated'], 'closed': iss['closed'],
+        'is_yours': is_yours,
+        'sort_key': (0 if is_open else 1, -(iss['updated'] if is_open else iss['closed'])),
+    })
+
+# Sort: open by updated desc, closed by closed desc, then by repo/n
+rows.sort(key=lambda r: (r['sort_key'][0], r['sort_key'][1], r['repo'], r['n']))
+
+# Format
+def agent_icons(agts):
+    if not agts: return ''
+    icons = []
+    for s in agts:
+        parts = s.rsplit(' ', 1)
+        icons.append(parts[1] if len(parts) == 2 else s)
+    return ' '.join(icons[:3])
+
+header = f"{'REPO':<12} {'#':<5} {'ST':<3} {'STATUS':<10} {'AGENT':<7} {'AGE':<5} {'UPD':<5} {'★':<2} TITLE"
+print(header)
+print('─' * 78)
+
+count_open = sum(1 for r in rows if r['is_open'])
+count_closed = sum(1 for r in rows if not r['is_open'])
+
+for r in rows:
+    sym_c = color(r['color'], r['sym'])
+    status_c = color(r['color'], f"{r['status']:<9}")
+    age = human_age(r['created'])
+    upd = human_age(r['updated']) if r['is_open'] else human_age(r['closed'])
+    star = '★' if r['is_yours'] else ' '
+    star_c = color(Y + BOLD, star) if r['is_yours'] else ' '
+    agents = agent_icons(r['agents'])
+    agents_c = color(C + BOLD, f'{agents:<6}') if agents else color(D, '—'.ljust(6))
+    title = r['title']
+    if r['sym'] in ('○', '◐') and not r['is_yours']:
+        title = color(D, title)
+    if not r['is_open']:
+        title = color(D, title)
+
+    line = f"{r['repo']:<12} #{r['n']:<4} {sym_c} {status_c} {agents_c} {age:<5} {upd:<5} {star_c} {title}"
+    # Hidden tab field: <repo>#<num> for fzf to extract on enter
+    print(f"{line}\t{r['repo']}#{r['n']}")
+PYEOF
+    rm -f "$tmp"
+}
+
+# ── issue preview ───────────────────────────────────────────────
+
+issue_preview() {
+    local line=$1 key repo num gh_repo
+    # Extract <repo>#<num> from hidden tab field
+    key=$(echo "$line" | sed -n 's/.*\t\([^[:space:]]*#[0-9]*\)$/\1/p')
+    if [[ -z "$key" ]]; then
+        # Fallback: parse from visible columns
+        repo=$(echo "$line" | awk '{print $1}')
+        num=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        key="${repo}#${num}"
+    fi
+    repo="${key%#*}"
+    num="${key#*#}"
+    gh_repo=$(issue_repos | grep "^${repo}:" | cut -d: -f2)
+
+    echo "── Issue: ${gh_repo}#${num} ──"
+    echo ""
+
+    gh issue view "$num" --repo "$gh_repo" --json \
+        title,body,labels,state,url,assignees,createdAt,updatedAt,closedAt,comments 2>/dev/null \
+    | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(f\"Title:  {d['title']}\")
+print(f\"State:  {d['state']}\")
+print(f\"URL:    {d['url']}\")
+ass = ', '.join(a['login'] for a in d.get('assignees',[])) or '—'
+print(f\"Assignees: {ass}\")
+lbls = ' '.join(l['name'] for l in d.get('labels',[])) or '—'
+print(f\"Labels: {lbls}\")
+print(f\"Created: {d.get('createdAt','—')[:10]}  Updated: {d.get('updatedAt','—')[:10]}  Closed: {(d.get('closedAt') or '—')[:10]}\")
+print()
+body = d.get('body','') or '(empty)'
+print('── Body ──')
+print(body[:2500])
+comments = d.get('comments',[]) or []
+if comments:
+    print()
+    print('── Recent comments ──')
+    for cm in comments[-3:]:
+        author = cm.get('author',{}).get('login','?')
+        when = cm.get('createdAt','')[:10]
+        body = (cm.get('body','') or '').replace('\n', ' ')[:400]
+        print(f'  [{when}] {author}: {body}')
+" 2>/dev/null
+
+    echo ""
+    echo "── Linked PRs ──"
+    gh pr list --repo "$gh_repo" --state all --search "issue:$num" \
+        --json number,title,state,reviewDecision,url,isDraft 2>/dev/null \
+    | python3 -c "
+import json, sys
+prs = json.load(sys.stdin)
+if not prs: print('(no linked PRs)')
+for pr in prs:
+    rd = pr.get('reviewDecision') or '—'
+    draft = ' [DRAFT]' if pr.get('isDraft') else ''
+    print(f\"  PR #{pr['number']}: {pr['title']} ({pr['state']}, review={rd}){draft}\")
+    print(f\"  {pr['url']}\")
+" 2>/dev/null
+
+    echo ""
+    echo "── Active Agent Sessions ──"
+    local map_file2
+    map_file2=$(_cached_session_map 2>/dev/null)
+    if [[ -s "$map_file2" ]]; then
+        python3 -c "
+import json
+m = json.load(open('$map_file2'))
+sessions = m.get('$repo#$num', [])
+if not sessions: print('(no active agent sessions)')
+else:
+    for s in sessions: print(f'  {s}')
+" 2>/dev/null
+    else
+        echo "(no active agent sessions)"
+    fi
+}
+
+# ── issue browser (interactive fzf) ─────────────────────────────
+
+issue_browser() {
+    local repo_filter="${1:-}" force_flag="${2:-}" view="${3:-all}"
+
+    # --all: clear filter; --force: skip cache
+    [[ "$repo_filter" == "--all" ]] && repo_filter=""
+    if [[ "$repo_filter" == "--force" ]]; then force_flag="--force"; repo_filter=""; fi
+    [[ "$force_flag" == "--all" ]] && { repo_filter=""; force_flag="--force"; }
+
+    if [[ -z "$repo_filter" ]]; then
+        repo_filter=$(detect_repo_from_cwd)
+        if [[ -n "$repo_filter" ]]; then
+            echo "Auto-detected repo: $repo_filter (add --all for all repos)" >&2
+        else
+            echo "No repo detected from CWD; showing all repos" >&2
+        fi
+    fi
+
+    if ! command -v fzf &>/dev/null; then
+        echo "fzf not found. Install with: apt install fzf" >&2
+        issue_list "$view" "$repo_filter" "$force_flag"
+        return
+    fi
+    if ! command -v tmq &>/dev/null; then
+        echo "tmq not found (needed to dispatch issues)" >&2
+        return 1
+    fi
+
+    # Fetch with spinner
+    local cached="cached"
+    if [[ -n "$repo_filter" ]]; then
+        _cache_valid "$repo_filter" || cached="fetching"
+    else
+        cached="fetching"
+    fi
+    echo "[$view] issues (${repo_filter:-all repos}, $cached)..." >&2
+
+    if [[ ! -t 0 ]]; then
+        issue_list "$view" "$repo_filter" "$force_flag"
+        return
+    fi
+
+    # Stash env for ctrl-r reload
+    [[ -z "$repo_filter" ]] && export TMS_ISSUE_REPO="--all" || export TMS_ISSUE_REPO="$repo_filter"
+    export TMS_ISSUE_FORCE="$force_flag"
+    export TMS_ISSUE_VIEW="$view"
+
+    local next_view case_view
+    case "$view" in
+        all) next_view="active" ;;
+        active) next_view="yours" ;;
+        yours) next_view="stale" ;;
+        stale) next_view="all" ;;
+    esac
+    case "$next_view" in
+        all) case_view="All" ;;
+        active) case_view="Active (with live agents)" ;;
+        yours) case_view="Yours (assigned to @$GH_USER)" ;;
+        stale) case_view="Stale (open >14d, no activity)" ;;
+    esac
+
+    local fzf_header="[$case_view]  enter:dispatch  ctrl-o:browser  ctrl-p:full preview  ctrl-e:review PR  ctrl-v:cycle view  ctrl-r:refresh  ctrl-s:sessions  ?:help  esc:cancel"
+
+    local issue_data
+    issue_data=$(issue_list "$view" "$repo_filter" "$force_flag")
+
+    # Build ctrl-v reload per view
+    local reload_v="tms issues --raw $TMS_ISSUE_REPO --force --view $next_view"
+    local header_v="[$next_view]  enter:dispatch  ctrl-o:browser  ctrl-p:full preview  ctrl-e:review PR  ctrl-v:cycle view  ctrl-r:refresh  ctrl-s:sessions  ?:help  esc:cancel"
+
+    local selected
+    stty -ixon 2>/dev/null
+    selected=$(echo "$issue_data" | fzf \
+        --header="$fzf_header" \
+        --header-first \
+        --ansi \
+        --no-sort \
+        --preview="tms --preview {}" \
+        --preview-window='right:60%:wrap' \
+        --bind="enter:accept" \
+        --bind="ctrl-o:execute(gh issue view \$(echo {} | sed -n 's/.*\\t\\([^[:space:]]*#[0-9]*\\)\$/\\1/p' | cut -d# -f2) --repo bogocat/\$(echo {} | sed -n 's/.*\\t\\([^[:space:]]*#[0-9]*\\)\$/\\1/p' | cut -d# -f1) --web 2>/dev/null)" \
+        --bind="ctrl-p:execute(tms --preview {} | less -R)" \
+        --bind="ctrl-e:execute(key=\$(echo {} | sed -n 's/.*\\t\\([^[:space:]]*#[0-9]*\\)\$/\\1/p'); repo=\${key%#*}; iss=\${key#*#}; pr=\$(gh pr list --repo bogocat/\$repo --search \"issue:\$iss\" --json number --jq '.[0].number' 2>/dev/null); if [[ -n \"\$pr\" ]]; then tmq review \$repo \$pr; else echo \"No linked PR found for \$repo#\$iss\"; fi)" \
+        --bind="ctrl-s:reload(tms sessions)+change-header(enter:attach  ctrl-x/d:kill  ctrl-r:rename  ctrl-k:clean  ctrl-i:issues  ?:help  esc:cancel)+change-preview(name=\"\$(echo {} | sed 's/.*\\t//')\"; tmux capture-pane -t \"\$name\" -p -S -40 2>/dev/null | sed 's/^/  /')" \
+        --bind="ctrl-v:reload($reload_v)+change-header($header_v)" \
+        --bind="ctrl-r:reload(tms issues --raw $TMS_ISSUE_REPO --force --view $view)+change-header(refreshing...  enter=dispatch  ctrl-o=browser  ctrl-s=back  ?=help  esc=cancel)" \
+        --bind="?:execute(printf '%s\n\n' 'KEYBINDINGS' '-----------' 'enter      dispatch agent (via tmq)' 'ctrl-o     open issue in browser' 'ctrl-p     full preview' 'ctrl-e     code review linked PR' 'ctrl-v     cycle view (All/Active/Yours/Stale)' 'ctrl-r     force refresh (skip cache)' 'ctrl-s     switch to session browser' '?          this help' 'esc        cancel' '' 'VIEW MODES' '-----------' 'All      all open + recently closed (14d)' 'Active   issues with a live agent session' 'Yours    assigned to you' 'Stale    open >14d, no activity, no agent' '' 'COLUMNS' '--------' 'ST  status (○open ●active ▶pr ◐draft ◎review ✎changes ✓ready ✗blocked ✔reviewed ?question)' 'AGE since created  UPD since last update  ★ assigned to you' | less -R)" \
+        2>/dev/null || true)
+
+    if [[ -n "$selected" ]]; then
+        local key repo num
+        key=$(echo "$selected" | sed -n 's/.*\t\([^[:space:]]*#[0-9]*\)$/\1/p')
+        if [[ -n "$key" ]]; then
+            repo="${key%#*}"
+            num="${key#*#}"
+            tmq "$repo" "$num"
+            exec tms
+        fi
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# Session browser (formerly the default behavior of `tms`)
+# ═══════════════════════════════════════════════════════════════
 
 session_age_seconds() {
     local created
@@ -58,119 +775,81 @@ detect_agent() {
     esac
 }
 
-# Check ALL panes in ALL windows. A session is stale only if every
-# pane is sitting at a shell prompt and the session is old + unattached.
 is_session_stale() {
     local name=$1
     local age_sec attached
-
     age_sec=$(session_age_seconds "$name")
     (( age_sec <= STALE_DAYS * 86400 )) && return 1
-
     attached=$(tmux list-sessions -F "#{session_attached}" -f "#{==:#{session_name},$name}" 2>/dev/null)
     (( attached > 0 )) && return 1
-
-    # Check every pane — if ANY pane is running something non-shell, it's active
     local panes
     panes=$(tmux list-panes -t "$name" -F "#{pane_current_command}" 2>/dev/null) || return 1
-
     while IFS= read -r cmd; do
         [[ -z "$cmd" ]] && continue
         case "$cmd" in
-            bash|zsh|fish|sh|dash) ;;  # shell prompt = idle
-            *) return 1 ;;              # anything else = active work
+            bash|zsh|fish|sh|dash) ;;
+            *) return 1 ;;
         esac
     done <<< "$panes"
-
-    return 0  # all panes idle → stale
+    return 0
 }
 
-# ── issue status lookup (for session list coloring) ──────────────
-
-# Build a mapping from "repo#num" → "sym|status|color_code"
-# Reads cached NDJSON files (fast, no network)
-_issue_status_lookup() {
+# Read cached NDJSON issue files and produce "repo#num → sym|status|color"
+_session_status_lookup() {
     local cache_dir="$ISSUE_CACHE_DIR"
     [[ -d "$cache_dir" ]] || { echo ""; return; }
-
     python3 - "$cache_dir" << 'PYEOF'
 import json, sys, os, glob
-
-R='\033[31m'; G='\033[32m'; Y='\033[33m'; B='\033[34m'
-M='\033[35m'; C='\033[36m'; D='\033[2m'; N='\033[0m'; BOLD='\033[1m'
-
+R='\033[31m'; G='\033[32m'; Y='\033[33m'; M='\033[35m'; C='\033[36m'; D='\033[2m'; N='\033[0m'
 cache_dir = sys.argv[1]
 for f in sorted(glob.glob(os.path.join(cache_dir, '*.ndjson'))):
     try:
         with open(f) as fh:
             for line in fh:
                 line = line.strip()
-                if not line:
-                    continue
-                iss = json.loads(line)
-                key = f"{iss['repo']}#{iss['number']}"
-                status = iss.get('status', '')
-                labels = iss.get('labels', '').lower()
-
-                if 'blocked' in labels:
-                    print(f"{key}\t✗\tblocked\t31")
-                elif 'question' in labels:
-                    print(f"{key}\t?\tquestion\t35")
-                elif 'reviewed' in labels:
-                    print(f"{key}\t✔\treviewed\t32")
-                elif status == 'ready-to-merge':
-                    print(f"{key}\t✓\tready\t32")
-                elif status == 'pending-review':
-                    print(f"{key}\t◎\treview\t33")
-                elif status == 'in progress':
-                    print(f"{key}\t▶\tpr open\t34")
-                else:
-                    # Open issue — session_info will color it cyan (has agent)
-                    print(f"{key}\t○\topen\t0")
-    except Exception:
-        continue
+                if not line: continue
+                try: iss = json.loads(line)
+                except Exception: continue
+                # We don't have full enrichment here, just labels. Best-effort.
+                key = f"{iss.get('repo','')}#{iss.get('n') or iss.get('number','')}"
+                if not iss.get('repo'): continue
+                labels = (iss.get('l') or iss.get('labels','') or '').lower()
+                state = iss.get('s') or iss.get('state','')
+                if 'blocked' in labels: print(f"{key}\t✗\tblocked\t31")
+                elif 'question' in labels: print(f"{key}\t?\tquestion\t35")
+                elif 'reviewed' in labels: print(f"{key}\t✔\treviewed\t32")
+                elif state == 'CLOSED': print(f"{key}\t✕\tclosed\t2")
+                else: print(f"{key}\t○\topen\t2")
+    except Exception: continue
 PYEOF
 }
 
-# Compact session name for display (strip aoe_ prefix + UUID suffix)
 compact_session_name() {
     local name=$1
-    # tmq sessions: already short, keep as-is
-    if [[ "$name" =~ ^(feat|fix|chore|review)- ]]; then
-        echo "$name"
-        return
-    fi
-    # aoe sessions: aoe_feat-home-portal_5_f3cc709e → feat-home-portal#5
+    if [[ "$name" =~ ^(feat|fix|chore|review)- ]]; then echo "$name"; return; fi
     if [[ "$name" == aoe_* ]]; then
-        local stripped="${name#aoe_}"       # feat-home-portal_5_f3cc709e
-        local uuid="${stripped##*_}"        # f3cc709e
+        local stripped="${name#aoe_}"
+        local uuid="${stripped##*_}"
         if [[ "$uuid" =~ ^[0-9a-f]{6,}$ ]]; then
-            stripped="${stripped%_$uuid}"   # feat-home-portal_5
+            stripped="${stripped%_$uuid}"
         fi
-        # Replace _ with # for the issue number part: feat-home-portal_5 → feat-home-portal#5
         if [[ "$stripped" =~ _([0-9]+)$ ]]; then
             stripped="${stripped%_${BASH_REMATCH[1]}}#${BASH_REMATCH[1]}"
         fi
-        echo "$stripped"
-        return
+        echo "$stripped"; return
     fi
-    # Everything else: keep as-is
     echo "$name"
 }
 
 session_info() {
-    local name=$1
-    local status_map="${2:-}"    # temp file: key\tsym\tstatus\tcolor
-    local session_issue="${3:-}" # pre-resolved issue key (for aoe sessions)
+    local name=$1 status_map="${2:-}" session_issue="${3:-}"
     local cmd cwd attached wins age_sec
-
     cmd=$(tmux list-panes -t "$name" -F "#{pane_current_command}" 2>/dev/null | head -1)
     cwd=$(tmux list-panes -t "$name" -F "#{pane_current_path}" 2>/dev/null | head -1)
     attached=$(tmux list-sessions -F "#{session_attached}" -f "#{==:#{session_name},$name}" 2>/dev/null)
     wins=$(tmux list-sessions -F "#{session_windows}" -f "#{==:#{session_name},$name}" 2>/dev/null)
     age_sec=$(session_age_seconds "$name")
 
-    # Shorten cwd
     local short_cwd="$cwd"
     short_cwd="${short_cwd/#\/root/}"
     short_cwd="${short_cwd/#\/home/}"
@@ -187,79 +866,54 @@ session_info() {
     age_str=$(session_age_human "$age_sec")
 
     local stale_flag=" "
-    if is_session_stale "$name"; then
-        stale_flag="⚰"
-    fi
+    is_session_stale "$name" && stale_flag="⚰"
 
-    # Multi-window indicator
     local win_mark="$wins"
     (( wins > 1 )) && win_mark="${wins}w"
 
-    # Compact session display name
-    local display_name
-    display_name=$(compact_session_name "$name")
+    local disp_name
+    disp_name=$(compact_session_name "$name")
+    if (( ${#disp_name} > 28 )); then disp_name="${disp_name:0:25}…"; fi
 
-    # Detect linked issue + color
     local issue="—"
     local issue_key=""
-
     if [[ "$name" =~ ^(feat|fix|chore|review)-(.+)#([0-9]+) ]]; then
         issue_key="${BASH_REMATCH[2]}#${BASH_REMATCH[3]}"
     fi
-    if [[ -z "$issue_key" && -n "$session_issue" ]]; then
-        issue_key="$session_issue"
-    fi
+    [[ -z "$issue_key" && -n "$session_issue" ]] && issue_key="$session_issue"
 
-    if [[ -n "$issue_key" ]]; then
-        if [[ -n "$status_map" && -f "$status_map" ]]; then
-            local lookup
-            lookup=$(grep "^${issue_key}"$'\t' "$status_map" 2>/dev/null | head -1 || true)
-            if [[ -n "$lookup" ]]; then
-                local sym status_text color_code
-                sym=$(echo "$lookup" | cut -f2)
-                color_code=$(echo "$lookup" | cut -f4)
-                [[ "$color_code" == "0" ]] && color_code="36;1"
-                local ec nc
-                printf -v ec '\033[%sm' "$color_code"
-                printf -v nc '\033[0m'
-                issue="${ec}${sym} ${issue_key}${nc}"
-            else
-                issue="${issue_key}"
-            fi
+    if [[ -n "$issue_key" && -n "$status_map" && -f "$status_map" ]]; then
+        local lookup
+        lookup=$(grep "^${issue_key}"$'\t' "$status_map" 2>/dev/null | head -1 || true)
+        if [[ -n "$lookup" ]]; then
+            local sym color_code ec nc
+            sym=$(echo "$lookup" | cut -f2)
+            color_code=$(echo "$lookup" | cut -f4)
+            [[ "$color_code" == "0" ]] && color_code="36;1"
+            printf -v ec '\033[%sm' "$color_code"
+            printf -v nc '\033[0m'
+            issue="${ec}${sym} ${issue_key}${nc}"
         else
             issue="${issue_key}"
         fi
     fi
 
-    # Use real name for fzf selection (first field = awk {print $1})
-    # But display compact: aoe_ prefix + UUID stripped if possible
-    local disp_name
-    disp_name=$(compact_session_name "$name")
-    # Truncate if needed
-    if (( ${#disp_name} > 28 )); then
-        disp_name="${disp_name:0:25}…"
-    fi
-
-    # Output real name as invisible last column (tab-separated, fzf strips ANSI
-    # but keeps text — preview/attach use real name from {1})
     printf "%-28s %s%-1s %-3s %-7s %-3s %-24s %s\t%s\n" \
         "$disp_name" "$att_marker" "$agent_icon" "$win_mark" "$age_str" "$stale_flag" "$issue" "$short_cwd" "$name"
 }
 
-session_list() {
-    # Build issue status lookup (fast — reads from cache)
+session_list_text() {
     local status_map
     status_map=$(mktemp /tmp/tms-session-status-XXXXXX.tsv)
-    _issue_status_lookup > "$status_map" 2>/dev/null || true
+    _session_status_lookup > "$status_map" 2>/dev/null || true
 
-    # Build session→issue map for aoe sessions (invert the session map)
     local sess_map
     sess_map=$(_cached_session_map 2>/dev/null || echo "")
     local aoe_issues
     aoe_issues=$(mktemp /tmp/tms-aoe-issues-XXXXXX.tsv)
     if [[ -n "$sess_map" && -s "$sess_map" ]]; then
         python3 -c "
-import json, sys
+import json
 m = json.load(open('$sess_map'))
 for key, sessions in m.items():
     for s in sessions:
@@ -276,7 +930,6 @@ for key, sessions in m.items():
     while IFS= read -r name; do
         [[ -z "$name" ]] && continue
         local sess_issue=""
-        # Look up aoe session → issue mapping
         if [[ -s "$aoe_issues" ]]; then
             sess_issue=$(grep "^${name}"$'\t' "$aoe_issues" 2>/dev/null | head -1 | cut -f2 || true)
         fi
@@ -285,8 +938,6 @@ for key, sessions in m.items():
 
     rm -f "$status_map" "$aoe_issues"
 }
-
-# ── actions ──────────────────────────────────────────────────────
 
 attach_session() {
     local name=$1
@@ -319,8 +970,6 @@ rename_session() {
     fi
 }
 
-# ── stale detection (all windows) ────────────────────────────────
-
 stale_sessions() {
     printf "%-20s %-7s %-4s %s\n" "SESSION" "AGE" "WINS" "WINDOWS"
     printf "%s\n" "──────────────────────────────────────────────────"
@@ -339,19 +988,12 @@ stale_sessions() {
     done <<< "$(tmux list-sessions -F "#{session_name}" 2>/dev/null | sort)"
 }
 
-# ── compact scratch sessions ─────────────────────────────────────
-
-# After killing stale sessions, renumber single-letter-prefix sessions
-# so they're contiguous.  c0,c4,c5 → c0,c1,c2.  Skips attached sessions.
 compact_scratch_sessions() {
     local prefixes=()
-
-    # Find which single-letter prefixes exist
     while IFS= read -r name; do
         [[ -z "$name" ]] && continue
         if [[ "$name" =~ ^([a-z])([0-9]+)$ ]]; then
             local p="${BASH_REMATCH[1]}"
-            # Only collect each prefix once
             [[ " ${prefixes[*]:-} " != *" $p "* ]] && prefixes+=("$p")
         fi
     done <<< "$(tmux list-sessions -F "#{session_name}" 2>/dev/null)"
@@ -365,15 +1007,14 @@ compact_scratch_sessions() {
             fi
         done <<< "$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^${prefix}[0-9]\+$" | sort -V)"
 
-        local idx=0
-        local renamed=0
+        local idx=0 renamed=0
         for s in "${remaining[@]}"; do
             local target="${prefix}${idx}"
             if [[ "$s" != "$target" ]]; then
                 local att
                 att=$(tmux list-sessions -F "#{session_attached}" -f "#{==:#{session_name},$s}" 2>/dev/null)
                 if (( att > 0 )); then
-                    echo "  skip $s → $target (attached, rename manually)"
+                    echo "  skip $s → $target (attached)"
                 else
                     tmux rename-session -t "$s" "$target" 2>/dev/null && \
                         echo "  $s → $target" && renamed=1
@@ -385,548 +1026,71 @@ compact_scratch_sessions() {
     done
 }
 
-# ── issue browser ─────────────────────────────────────────────────
-# tms issues — browse open GitHub issues across repos with pipeline
-# status (open / in progress / pending review / ready to merge).
-
-# Repo registry (mirrors tmq's REPO_GH for GH API)
-issue_repos() {
-    cat <<'EOF'
-distillery:bogocat/distillery
-home-portal:bogocat/home-portal
-tower-fleet:bogocat/tower-fleet
-scripts:bogocat/scripts
-palimpsest:bogocat/palimpsest
-rms:bogocat/openrms
-tms:bogocat/tms
-EOF
-}
-
-# Map a directory path to a repo shortname (handles worktrees)
-detect_repo_from_cwd() {
-    local dir="${1:-$PWD}"
-    case "$dir" in
-        */distillery*|*/wt-distillery*/) echo distillery ;;
-        */home-portal*|*/wt-home-portal*/) echo home-portal ;;
-        */tower-fleet*|*/wt-tower-fleet*/)  echo tower-fleet ;;
-        */scripts*|*/wt-scripts*/|*/bogocat/scripts*) echo scripts ;;
-        */palimpsest*|*/wt-palimpsest*/)    echo palimpsest ;;
-        */rms*|*/wt-rms*/)                echo rms ;;
-        */tms*)                           echo tms ;;
-        *)                                echo "" ;;
-    esac
-}
-
-# Cache helpers
-_cache_file() { echo "$ISSUE_CACHE_DIR/$1.ndjson"; }
-
-_cache_valid() {
-    local cf
-    cf=$(_cache_file "$1")
-    [[ -f "$cf" ]] || return 1
-    local age
-    age=$(($NOW - $(stat -c %Y "$cf" 2>/dev/null || echo 0)))
-    (( age < ISSUE_CACHE_TTL ))
-}
-
-_read_cache() {
-    local cf
-    cf=$(_cache_file "$1")
-    [[ -f "$cf" ]] && cat "$cf"
-}
-
-_write_cache() {
-    mkdir -p "$ISSUE_CACHE_DIR"
-    cat - > "$(_cache_file "$1")"
-}
-
-_clear_cache() {
-    rm -rf "$ISSUE_CACHE_DIR"
-    mkdir -p "$ISSUE_CACHE_DIR"
-}
-
-# Fetch issues + PRs for a single repo, output NDJSON with pipeline status
-fetch_repo_issues() {
-    local short=$1 gh_repo=$2
-    local tmp=/tmp/tms-issues-$$-$short
-
-    # Fetch open issues + PRs to temp files
-    gh issue list --repo "$gh_repo" --state open \
-        --limit 50 --json number,title,labels,url,createdAt > "$tmp.issues" 2>/dev/null || return
-
-    gh pr list --repo "$gh_repo" --state open \
-        --limit 50 --json number,title,body,headRefName,reviewDecision,url > "$tmp.prs" 2>/dev/null || echo '[]' > "$tmp.prs"
-
-    # Single python pass: enrich issues with PR status
-    python3 - "$tmp.issues" "$tmp.prs" "$short" << 'PYEOF'
-import json, sys, re
-
-with open(sys.argv[1]) as f:
-    issues = json.load(f)
-with open(sys.argv[2]) as f:
-    prs = json.load(f)
-short_name = sys.argv[3]
-
-pr_status = {}
-for pr in prs:
-    # Branch: feat/issue-68-*
-    m = re.search(r'issue-(\d+)', pr.get('headRefName',''))
-    if not m:
-        # Title: "... (#68)"
-        m = re.search(r'\(#(\d+)\)', pr.get('title',''))
-    if not m:
-        # Body: closes/fixes/resolves #68
-        m = re.search(r'(?:close|fix|resolve)[sd]?\s+#(\d+)', pr.get('body',''), re.I)
-    if m:
-        num = int(m.group(1))
-        rd = pr.get('reviewDecision','') or ''
-        status = 'in progress'
-        if rd == 'APPROVED': status = 'ready-to-merge'
-        elif rd in ('REVIEW_REQUIRED','CHANGES_REQUESTED'): status = 'pending-review'
-        pr_status[num] = (pr['number'], status)
-
-for iss in issues:
-    num = iss['number']
-    labels = ' '.join(l['name'] for l in iss.get('labels',[]))
-    status = pr_status.get(num, (None, 'open issue'))[1]
-    out = {
-        'repo': short_name,
-        'number': num,
-        'title': iss['title'],
-        'labels': labels,
-        'status': status,
-    }
-    print(json.dumps(out))
-PYEOF
-    rm -f "$tmp.issues" "$tmp.prs"
-}
-
-# Fetch all issues across repos, output NDJSON
-# Optional $1 filters to a single repo shortname
-# Uses cache unless $2 == "--force"
-fetch_all_issues() {
-    local filter="${1:-}" force="${2:-}"
-    local -a repos_to_fetch=()
-    while IFS=: read -r short gh_repo; do
-        [[ -n "$filter" && "$short" != "$filter" ]] && continue
-        repos_to_fetch+=("$short:$gh_repo")
-    done <<< "$(issue_repos)"
-
-    mkdir -p "$ISSUE_CACHE_DIR"
-    for entry in "${repos_to_fetch[@]}"; do
-        local short="${entry%%:*}" gh_repo="${entry##*:}"
-        if [[ "$force" != "--force" ]] && _cache_valid "$short"; then
-            _read_cache "$short"
-        else
-            fetch_repo_issues "$short" "$gh_repo" 2>/dev/null | tee "$(_cache_file "$short")"
-        fi
-    done
-}
-
-# Build session → issue mapping (JSON: repo#num → [agent info])
-# Batched into single tmux call + single git sweep for speed
-_issue_session_map() {
-    local tmp="/tmp/tms-session-map-$$.json"
-    python3 - "$tmp" << 'PYEOF'
-import json, subprocess, re, os, sys
-
-ICONS = {'pi': '\u03c0', 'claude': 'cc', 'opencode': 'oc', 'python3': 'py', 'bash': 'sh', 'zsh': 'sh'}
-REPOS = ['home-portal', 'distillery', 'tower-fleet', 'scripts', 'palimpsest', 'rms', 'deploy']
-
-def shell(cmd, timeout=5):
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.stdout.strip()
-    except:
-        return ''
-
-# Single tmux call: all panes → session, command, cwd
-panes_raw = shell(['tmux', 'list-panes', '-a', '-F', '#{session_name}|#{pane_current_command}|#{pane_current_path}'])
-panes = []
-for line in panes_raw.split('\n'):
-    if '|' in line:
-        p = line.split('|', 2)
-        panes.append({'session': p[0], 'cmd': p[1], 'cwd': p[2]})
-
-# Build session→(cmd,cwd) map (first pane per session)
-ses_info = {}
-for p in panes:
-    if p['session'] not in ses_info:
-        ses_info[p['session']] = (p['cmd'], p['cwd'])
-
-# aoe sessions (try, don't block)
-aoe_data = {}
-try:
-    for s in json.loads(shell(['aoe', 'list', '--json'], timeout=3)):
-        aoe_data[s['title']] = {'tool': s.get('tool',''), 'branch': (s.get('worktree') or {}).get('branch',''), 'path': s.get('path','')}
-except: pass
-
-mapping = {}
-
-for session, (cmd, cwd) in ses_info.items():
-    icon = ICONS.get(cmd, cmd[:3] if cmd else '?')
-
-    # tmq sessions: feat|fix|chore|review-<repo>#<num>[-cc|-oc]
-    m = re.match(r'(feat|fix|chore|review)-(.+?)#(\d+)(-cc|-oc)?$', session)
-    if m:
-        key = f'{m.group(2)}#{m.group(3)}'
-        mapping.setdefault(key, []).append(f'{session} {icon}')
-        continue
-
-    # aoe sessions: aoe_<title>_<uuid>
-    if session.startswith('aoe_'):
-        parts = session.split('_')
-        if len(parts) >= 3:
-            title = '_'.join(parts[1:-1])
-            info = aoe_data.get(title, {})
-            path = info.get('path','')
-            # Try 1: branch name like feat/issue-68-*
-            bm = re.match(r'(feat|fix|chore|review)/issue-(\d+)', info.get('branch',''))
-            if not bm:
-                # Try 2: aoe title like "feat-home-portal#5" (direct issue ref)
-                bm = re.match(r'(feat|fix|chore|review)-(.+?)#(\d+)', title.replace('_', '#'))
-            if bm:
-                num = bm.group(2) if len(bm.groups()) == 2 else bm.group(3) if len(bm.groups()) == 3 else ''
-                if not num or not num.isdigit():
-                    num = bm.group(3) if len(bm.groups()) >= 3 else ''
-                # Re-extract groups properly: (type, repo, num) or (type, issue-num)
-                if bm.lastindex and bm.lastindex >= 2:
-                    if bm.lastindex == 2:
-                        # Branch match: (type, issue-number-only)
-                        num = bm.group(2)
-                        # Find repo from path
-                        repo_name = os.path.basename(path.rstrip('/'))
-                        for r in REPOS:
-                            if f'/{r}' in path:
-                                repo_name = r; break
-                    else:
-                        # Title match: (type, repo, num)
-                        repo_name = bm.group(2)
-                        num = bm.group(3)
-                    key = f'{repo_name}#{num}'
-                    mapping.setdefault(key, []).append(f'{session} {icon}')
-        continue
-
-    # scratch: c<n>, o<n>, p<n>
-    m = re.match(r'^([cop])(\d+)$', session)
-    if not m:
-        continue
-    if not cwd or not os.path.isdir(os.path.join(cwd, '.git')):
-        continue
-    branch = shell(['git', '-C', cwd, 'branch', '--show-current'])
-    bm = re.match(r'(feat|fix|chore|review)/issue-(\d+)', branch)
-    if not bm:
-        continue
-    num = bm.group(2)
-    repo_name = os.path.basename(cwd.rstrip('/'))
-    for r in REPOS:
-        if cwd.endswith(f'/{r}') or f'/{r}-worktrees/' in cwd or f'/{r}/' in cwd:
-            repo_name = r; break
-    key = f'{repo_name}#{num}'
-    mapping.setdefault(key, []).append(f'{session} {icon}')
-
-with open(sys.argv[1], 'w') as f:
-    json.dump(mapping, f)
-PYEOF
-    echo "$tmp"
-}
-
-# Cached wrapper for session map (TTL 15s — sessions don't change fast)
-_cached_session_map() {
-    local cache_file="/tmp/tms-session-map-cache.json"
-    local ttl=15
-    if [[ -f "$cache_file" ]]; then
-        local age=$(($(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0)))
-        if (( age < ttl )); then
-            echo "$cache_file"
-            return
-        fi
-    fi
-    local map_file
-    map_file=$(_issue_session_map)
-    cp "$map_file" "$cache_file"
-    rm -f "$map_file"
-    echo "$cache_file"
-}
-
-# Format issues for display (fzf input) — single Python pass for speed
-issue_list() {
-    local repo_filter="${1:-}" force_flag="${2:-}"
-
-    # Build session map (identifies which agents work on which issues)
-    local map_file
-    map_file=$(_cached_session_map)
-
-    printf "%-12s %-5s %-3s %-7s %-6s %s\n" "REPO" "#" "ST" "STATUS" "AGENT" "TITLE"
-    printf "%s\n" "─────────────────────────────────────────────────────────────────"
-
-    # Pipe all NDJSON through a single Python process — avoids spawning
-    # python3 per-field/per-line (was 5+ processes per issue)
-    local map_arg=""
-    [[ -s "$map_file" ]] && map_arg="$map_file"
-
-    local pyfmt
-    pyfmt=$(mktemp /tmp/tms-fmt-XXXXXX.py)
-    cat > "$pyfmt" << 'PYEOF'
-import json, sys
-
-# ANSI helpers
-R = '\033[31m'; G = '\033[32m'; Y = '\033[33m'; B = '\033[34m'
-M = '\033[35m'; C = '\033[36m'; W = '\033[37m'; D = '\033[2m'; N = '\033[0m'
-BOLD = '\033[1m'
-
-def color(c, s):
-    return f'{c}{s}{N}'
-
-# Load session map
-sessions = {}
-if len(sys.argv) > 1 and sys.argv[1]:
-    with open(sys.argv[1]) as f:
-        sessions = json.load(f)
-
-# Agent icon extraction from session names like "feat-distillery#245-oc π"
-def agent_icons(key):
-    if key not in sessions:
-        return ''
-    icons = []
-    for s in sessions[key]:
-        # s is like "feat-distillery#245-oc π" — grab the icon after the space
-        parts = s.rsplit(' ', 1)
-        if len(parts) == 2:
-            icons.append(parts[1])
-        else:
-            icons.append(s)
-    return ' '.join(icons[:2])
-
-# Status detection
-def get_status(iss):
-    status = iss.get('status', '')
-    labels = iss.get('labels', '').lower()
-    key = f'{iss["repo"]}#{iss["number"]}'
-    has_agent = bool(agent_icons(key))
-
-    # Label-based overrides (check before PR status)
-    if 'blocked' in labels:
-        return ('✗', 'blocked', R)
-    if 'question' in labels:
-        return ('?', 'question', M)
-    if 'reviewed' in labels:
-        return ('✔', 'reviewed', G)
-
-    # PR-based status
-    if status == 'ready-to-merge':
-        return ('✓', 'ready', G)
-    if status == 'pending-review':
-        return ('◎', 'review', Y)
-    if status == 'in progress':
-        return ('▶', 'pr open', B)
-    if has_agent:
-        return ('●', 'active', C + BOLD)
-    return ('○', 'open', D)
-
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        iss = json.loads(line)
-    except json.JSONDecodeError:
-        continue
-
-    repo = iss.get('repo', '')
-    if not repo:
-        continue
-    num = iss.get('number', '')
-    title = iss.get('title', '')
-
-    sym, status_text, status_color = get_status(iss)
-    key = f'{repo}#{num}'
-    agents = agent_icons(key)
-
-    # Color the symbol and status
-    sym_colored = color(status_color, sym)
-    status_colored = color(status_color, f'{status_text:<7}')
-
-    # Agent column: color icons if present, dim dash if not
-    if agents:
-        agent_colored = color(C + BOLD, f'{agents:<6}')
-    else:
-        agent_colored = color(D, '—'.ljust(6))
-
-    # Title: dim if open+no-agent, otherwise normal
-    if sym == '○':
-        title = color(D, title)
-
-    # Truncate title to fit terminal
-    print(f'{repo:<12} #{num:<4}  {sym_colored} {status_colored} {agent_colored} {title}')
-PYEOF
-
-    fetch_all_issues "$repo_filter" "$force_flag" | python3 "$pyfmt" "$map_arg"
-    rm -f "$pyfmt"
-
-    # Session map is shared cache, don't delete
-}
-
-# Issue preview (body + linked PRs)
-issue_preview() {
-    local line=$1 repo num
-    repo=$(echo "$line" | awk '{print $1}')
-    num=$(echo "$line" | awk '{print $2}' | tr -d '#')
-
-    local gh_repo
-    gh_repo=$(issue_repos | grep "^${repo}:" | cut -d: -f2)
-
-    echo "── Issue: $gh_repo#$num ──"
-    echo ""
-    gh issue view "$num" --repo "$gh_repo" --json title,body,labels,state,url 2>/dev/null | \
-        python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-print(f\"Title:  {d['title']}\")
-print(f\"State:  {d['state']}\")
-print(f\"URL:    {d['url']}\")
-print(f\"Labels: {' '.join(l['name'] for l in d.get('labels',[]))}\")
-print()
-print(d.get('body','')[:2000])
-" 2>/dev/null
-
-    echo ""
-    echo "── Linked PRs ──"
-    gh pr list --repo "$gh_repo" --state open --search "issue:$num" \
-        --json number,title,reviewDecision,url 2>/dev/null | \
-        python3 -c "
-import json, sys
-prs = json.load(sys.stdin)
-if not prs:
-    print('(no linked PRs)')
-for pr in prs:
-    rd = pr.get('reviewDecision','') or 'open'
-    print(f\"  PR #{pr['number']}: {pr['title']} ({rd})\")
-    print(f\"  {pr['url']}\")
-" 2>/dev/null
-
-    echo ""
-    echo "── Active Agent Sessions ──"
-    local map_file2
-    map_file2=$(_cached_session_map 2>/dev/null)
-    if [[ -s "$map_file2" ]]; then
-        python3 -c "
-import json
-m = json.load(open('$map_file2'))
-key = '${repo}#${num}'
-sessions = m.get(key, [])
-if not sessions:
-    print('(no active agent sessions)')
-else:
-    for s in sessions:
-        print(f'  {s}')
-" 2>/dev/null
-        # Don't delete — _cached_session_map returns the shared cache file
-    else
-        echo "(no active agent sessions)"
-    fi
-}
-
-# Interactive issue browser (fzf picker)
-issue_browser() {
-    local repo_filter="${1:-}" force_flag="${2:-}"
-
-    # --all: show all repos
-    if [[ "$repo_filter" == "--all" ]]; then
-        repo_filter=""
-    fi
-
-    # --force: skip cache
-    if [[ "$repo_filter" == "--force" ]]; then
-        force_flag="--force"
-        repo_filter=""
-    elif [[ "$force_flag" == "--all" ]]; then
-        repo_filter=""
-        force_flag="--force"
-    fi
-
-    # No repo filter specified → auto-detect from CWD
-    if [[ -z "$repo_filter" ]]; then
-        repo_filter=$(detect_repo_from_cwd)
-        if [[ -n "$repo_filter" ]]; then
-            echo "Auto-detected repo: $repo_filter (add --all for all repos)" >&2
-        else
-            echo "No repo detected from CWD; showing all repos" >&2
-        fi
-    fi
-
-    # If for some reason --force wasn't set but passed, check
-    if [[ "${2:-}" == "--force" ]]; then
-        force_flag="--force"
-    fi
-
-    if ! command -v fzf &>/dev/null; then
-        echo "fzf not found. Install with: apt install fzf"
-        echo ""
-        echo "Available issues:"
-        issue_list "$repo_filter"
-        exit 1
-    fi
-
-    if ! command -v tmq &>/dev/null; then
-        echo "tmq not found (needed to dispatch issues)"
-        exit 1
-    fi
-
-    # Build header with cache/repo info
-    local fzf_header="enter:dispatch  ctrl-o:browser  ctrl-p:preview  ctrl-e:review  ctrl-s:sessions  ?:help  esc:cancel"
-    if [[ "$force_flag" == "--force" ]]; then
-        echo "Fetching issues (force refresh)..." >&2
-    elif [[ -n "$repo_filter" ]]; then
-        local cached="cached"
-        _cache_valid "$repo_filter" || cached="fetching"
-        echo "Issues for $repo_filter ($cached)..." >&2
-    else
-        echo "Fetching all issues..." >&2
-    fi
-    local issue_data
-    issue_data=$(issue_list "$repo_filter" "$force_flag")
-
-    # If no TTY, just print the list
-    if [[ ! -t 0 ]]; then
-        echo "$issue_data"
+clean_stale() {
+    local -a to_kill=()
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        is_session_stale "$name" && to_kill+=("$name")
+    done <<< "$(tmux list-sessions -F "#{session_name}" 2>/dev/null | sort)"
+
+    if ((${#to_kill[@]} == 0)); then
+        echo "No stale sessions found (>${STALE_DAYS}d, all windows idle)."
         return
     fi
-
-    # Export for ctrl-r force-refresh reload; "--all" sentinel = all repos
-    if [[ -z "$repo_filter" ]]; then
-        export TMS_ISSUE_REPO="--all"
-    else
-        export TMS_ISSUE_REPO="$repo_filter"
+    echo "Stale sessions (>${STALE_DAYS}d):"
+    for s in "${to_kill[@]}"; do
+        local wins
+        wins=$(tmux list-sessions -F "#{session_windows}" -f "#{==:#{session_name},$s}" 2>/dev/null)
+        local win_detail
+        win_detail=$(tmux list-windows -t "$s" -F "#{window_index}:#{pane_current_command}" 2>/dev/null | tr '\n' ' ')
+        echo "  $s  (${wins} windows: $win_detail)"
+    done
+    local auto_yes="${2:-}"
+    if [[ "$auto_yes" != "--yes" ]]; then
+        printf "Kill all %d? [y/N] " "${#to_kill[@]}"
+        read -r ans
+        [[ ! "$ans" =~ ^[Yy]$ ]] && { echo "Cancelled."; return; }
     fi
-    export TMS_ISSUE_FORCE="$force_flag"
+    for s in "${to_kill[@]}"; do
+        tmux kill-session -t "$s" 2>/dev/null && echo "  killed $s" || echo "  failed $s"
+    done
+    if [[ "$auto_yes" != "--yes" ]]; then
+        printf "Compact scratch session numbers? [Y/n] "
+        read -r ans2
+        [[ "$ans2" =~ ^[Nn]$ ]] && return
+    fi
+    compact_scratch_sessions
+}
 
+session_browser() {
+    if ! command -v fzf &>/dev/null; then
+        echo "fzf not found. Install with: apt install fzf" >&2
+        session_list_text
+        return
+    fi
+    stty -ixon 2>/dev/null
     local selected
-    stty -ixon 2>/dev/null  # enable ctrl+s passthrough
-    selected=$(echo "$issue_data" | fzf \
-        --header="$fzf_header" \
-        --header-first \
-        --ansi \
-        --no-sort \
-        --preview="tms --preview {}" \
+    selected=$(session_list_text | fzf \
+        --header='enter:attach  ctrl-x/d:kill  ctrl-r:rename  ctrl-k:clean  ctrl-p:peek  ctrl-i:issues  ?:help  esc:cancel' \
+        --header-first --ansi --no-sort \
+        --preview='name=$(echo {} | sed "s/.*\t//"); tmux capture-pane -t "$name" -p -S -40 2>/dev/null | sed "s/^/  /"' \
         --preview-window='right:60%:wrap' \
         --bind="enter:accept" \
-        --bind="ctrl-o:execute(gh issue view \$(echo {2} | tr -d '#') --web 2>/dev/null)" \
-        --bind="ctrl-p:execute(tms --preview {} | less -R)" \
-        --bind="ctrl-e:execute(repo={1}; iss=\$(echo {2} | tr -d '#'); pr=\$(gh pr list --repo bogocat/\$repo --search \"issue:\$iss\" --json number --jq '.[0].number' 2>/dev/null); if [[ -n \"\$pr\" ]]; then tmq review \$repo \$pr; else echo \"No linked PR found for \$repo#\$iss\"; fi)" \
-        --bind="ctrl-s:reload(tms ls | tail -n +3)+change-header(sessions: enter=attach  ctrl-x/d=kill  ctrl-k=clean  ctrl-i=issues  ?=help)+change-preview(name=\"\$(echo {} | sed 's/.*\\t//')\"; tmux capture-pane -t \"\$name\" -p -S -40 2>/dev/null | sed 's/^/  /')" \
-        --bind="?:execute(printf '%s\n\n' 'KEYBINDINGS' '-----------' 'enter      dispatch agent (via tmq)' 'ctrl-o     open issue in browser' 'ctrl-p     full preview' 'ctrl-e     code review linked PR' 'ctrl-s     back to sessions' 'ctrl-r     force refresh (skip cache)' '?          this help' 'esc        cancel' '' 'STATUS LEGEND (ST column)' '------------------------' '○ dim      open, no agent' '● cyan     active agent, no PR yet' '▶ blue     PR open, not reviewed' '◎ yellow   pending review' '✔ green    reviewed or ready to merge' '✗ red      blocked' '? magenta  question' | less -R)" \
-        --bind="ctrl-r:reload(tms issues --raw \$TMS_ISSUE_REPO --force)+change-header(issues (refreshing...): enter=dispatch  ctrl-o=browser  ctrl-p=preview  ctrl-s=back  ?=help  esc=cancel)" \
-        2>/dev/null || true)
+        --bind="ctrl-x:execute(real=\$(echo {} | sed 's/.*\t//'); tms kill \$real --force)+reload(tms ls | tail -n +3)" \
+        --bind="ctrl-d:execute(real=\$(echo {} | sed 's/.*\t//'); tms kill \$real --force)+reload(tms ls | tail -n +3)" \
+        --bind="ctrl-r:become(stty sane; real=\$(echo {} | sed 's/.*\t//'); tms rename \$real; exec tms)" \
+        --bind="ctrl-p:execute(real=\$(echo {} | sed 's/.*\t//'); tmux capture-pane -t \"\$real\" -p -S -40 | less -R)" \
+        --bind="ctrl-k:execute(tms clean --yes)+reload(tms ls | tail -n +3)" \
+        --bind="ctrl-i:reload(tms issues --raw --all)+change-header(issues: enter=dispatch  ctrl-o=browser  ctrl-p=preview  ctrl-v=view  ctrl-s=back  ?=help  esc=cancel)+change-preview(tms --preview {})" \
+        --bind="ctrl-s:reload(tms ls | tail -n +3)+change-header(enter:attach  ctrl-x/d:kill  ctrl-r:rename  ctrl-k:clean  ctrl-p:peek  ctrl-i:issues  ?:help  esc:cancel)+change-preview(name=\"\$(echo {} | sed 's/.*\\t//')\"; tmux capture-pane -t \"\$name\" -p -S -40 2>/dev/null | sed 's/^/  /')" \
+        --bind="?:execute(printf '%s\n\n' 'KEYBINDINGS' '-----------' 'enter      attach' 'ctrl-x/d   kill session' 'ctrl-r     rename' 'ctrl-k     clean stale' 'ctrl-i     switch to issues' 'ctrl-s     back to sessions' 'ctrl-p     peek terminal' '?          help' 'esc        cancel' | less -R)" \
+        --tac) || true
 
     if [[ -n "$selected" ]]; then
-        local col1 col2
+        local col1 col2 real_name
         col1=$(echo "$selected" | awk '{print $1}')
         col2=$(echo "$selected" | awk '{print $2}' | tr -d '#')
-        # Extract real session name from hidden tab field
-        local real_name
         real_name=$(echo "$selected" | sed 's/.*\t//')
-        # Smart enter: issues dispatch, sessions attach
         if echo "$col1" | grep -qE '^(distillery|home-portal|tower-fleet|scripts|palimpsest|rms)$'; then
             tmq "$col1" "$col2"
             exec tms
@@ -937,158 +1101,92 @@ issue_browser() {
     fi
 }
 
-# ── clean: kill stale + compact ──────────────────────────────────
-
-clean_stale() {
-    local -a to_kill=()
-    while IFS= read -r name; do
-        [[ -z "$name" ]] && continue
-        if is_session_stale "$name"; then
-            to_kill+=("$name")
-        fi
-    done <<< "$(tmux list-sessions -F "#{session_name}" 2>/dev/null | sort)"
-
-    if ((${#to_kill[@]} == 0)); then
-        echo "No stale sessions found (>${STALE_DAYS}d, all windows idle)."
-        return
-    fi
-
-    echo "Stale sessions (>${STALE_DAYS}d, all windows at shell prompt):"
-    for s in "${to_kill[@]}"; do
-        local wins
-        wins=$(tmux list-sessions -F "#{session_windows}" -f "#{==:#{session_name},$s}" 2>/dev/null)
-        local win_detail
-        win_detail=$(tmux list-windows -t "$s" -F "#{window_index}:#{pane_current_command}" 2>/dev/null | tr '\n' ' ')
-        echo "  $s  (${wins} windows: $win_detail)"
-    done
-    local auto_yes="${2:-}"
-    if [[ "$auto_yes" != "--yes" ]]; then
-        echo ""
-        printf "Kill all %d? [y/N] " "${#to_kill[@]}"
-        read -r ans
-        if [[ ! "$ans" =~ ^[Yy]$ ]]; then
-            echo "Cancelled."
-            return
-        fi
-    fi
-
-    for s in "${to_kill[@]}"; do
-        tmux kill-session -t "$s" 2>/dev/null && echo "  killed $s" || echo "  failed $s"
-    done
-
-    # Offer compaction (skip prompt in --yes mode)
-    if [[ "$auto_yes" != "--yes" ]]; then
-        echo ""
-        printf "Compact scratch session numbers (c0,c1,c2...)? [Y/n] "
-        read -r ans2
-        if [[ "$ans2" =~ ^[Nn]$ ]]; then
-            return
-        fi
-    fi
-    compact_scratch_sessions
-}
-
-# ── main ─────────────────────────────────────────────────────────
+# ── main ────────────────────────────────────────────────────────
 
 case "${1:-}" in
     ls|list)
-        session_list
+        session_list_text
         ;;
     kill)
-        if [[ -z "${2:-}" ]]; then
-            echo "Usage: tms kill <session-name>"
-            exit 1
-        fi
+        [[ -z "${2:-}" ]] && { echo "Usage: tms kill <name>"; exit 1; }
         kill_session "$2" "${3:-}"
         ;;
     rename)
-        if [[ -z "${2:-}" ]]; then
-            echo "Usage: tms rename <session-name>"
-            exit 1
-        fi
+        [[ -z "${2:-}" ]] && { echo "Usage: tms rename <name>"; exit 1; }
         rename_session "$2"
         ;;
-    stale)
-        stale_sessions
-        ;;
-    clean)
-        clean_stale "$@"
-        ;;
-    compact)
-        compact_scratch_sessions
+    stale) stale_sessions ;;
+    clean) clean_stale "$@" ;;
+    compact) compact_scratch_sessions ;;
+    sessions|session)
+        shift
+        session_browser
         ;;
     issues)
-        if [[ "${2:-}" == "--raw" ]]; then
-            raw_repo="${3:-}"
-            raw_force="${4:-}"
-            if [[ -z "$raw_repo" ]]; then
-                raw_repo=$(detect_repo_from_cwd)
-                [[ -n "$raw_repo" ]] && echo "repo:$raw_repo (add --all for all)" >&2
-            elif [[ "$raw_repo" == "--all" ]]; then
-                raw_repo=""
+        shift
+        # Parse --view / --raw / --force / --all / --clear-cache
+        view="all"; raw=""; force=""; repo_arg=""; clear=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --view) view="$2"; shift 2 ;;
+                --raw) raw="--raw"; shift ;;
+                --force) force="--force"; shift ;;
+                --all) repo_arg="--all"; shift ;;
+                --clear-cache) clear=1; shift ;;
+                *) [[ -z "$repo_arg" ]] && repo_arg="$1"; shift ;;
+            esac
+        done
+        if [[ -n "$clear" ]]; then _clear_cache; echo "Issue cache cleared."; exit 0; fi
+        if [[ "$repo_arg" == "--all" ]]; then repo_arg=""; fi
+        if [[ -z "$repo_arg" && -z "${TMS_NO_AUTO:-}" ]]; then
+            detected=$(detect_repo_from_cwd)
+            if [[ -n "$detected" ]]; then
+                repo_arg="$detected"
             fi
-            if [[ "$raw_repo" == "--force" ]]; then
-                raw_force="--force"; raw_repo=""
-            fi
-            issue_list "$raw_repo" "$raw_force"
+        fi
+        if [[ -n "$raw" ]]; then
+            issue_list "$view" "$repo_arg" "$force"
             exit 0
         fi
-        if [[ "${2:-}" == "--clear-cache" ]]; then
-            _clear_cache
-            echo "Issue cache cleared."
-            exit 0
-        fi
-        issue_browser "${2:-}" "${3:-}"
+        issue_browser "$repo_arg" "$force" "$view"
         ;;
     "")
-        # Interactive fzf picker
-        if ! command -v fzf &>/dev/null; then
-            echo "fzf not found. Install with: apt install fzf"
-            echo ""
-            echo "Available sessions:"
-            session_list
-            exit 1
+        # DEFAULT: issue browser
+        issue_browser
+        ;;
+    --all)
+        TMS_NO_AUTO=1 issue_browser --all
+        ;;
+    --raw|--raw=*)
+        # Convenience: tms --raw [--all | repo] [--view X]
+        shift
+        TMS_NO_AUTO=1
+        repo_arg=""
+        force_flag=""
+        view="all"
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --all) repo_arg="--all"; shift ;;
+                --view) view="$2"; shift 2 ;;
+                --force) force_flag="--force"; shift ;;
+                *) [[ -z "$repo_arg" ]] && repo_arg="$1"; shift ;;
+            esac
+        done
+        if [[ -z "$repo_arg" ]]; then
+            detected=$(detect_repo_from_cwd)
+            [[ -n "$detected" ]] && repo_arg="$detected"
         fi
-
-        stty -ixon 2>/dev/null  # enable ctrl+s passthrough
-        selected=$(session_list | fzf \
-            --header='enter:attach  ctrl-x/d:kill  ctrl-r:rename  ctrl-k:clean  ctrl-p:peek  ctrl-i:issues  ?:help  esc:cancel' \
-            --header-first \
-            --ansi \
-            --no-sort \
-            --preview='name=$(echo {} | sed "s/.*\t//"); tmux capture-pane -t "$name" -p -S -40 2>/dev/null | sed "s/^/  /"' \
-            --preview-window='right:60%:wrap' \
-            --bind="enter:accept" \
-            --bind="ctrl-x:execute(real=\$(echo {} | sed 's/.*\t//'); tms kill \$real --force)+reload(tms ls | tail -n +3)" \
-            --bind="ctrl-d:execute(real=\$(echo {} | sed 's/.*\t//'); tms kill \$real --force)+reload(tms ls | tail -n +3)" \
-            --bind="ctrl-r:become(stty sane; real=\$(echo {} | sed 's/.*\t//'); tms rename \$real; exec tms)" \
-            --bind="ctrl-p:execute(real=\$(echo {} | sed 's/.*\t//'); tmux capture-pane -t \"\$real\" -p -S -40 | less -R)" \
-            --bind="ctrl-k:execute(tms clean --yes)+reload(tms ls | tail -n +3)" \
-            --bind="ctrl-i:reload(tms issues --raw --all)+change-header(issues (all repos): enter=dispatch  ctrl-o=browser  ctrl-p=preview  ctrl-s=back  ?=help  esc=cancel)+change-preview(tms --preview {})" \
-            --bind="ctrl-s:reload(tms ls | tail -n +3)+change-header(enter:attach  ctrl-x/d:kill  ctrl-r:rename  ctrl-k:clean  ctrl-p:peek  ctrl-i:issues  ?:help  esc:cancel)+change-preview(name=\"\$(echo {} | sed 's/.*\\t//')\"; tmux capture-pane -t \"\$name\" -p -S -40 2>/dev/null | sed 's/^/  /')" \
-            --bind="?:execute(printf '%s\n\n' 'KEYBINDINGS' '-----------' 'enter      attach to session' 'ctrl-x/d   kill session' 'ctrl-r     rename session' 'ctrl-k     clean stale' 'ctrl-i     browse issues' 'ctrl-s     back to sessions' 'ctrl-p     peek terminal' '?          this help' 'esc        cancel' | less -R)" \
-            --tac)
-
-        if [[ -n "$selected" ]]; then
-            col1=$(echo "$selected" | awk '{print $1}')
-            col2=$(echo "$selected" | awk '{print $2}' | tr -d '#')
-            # Extract real session name from hidden tab field
-            real_name=$(echo "$selected" | sed 's/.*\t//')
-            # Smart enter: issues dispatch via tmq, sessions attach directly
-            if echo "$col1" | grep -qE '^(distillery|home-portal|tower-fleet|scripts|palimpsest|rms)$'; then
-                tmq "$col1" "$col2"
-                exec tms
-            else
-                attach_session "$real_name"
-                [[ -z "${TMUX:-}" ]] && exec tms
-            fi
-        fi
+        [[ "$repo_arg" == "--all" ]] && repo_arg=""
+        issue_list "$view" "$repo_arg" "$force_flag"
         ;;
     --preview)
         issue_preview "${2:-}"
         ;;
+    -h|--help)
+        sed -n '2,30p' "$0"
+        ;;
     *)
-        echo "Usage: tms [ls|kill <name>|rename <name>|stale|clean|compact|issues [repo|--all|--force]|issues --clear-cache]"
+        echo "Usage: tms [sessions|issues|ls|kill|rename|stale|clean|compact]"
         exit 1
         ;;
 esac
