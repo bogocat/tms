@@ -85,6 +85,16 @@ list_repos() {
     done
 }
 
+# Machine-readable registry. Tab-separated, one repo per line.
+# Fields: short<TAB>local_path<TAB>gh_repo<TAB>needs_worktree
+# Used by `tms` to derive its own repo awareness from the canonical registry.
+list_repos_machine() {
+    for name in "${!REPO_PATH[@]}"; do
+        printf "%s\t%s\t%s\t%s\n" \
+            "$name" "${REPO_PATH[$name]}" "${REPO_GH[$name]}" "${REPO_WORKTREE[$name]}"
+    done
+}
+
 # ── helpers ──────────────────────────────────────────────────────
 
 slugify() {
@@ -444,7 +454,11 @@ main() {
 
 case "${1:-}" in
     list|ls)
-        list_repos
+        if [[ "${2:-}" == "--machine" ]]; then
+            list_repos_machine
+        else
+            list_repos
+        fi
         ;;
     review|pr)
         shift
