@@ -929,8 +929,10 @@ issue_browser() {
         # Smart enter: issues dispatch, sessions attach
         if echo "$col1" | grep -qE '^(distillery|home-portal|tower-fleet|scripts|palimpsest|rms)$'; then
             tmq "$col1" "$col2"
+            exec tms
         else
             attach_session "$real_name"
+            [[ -z "${TMUX:-}" ]] && exec tms
         fi
     fi
 }
@@ -1075,8 +1077,10 @@ case "${1:-}" in
             # Smart enter: issues dispatch via tmq, sessions attach directly
             if echo "$col1" | grep -qE '^(distillery|home-portal|tower-fleet|scripts|palimpsest|rms)$'; then
                 tmq "$col1" "$col2"
+                exec tms
             else
                 attach_session "$real_name"
+                [[ -z "${TMUX:-}" ]] && exec tms
             fi
         fi
         ;;
