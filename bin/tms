@@ -1235,6 +1235,106 @@ clean_stale() {
     compact_scratch_sessions
 }
 
+# ── new: create a GitHub issue from the current repo ─────────────
+# tms new [--repo <shortname>] [--title <title>] [--body <body>] [--label <label>]...
+# Repo defaults to the cwd-detected repo. With no flags at all, prompts
+# for title interactively and opens $EDITOR for the body. Otherwise flags
+# are passed through to `gh issue create`.
+#
+# Always clears the issue cache afterwards so the new issue shows up
+# in `tms issues` on the next refresh.
+
+new_issue() {
+    local repo_override="" title="" body="" body_file="" labels=()
+    local web=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo)   repo_override="$2"; shift 2 ;;
+            --title)  title="$2"; shift 2 ;;
+            --body)   body="$2"; shift 2 ;;
+            --label|--labels) labels+=("$2"); shift 2 ;;
+            --web)    web=1; shift ;;
+            -h|--help)
+                cat <<'EOF'
+tms new — create a GitHub issue in the current (or specified) repo
+
+Usage:
+  tms new [--repo <shortname>] [--title <title>] [--body <body>]
+          [--label <label>]... [--web]
+
+If --title is omitted, prompts for it.
+If --body is omitted, $EDITOR is opened for the body (gh's default behavior).
+The issue cache is cleared after creation so the new issue shows in
+'tms issues' on the next refresh.
+
+Repo defaults to the cwd-detected repo (see detect_repo_from_cwd).
+
+Examples:
+  tms new
+  tms new --title "fix: race in foo" --body "Steps to reproduce..."
+  tms new --repo distillery --label enhancement --label pipeline:book
+EOF
+                return ;;
+            *) echo "tms new: unknown arg: $1" >&2; return 1 ;;
+        esac
+    done
+
+    local repo
+    if [[ -n "$repo_override" ]]; then
+        repo="$repo_override"
+    else
+        repo=$(detect_repo_from_cwd)
+    fi
+    if [[ -z "$repo" ]]; then
+        echo "tms new: could not detect repo from CWD; pass --repo" >&2
+        return 1
+    fi
+    if ! is_known_repo "$repo"; then
+        echo "tms new: unknown repo: $repo" >&2
+        return 1
+    fi
+
+    local gh_repo
+    gh_repo=$(_tmq_registry | awk -F'\t' -v s="$repo" '$1 == s {print $3; exit}')
+    if [[ -z "$gh_repo" ]]; then
+        echo "tms new: no GH slug for $repo" >&2
+        return 1
+    fi
+
+    # Interactive title prompt if missing
+    if [[ -z "$title" ]]; then
+        printf "Title for %s issue: " "$repo"
+        read -r title
+        if [[ -z "$title" ]]; then
+            echo "tms new: title required" >&2
+            return 1
+        fi
+    fi
+
+    # Build gh args. gh issue create semantics:
+    #   --title X --body Y → non-interactive create (both required when stdin is not a TTY)
+    #   --title X          → opens $EDITOR for body when stdin IS a TTY
+    #   (nothing)          → prompts for title + opens editor for body
+    # We pass --body when given, otherwise let gh open the editor.
+    # We never need to pass an --editor flag to gh.
+    local -a gh_args=(issue create --repo "$gh_repo" --title "$title")
+    if [[ -n "$body" ]]; then
+        gh_args+=(--body "$body")
+    fi
+    for lab in "${labels[@]}"; do
+        gh_args+=(--label "$lab")
+    done
+    (( web )) && gh_args+=(--web)
+
+    echo "Creating issue in $gh_repo: $title" >&2
+    gh "${gh_args[@]}"
+    local rc=$?
+
+    # Always clear the cache so the new issue shows in tms issues
+    _clear_cache 2>/dev/null || true
+    return $rc
+}
+
 # ── main ─────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -1263,6 +1363,10 @@ case "${1:-}" in
         ;;
     compact)
         compact_scratch_sessions
+        ;;
+    new)
+        shift
+        new_issue "$@"
         ;;
     issues)
         if [[ "${2:-}" == "--raw" ]]; then
@@ -1335,7 +1439,7 @@ case "${1:-}" in
         issue_preview "${2:-}"
         ;;
     *)
-        echo "Usage: tms [ls|kill <name>|rename <name>|stale|clean|compact|issues [repo|--all|--force]|issues --clear-cache]"
+        echo "Usage: tms [ls|kill <name>|rename <name>|stale|clean|compact|issues [repo|--all|--force]|issues --clear-cache|new]"
         exit 1
         ;;
 esac
