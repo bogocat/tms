@@ -85,6 +85,135 @@ is_session_stale() {
     return 0  # all panes idle → stale
 }
 
+# ── agent status lookup (Running/Waiting/Idle from aoe) ─────────
+# For aoe-managed sessions, fetch the daemon's notion of state.
+# For raw tmux sessions, derive a coarse status from the pane cmd:
+#   pi|claude|opencode|codex|cursor → "run"  (agent is the foreground process)
+#   bash|zsh|fish|sh|dash            → "idle" (sat at a prompt)
+#   anything else                    → "run"  (background worker of some kind)
+#
+# Aoe statuses: running | waiting | idle | error | stopped
+# We map them to compact 4-char labels for the picker column.
+
+AOE_STATUS_CACHE=/tmp/tms-aoe-status-cache.json
+AOE_STATUS_TTL=10
+
+# Build a temp file mapping aoe_title → status. Cached for AOE_STATUS_TTL.
+# File format: title<TAB>status (one per line)
+_aoe_status_map() {
+    if [[ -f "$AOE_STATUS_CACHE" ]]; then
+        local age
+        age=$(($(date +%s) - $(stat -c %Y "$AOE_STATUS_CACHE" 2>/dev/null || echo 0)))
+        if (( age < AOE_STATUS_TTL )); then
+            echo "$AOE_STATUS_CACHE"
+            return
+        fi
+    fi
+
+    if ! command -v aoe &>/dev/null; then
+        # No aoe → empty cache, no statuses
+        : > "$AOE_STATUS_CACHE"
+        echo "$AOE_STATUS_CACHE"
+        return
+    fi
+
+    # Get all aoe session titles, then per-session status.
+    # ~15ms per call, so 50 sessions = ~750ms. Acceptable for picker.
+    aoe list --json 2>/dev/null | python3 -c "
+import json, subprocess, sys
+try:
+    sessions = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for s in sessions:
+    title = s.get('title','')
+    if not title:
+        continue
+    try:
+        r = subprocess.run(
+            ['aoe', 'session', 'show', title, '--json'],
+            capture_output=True, text=True, timeout=3
+        )
+        if r.returncode == 0:
+            d = json.loads(r.stdout)
+            print(f'{title}\t{d.get(\"status\",\"unknown\")}')
+    except Exception:
+        pass
+" > "$AOE_STATUS_CACHE" 2>/dev/null
+
+    echo "$AOE_STATUS_CACHE"
+}
+
+# Map aoe status string → 4-char label + ANSI color code
+_format_status() {
+    local s=$1
+    case "$s" in
+        running)  printf 'run '  ;;  # green bold
+        waiting)  printf 'wait'  ;;  # yellow bold
+        idle)     printf 'idle'  ;;  # dim
+        error)    printf 'err '  ;;  # red bold
+        stopped)  printf 'stop'  ;;  # red dim
+        *)        printf '—   '  ;;
+    esac
+}
+
+_status_color() {
+    local s=$1
+    case "$s" in
+        running)  echo '32;1' ;;
+        waiting)  echo '33;1' ;;
+        idle)     echo '2' ;;
+        error)    echo '31;1' ;;
+        stopped)  echo '31;2' ;;
+        *)        echo '2' ;;
+    esac
+}
+
+# Public: resolve the status for a given session.
+# Args: $1 = tmux session name, $2 = status map file path
+# Outputs: "<colored_status_text><reset>"
+_session_status() {
+    local name=$1 map_file=$2
+    local status_text=""
+
+    if [[ "$name" == aoe_* ]] && [[ -n "$map_file" && -f "$map_file" ]]; then
+        # Extract the aoe title (compact form) from the tmux name
+        local compact
+        compact=$(compact_session_name "$name")
+        if [[ -n "$compact" ]]; then
+            local hit
+            hit=$(grep -F "${compact}"$'\t' "$map_file" 2>/dev/null | head -1 || true)
+            if [[ -n "$hit" ]]; then
+                local s
+                s=$(echo "$hit" | cut -f2)
+                status_text=$(_format_status "$s")
+                local color
+                color=$(_status_color "$s")
+                printf '\033[%sm%s\033[0m' "$color" "$status_text"
+                return
+            fi
+        fi
+        # aoe session but no status → still show placeholder
+        printf '\033[2m—   \033[0m'
+        return
+    fi
+
+    # Non-aoe session: derive from pane cmd
+    local cmd
+    cmd=$(tmux list-panes -t "$name" -F "#{pane_current_command}" 2>/dev/null | head -1)
+    case "$cmd" in
+        pi|claude|opencode|codex|cursor)
+            printf '\033[32;1mrun \033[0m' ;;
+        bash|zsh|fish|sh|dash)
+            printf '\033[2midle\033[0m' ;;
+        "")
+            printf '\033[2m—   \033[0m' ;;
+        *)
+            # Background worker or unknown — assume active
+            printf '\033[32;1mrun \033[0m' ;;
+    esac
+}
+
 # ── issue status lookup (for session list coloring) ──────────────
 
 # Build a mapping from "repo#num" → "sym|status|color_code"
@@ -162,6 +291,7 @@ session_info() {
     local name=$1
     local status_map="${2:-}"    # temp file: key\tsym\tstatus\tcolor
     local session_issue="${3:-}" # pre-resolved issue key (for aoe sessions)
+    local aoe_status_map="${4:-}" # temp file: aoe_title\tstatus
     local cmd cwd attached wins age_sec
 
     cmd=$(tmux list-panes -t "$name" -F "#{pane_current_command}" 2>/dev/null | head -1)
@@ -169,6 +299,11 @@ session_info() {
     attached=$(tmux list-sessions -F "#{session_attached}" -f "#{==:#{session_name},$name}" 2>/dev/null)
     wins=$(tmux list-sessions -F "#{session_windows}" -f "#{==:#{session_name},$name}" 2>/dev/null)
     age_sec=$(session_age_seconds "$name")
+
+    # Resolve agent status (aoe: running/waiting/idle/error/stopped;
+    # non-aoe: derived from pane cmd)
+    local status_col
+    status_col=$(_session_status "$name" "$aoe_status_map")
 
     # Shorten cwd
     local short_cwd="$cwd"
@@ -242,8 +377,9 @@ session_info() {
 
     # Output real name as invisible last column (tab-separated, fzf strips ANSI
     # but keeps text — preview/attach use real name from {1})
-    printf "%-28s %s%-1s %-3s %-7s %-3s %-24s %s\t%s\n" \
-        "$disp_name" "$att_marker" "$agent_icon" "$win_mark" "$age_str" "$stale_flag" "$issue" "$short_cwd" "$name"
+    # Columns: SESSION(28) att(1) AG(1) ST(5) #W(3) AGE(7) stale(1) ISSUE(24) CWD + \t realname
+    printf "%-28s %s%-1s %-5s %-3s %-7s %-3s %-24s %s\t%s\n" \
+        "$disp_name" "$att_marker" "$agent_icon" "$status_col" "$win_mark" "$age_str" "$stale_flag" "$issue" "$short_cwd" "$name"
 }
 
 session_list() {
@@ -251,6 +387,10 @@ session_list() {
     local status_map
     status_map=$(mktemp /tmp/tms-session-status-XXXXXX.tsv)
     _issue_status_lookup > "$status_map" 2>/dev/null || true
+
+    # Build aoe agent-status lookup (Running/Waiting/Idle from aoe daemon)
+    local aoe_status_map
+    aoe_status_map=$(_aoe_status_map 2>/dev/null || echo "")
 
     # Build session→issue map for aoe sessions (invert the session map)
     local sess_map
@@ -268,8 +408,9 @@ for key, sessions in m.items():
 " > "$aoe_issues" 2>/dev/null || true
     fi
 
-    printf "%-28s %-4s %-3s %-7s %-3s %-24s %s\n" "SESSION" " " "AG" "#W" "AGE" "ISSUE" "CWD"
-    printf "%s\n" "──────────────────────────────────────────────────────────────────────"
+    printf "%-28s %-4s %-3s %-5s %-3s %-7s %-3s %-24s %s\n" \
+        "SESSION" " " "AG" "ST" "#W" "AGE" " " "ISSUE" "CWD"
+    printf "%s\n" "────────────────────────────────────────────────────────────────────────────────"
 
     local sessions
     sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | sort)
@@ -280,9 +421,10 @@ for key, sessions in m.items():
         if [[ -s "$aoe_issues" ]]; then
             sess_issue=$(grep "^${name}"$'\t' "$aoe_issues" 2>/dev/null | head -1 | cut -f2 || true)
         fi
-        session_info "$name" "$status_map" "$sess_issue"
+        session_info "$name" "$status_map" "$sess_issue" "$aoe_status_map"
     done <<< "$sessions"
 
+    # Don't delete the aoe_status_map cache (TTL'd in _aoe_status_map)
     rm -f "$status_map" "$aoe_issues"
 }
 
