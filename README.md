@@ -24,10 +24,12 @@ tmq distillery 245
 
 ```
 tms                  fzf picker: browse/attach/kill sessions
-tms ls               list all sessions (ISSUE + AGENT columns)
+tms ls               list all sessions (ISSUE + AGENT + ST columns)
 tms stale            find abandoned sessions (>7d idle)
 tms clean            kill stale + compact scratch sessions
 tms issues [repo]    browse open GitHub issues + dispatch agents
+tms new              create a GitHub issue (gh issue create wrapper)
+tms import           wrap a legacy c/o/p scratch session as aoe
 ```
 
 ### tmq — issue → agent dispatcher
@@ -44,7 +46,11 @@ tmq list                             known repos
 ```
 tms (browse + manage)
 ├── session view — attach, kill, rename, clean stale
-└── issues view — browse GitHub issues, pipeline status, dispatch
+│   └── column ST: aoe Running/Waiting/Idle for aoe sessions
+│       (or derived from pane cmd for raw tmux sessions)
+├── issues view — browse GitHub issues, pipeline status, dispatch
+├── new       — create GitHub issues (wraps gh issue create)
+└── import    — wrap a legacy c/o/p scratch session as an aoe session
 
 tmq (issue → agent spawn)
 ├── gh issue view → build prompt
@@ -57,11 +63,14 @@ aoe (Agent of Empires — monitoring)
 ```
 
 Three tools, three layers. aoe manages sessions; tmq dispatches work; tms connects them.
+The session→issue mapping in tms reads the worktree branch directly (via
+`git -C <path> branch --show-current`) and falls back to parsing the aoe
+title only when the session is on a main checkout.
 
 ## Dependencies
 
 - `tmux` — session substrate
 - `fzf` — interactive picker
-- `gh` — GitHub CLI (issue/PR queries)
+- `gh` — GitHub CLI (issue/PR queries + creation)
 - `python3` — JSON processing
-- `aoe` (optional) — session registration in Agent of Empires
+- `aoe` (optional) — session registration + status in Agent of Empires
