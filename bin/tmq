@@ -133,7 +133,7 @@ fetch_pr() {
 # ── prompt construction ──────────────────────────────────────────
 
 build_prompt() {
-    local repo=$1 number=$2 type=$3
+    local repo=$1 number=$2 type=$3 agent=${4:-pi}
 
     if [[ "$type" == "review" ]]; then
         local pr_json
@@ -229,6 +229,22 @@ PROMPT
                 ;;
         esac
 
+        # Loop discipline pointer (#20). pi loads the dispatch-loop skill;
+        # cc/oc have no pi skills, so point them at the repo's AGENTS.md if it
+        # exists. Keeps the in-session loop traveling with every dispatched
+        # agent instead of relying on a hand-injected prompt pointer.
+        local loop_instruction=""
+        case "$agent" in
+            pi)
+                loop_instruction="**Follow the \`dispatch-loop\` skill.** Print \`<<AGENT-STATE: ...>>\` on its own line at every transition, and run the loop: plan-gate (STOP at PLAN-REVIEW for human approval before writing code) -> TDD-first -> AC-verify before opening the PR. For large/sensitive plans call \`proposal-review\` at the plan gate; \`code-review\` runs at PR-REVIEW."
+                ;;
+            cc|oc)
+                if [[ -f "${TMQ_CWD}/AGENTS.md" ]]; then
+                    loop_instruction="**Read and follow \`AGENTS.md\`** in the repo root — the in-session loop: \`<<AGENT-STATE: ...>>\` markers + plan-gate / TDD-first / AC-verify."
+                fi
+                ;;
+        esac
+
         cat <<PROMPT
 ## $type: ${REPO_GH[$repo]}#$number
 
@@ -241,6 +257,8 @@ PROMPT
 $body
 
 ### Instructions
+$loop_instruction
+
 1. **Evaluate scope against ground truth first.** Don't trust the issue's task
    list at face value — issues rot. Check:
    - What has already been done? (grep for patterns the issue mentions; scan
@@ -536,7 +554,7 @@ main() {
 
     # Build the prompt
     local prompt
-    prompt=$(build_prompt "$repo" "$number" "$type")
+    prompt=$(build_prompt "$repo" "$number" "$type" "$agent")
 
     # Determine session name
     local session_name
