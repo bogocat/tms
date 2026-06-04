@@ -246,17 +246,26 @@ spawn_agent() {
     esac
 
     # Use Agent of Empires if available (session appears in aoe dashboard + web)
+    # NOTE: deliberately NOT passing -l (--launch) — that auto-switches the user's
+    # tmux client to the new session, which breaks the fzf dispatch-then-return
+    # flow in `tms`. Auto-attach is opt-in via TMS_TMQ_LAUNCH=1 (e.g. for
+    # interactive `tmq` invocations where the user wants to drop straight in).
     if command -v aoe &>/dev/null; then
-        local wt_flag=""
+        local wt_flag="" launch_flag=""
         [[ -n "$branch" ]] && wt_flag="-w $branch"
+        [[ "${TMS_TMQ_LAUNCH:-}" == "1" ]] && launch_flag="-l"
 
         aoe add "$cwd" -t "$session_name" --tool "$aoe_tool" \
-            $wt_flag -l --trust-hooks \
+            $wt_flag $launch_flag --trust-hooks \
             --cmd-override "$cmd_override" 2>&1
         echo "Spawned: $session_name ($agent in $cwd) [via aoe]"
         echo "Prompt:   $prompt_file"
         echo "Monitor:  aoe status"
-        echo "Attach:   aoe session attach $session_name"
+        if [[ "$launch_flag" == "-l" ]]; then
+            echo "(auto-attaching via -l)"
+        else
+            echo "Attach:   aoe session attach $session_name   # when ready"
+        fi
     else
         # Fallback: direct tmux spawn (no aoe dashboard visibility)
         case "$agent" in

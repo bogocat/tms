@@ -115,13 +115,20 @@ for iss in json.load(sys.stdin):
 
     # Open PRs — for status (review state, draft, etc.)
     gh pr list --repo "$gh_repo" --state open --limit 100 \
-        --json number,title,headRefName,reviewDecision,isDraft,url 2>/dev/null \
+        --json number,title,body,headRefName,reviewDecision,isDraft,url 2>/dev/null \
     | python3 -c "
 import json, sys, re
+def _match_issue(pr):
+    branch = pr.get('headRefName','') or ''
+    title = pr.get('title','') or ''
+    body = pr.get('body','') or ''
+    m = re.search(r'issue-(\d+)', branch)
+    if not m: m = re.search(r'(?:^|/)([0-9]+)-[a-z]', branch)  # feat/244-foo
+    if not m: m = re.search(r'\(#([0-9]+)\)', title)             # Title: ... (#248)
+    if not m: m = re.search(r'(?:close|fix|resolve)[sd]?\s+#([0-9]+)', body, re.I)
+    return int(m.group(1)) if m else None
 for pr in json.load(sys.stdin):
-    # Find which issue this PR closes
-    m = re.search(r'issue-(\d+)', pr.get('headRefName',''))
-    issue_num = int(m.group(1)) if m else None
+    issue_num = _match_issue(pr)
     rd = pr.get('reviewDecision') or ''
     draft = pr.get('isDraft', False)
     state = 'draft' if draft else (
@@ -142,12 +149,20 @@ for pr in json.load(sys.stdin):
 
     # Recently closed/merged PRs — for "merged" status on closed issues
     gh pr list --repo "$gh_repo" --state closed --limit 50 \
-        --json number,state,mergedAt,headRefName 2>/dev/null \
+        --json number,state,mergedAt,headRefName,title,body 2>/dev/null \
     | python3 -c "
 import json, sys, re
+def _match_issue(pr):
+    branch = pr.get('headRefName','') or ''
+    title = pr.get('title','') or ''
+    body = pr.get('body','') or ''
+    m = re.search(r'issue-(\d+)', branch)
+    if not m: m = re.search(r'(?:^|/)([0-9]+)-[a-z]', branch)
+    if not m: m = re.search(r'\(#([0-9]+)\)', title)
+    if not m: m = re.search(r'(?:close|fix|resolve)[sd]?\s+#([0-9]+)', body, re.I)
+    return int(m.group(1)) if m else None
 for pr in json.load(sys.stdin):
-    m = re.search(r'issue-(\d+)', pr.get('headRefName',''))
-    issue_num = int(m.group(1)) if m else None
+    issue_num = _match_issue(pr)
     print(json.dumps({
         'kind': 'closed-pr',
         'pr': pr['number'],
@@ -708,9 +723,14 @@ issue_browser() {
     local issue_data
     issue_data=$(issue_list "$view" "$repo_filter" "$force_flag")
 
-    # Build ctrl-v reload per view
-    local reload_v="tms issues --raw $TMS_ISSUE_REPO --force --view $next_view"
-    local header_v="[$next_view]  enter:dispatch  ctrl-o:browser  ctrl-p:full preview  ctrl-e:review PR  ctrl-v:cycle view  ctrl-r:refresh  ctrl-s:sessions  ?:help  esc:cancel"
+    # ctrl-v: use `become` (not `reload`) so each cycle re-evaluates next_view
+    # in a fresh tms process. With `reload` the bind string is baked in at
+    # fzf startup, so the second ctrl-v would re-fetch the same view.
+    local become_v="tms issues $TMS_ISSUE_REPO --force --view $next_view"
+    # ctrl-r: same `become` pattern for refresh; the new tms re-reads the cache
+    # with --force and re-renders. No fake 'refreshing...' header that would
+    # lie about state after the reload completes.
+    local become_r="tms issues $TMS_ISSUE_REPO --force --view $view"
 
     local selected
     stty -ixon 2>/dev/null
@@ -726,8 +746,8 @@ issue_browser() {
         --bind="ctrl-p:execute(tms --preview {} | less -R)" \
         --bind="ctrl-e:execute(key=\$(echo {} | sed -n 's/.*\\t\\([^[:space:]]*#[0-9]*\\)\$/\\1/p'); repo=\${key%#*}; iss=\${key#*#}; pr=\$(gh pr list --repo bogocat/\$repo --search \"issue:\$iss\" --json number --jq '.[0].number' 2>/dev/null); if [[ -n \"\$pr\" ]]; then tmq review \$repo \$pr; else echo \"No linked PR found for \$repo#\$iss\"; fi)" \
         --bind="ctrl-s:reload(tms sessions)+change-header(enter:attach  ctrl-x/d:kill  ctrl-r:rename  ctrl-k:clean  ctrl-i:issues  ?:help  esc:cancel)+change-preview(name=\"\$(echo {} | sed 's/.*\\t//')\"; tmux capture-pane -t \"\$name\" -p -S -40 2>/dev/null | sed 's/^/  /')" \
-        --bind="ctrl-v:reload($reload_v)+change-header($header_v)" \
-        --bind="ctrl-r:reload(tms issues --raw $TMS_ISSUE_REPO --force --view $view)+change-header(refreshing...  enter=dispatch  ctrl-o=browser  ctrl-s=back  ?=help  esc=cancel)" \
+        --bind="ctrl-v:become($become_v)" \
+        --bind="ctrl-r:become($become_r)" \
         --bind="?:execute(printf '%s\n\n' 'KEYBINDINGS' '-----------' 'enter      dispatch agent (via tmq)' 'ctrl-o     open issue in browser' 'ctrl-p     full preview' 'ctrl-e     code review linked PR' 'ctrl-v     cycle view (All/Active/Yours/Stale)' 'ctrl-r     force refresh (skip cache)' 'ctrl-s     switch to session browser' '?          this help' 'esc        cancel' '' 'VIEW MODES' '-----------' 'All      all open + recently closed (14d)' 'Active   issues with a live agent session' 'Yours    assigned to you' 'Stale    open >14d, no activity, no agent' '' 'COLUMNS' '--------' 'ST  status (○open ●active ▶pr ◐draft ◎review ✎changes ✓ready ✗blocked ✔reviewed ?question)' 'AGE since created  UPD since last update  ★ assigned to you' | less -R)" \
         2>/dev/null || true)
 
