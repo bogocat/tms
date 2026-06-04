@@ -46,6 +46,39 @@ def test_atomic_write_creates_file(tmp_path):
     assert json.loads(target.read_text()) == {"k": "v"}
 
 
+def test_build_session_map_uses_atomic_write(tmp_path, monkeypatch):
+    """`build_session_map` must use atomic_write_json, not direct open()+write.
+
+    A regression to direct `open(out_path, 'w')` + `json.dump` would
+    re-open the P0#1 cache-race on the session map path. The
+    aoe_status module already does this; this test pins the session
+    map module to the same contract.
+    """
+    from unittest.mock import patch
+    from tms.session_map import build_session_map
+
+    panes_str = ""
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:3] == ["tmq", "list", "--machine"]:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd and cmd[0] == "tmux" and "list-panes" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, panes_str, "")
+        if cmd[0] == "aoe" and cmd[1] == "list":
+            return subprocess.CompletedProcess(cmd, 0, "[]", "")
+        return real_run(cmd, *args, **kwargs)
+
+    with patch("tms.session_map.subprocess.run", side_effect=fake_run), \
+         patch("tms.session_map.atomic_write_json") as mock_atomic:
+        out = tmp_path / "map.json"
+        build_session_map(str(out))
+        mock_atomic.assert_called_once()
+        # The first positional arg must be the path
+        args, _kwargs = mock_atomic.call_args
+        assert args[0] == str(out)
+
+
 def test_atomic_write_overwrites_existing(tmp_path):
     target = tmp_path / "cache.json"
     target.write_text('{"old": true}')
@@ -163,6 +196,40 @@ def test_aoe_invalid_json_is_skipped(tmp_path, monkeypatch):
     # Should exit cleanly, writing nothing
     aoe_status.build_status_map(str(out))
     assert not out.exists() or out.read_text() == ""
+
+
+def test_aoe_valid_empty_list_writes_no_file(tmp_path, monkeypatch):
+    """aoe list returns [] (no sessions) — no cache file is written.
+
+    The original heredoc always wrote the (possibly empty) file. The
+    extracted module now skips the write when there are no rows. The
+    bash wrapper handles a missing file correctly (it re-invokes the
+    module), so the behavior is intentional — pin it here so a future
+    refactor can't silently re-introduce the empty-file write.
+    """
+    out = tmp_path / "map.tsv"
+    _build_aoe_status_map_with(monkeypatch, stdout="[]", returncode=0)
+    aoe_status.build_status_map(str(out))
+    assert not out.exists(), (
+        f"expected no file when aoe list returns []; "
+        f"got {out.read_text()!r}"
+    )
+
+
+def test_aoe_sessions_with_empty_titles_writes_no_file(tmp_path, monkeypatch):
+    """aoe list returns sessions with empty titles — same as no rows.
+
+    Pairs with the above: even valid JSON with rows is dropped when
+    every title is empty (the matcher skips them). No file written.
+    """
+    out = tmp_path / "map.tsv"
+    _build_aoe_status_map_with(
+        monkeypatch,
+        stdout=json.dumps([{"id": "abc", "title": ""}]),
+        returncode=0,
+    )
+    aoe_status.build_status_map(str(out))
+    assert not out.exists()
 
 
 def test_aoe_nonzero_exit_is_skipped(tmp_path, monkeypatch):

@@ -33,7 +33,15 @@ def atomic_write_text(path, content):
             f.write(content)
         os.replace(tmp, path)
     except BaseException:
-        # Clean up the tmp on any failure (including KeyboardInterrupt)
+        # fdopen's `with` may or may not have entered: if it didn't,
+        # the fd is still open (mkstemp gave it to us). Close it
+        # defensively — OSError(Bad file descriptor) is fine if the
+        # fd was already closed by the `with` exit.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        # Clean up the tmp on any failure (including KeyboardInterrupt).
         try:
             os.unlink(tmp)
         except OSError:

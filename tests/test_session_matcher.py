@@ -178,17 +178,18 @@ def test_aoe_session_with_review_title():
 
 
 def test_scratch_session_links_by_worktree_branch(tmp_path):
-    """`c5` on /root/projects/distillery with branch feat/issue-245-foo."""
-    # Use a real path that exists AND has .git (the distillery main
-    # checkout, not a worktree). This exercises the .git-is-dir case.
-    real_distillery = "/root/projects/distillery"
-    assert os.path.exists(os.path.join(real_distillery, ".git"))
-    assert os.path.isdir(os.path.join(real_distillery, ".git"))
+    """`c5` on a main checkout (where .git is a dir) with branch feat/issue-245-foo."""
+    # Set up a fake main checkout in tmp_path: .git is a DIRECTORY.
+    # The cwd uses the /wt-<short>-<num> convention so
+    # detect_repo_from_path resolves it (no real-filesystem dependency).
+    real_distillery = tmp_path / "wt-distillery-245"
+    real_distillery.mkdir(parents=True)
+    (real_distillery / ".git").mkdir()  # directory, not file
 
     mapping = _build_with_mock(
-        panes=[("c5", "pi", real_distillery)],
+        panes=[("c5", "pi", str(real_distillery))],
         registry=FAKE_REGISTRY,
-        branch_map={real_distillery: "feat/issue-245-foo"},
+        branch_map={str(real_distillery): "feat/issue-245-foo"},
     )
     assert "distillery#245" in mapping
     assert mapping["distillery#245"] == ["c5 π"]
@@ -197,26 +198,23 @@ def test_scratch_session_links_by_worktree_branch(tmp_path):
 def test_scratch_session_on_worktree_p1_regression(tmp_path):
     """P1#1 regression: scratch session on a worktree (where .git is a FILE).
 
-    Use the real worktree at /root/wt-tms-8 — its .git is a file, not a
-    directory. The old os.path.isdir check returned False for worktrees,
-    silently disabling this code path. The os.path.exists fix lets the
-    matcher find the .git and parse the branch.
+    Creates a fake worktree in tmp_path with .git as a file (the
+    worktree contract). The old os.path.isdir check returned False
+    for worktrees, silently disabling this code path. The
+    os.path.exists fix lets the matcher find the .git and parse
+    the branch.
     """
-    real_wt = "/root/wt-tms-8"
-    assert os.path.exists(os.path.join(real_wt, ".git"))
-    assert os.path.isfile(os.path.join(real_wt, ".git"))  # worktree contract
-    assert not os.path.isdir(os.path.join(real_wt, ".git"))
+    real_wt = tmp_path / "wt-distillery-99"
+    real_wt.mkdir()
+    (real_wt / ".git").write_text("gitdir: /tmp/fake\n")  # FILE, not dir
 
-    # The wt-tms-8 worktree is on feat/issue-8-test-suite (not an issue branch),
-    # so we'll mock the branch to a feat/issue-N one for this test.
     mapping = _build_with_mock(
-        panes=[("c5", "pi", real_wt)],
+        panes=[("c5", "pi", str(real_wt))],
         registry=FAKE_REGISTRY,
-        branch_map={real_wt: "feat/issue-8-test-suite"},
+        branch_map={str(real_wt): "feat/issue-99-foo"},
     )
-    # tms#8 is the issue number parsed from the branch
-    assert "tms#8" in mapping
-    assert mapping["tms#8"] == ["c5 π"]
+    assert "distillery#99" in mapping
+    assert mapping["distillery#99"] == ["c5 π"]
 
 
 def test_scratch_session_with_no_issue_branch_is_ignored():

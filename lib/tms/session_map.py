@@ -29,6 +29,8 @@ import os
 import re
 import subprocess
 
+from tms.atomic import atomic_write_json
+
 
 # Icons for known agent commands. Mirrors the bash `detect_agent` in bin/tms.
 ICONS = {
@@ -248,8 +250,11 @@ def build_session_map(out_path):
         key = f'{repo_name}#{num}'
         mapping.setdefault(key, []).append(f'{session} {icon}')
 
-    with open(out_path, 'w') as f:
-        json.dump(mapping, f)
+    # Atomic write: a concurrent reader opening the cache mid-write
+    # would otherwise see a partial JSON file and crash with
+    # JSONDecodeError. P0#1 (cache-race fix) — same pattern as
+    # lib/tms/aoe_status.py:build_status_map.
+    atomic_write_json(out_path, mapping)
 
 
 if __name__ == '__main__':

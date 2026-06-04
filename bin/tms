@@ -722,8 +722,10 @@ _cached_session_map() {
     fi
     local map_file
     map_file=$(_issue_session_map)
-    cp "$map_file" "$cache_file"
-    rm -f "$map_file"
+    # `mv` is atomic on the same filesystem (both /tmp). Replaces the
+    # previous `cp`+`rm` pattern, which was non-atomic and could leave
+    # a concurrent reader seeing a partial file. P0#1 (cache-race fix).
+    mv "$map_file" "$cache_file"
     echo "$cache_file"
 }
 

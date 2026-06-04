@@ -17,6 +17,7 @@ PR #7's multi-model review.
 """
 
 import os
+import json
 import subprocess
 from unittest.mock import patch
 
@@ -58,12 +59,14 @@ def fake_tmq_registry():
 # ── P1#1: worktree .git is a file, not a directory ───────────────
 
 
-def test_worktree_dot_git_is_a_file_not_directory(tmp_path):
-    """In git worktrees, .git is a FILE, not a directory.
+def test_worktree_file_structure_contract(tmp_path):
+    """The git worktree contract: .git is a FILE, not a directory.
 
-    This is the git worktree contract. The old matcher used
-    `os.path.isdir(cwd + '/.git')` which returned False for worktrees,
-    silently disabling the new code path. Fix: `os.path.exists`.
+    Documents the contract that the matcher relies on. The P1#1
+    production regression is caught by
+    `test_scratch_session_on_worktree_p1_regression` in
+    `test_session_matcher.py` — this test only asserts the
+    filesystem invariant.
     """
     fake_wt = tmp_path / "wt-distillery-108"
     fake_wt.mkdir()
@@ -76,6 +79,52 @@ def test_worktree_dot_git_is_a_file_not_directory(tmp_path):
     assert os.path.isfile(dot_git)
     # The bug: os.path.isdir returns False for the worktree case
     assert not os.path.isdir(dot_git)
+
+
+def test_scratch_session_on_fake_worktree_p1_regression(tmp_path):
+    """P1#1 production regression: a scratch session on a worktree path
+    (where .git is a FILE) must still be linked via the worktree branch.
+
+    The old matcher used `os.path.isdir(cwd + '/.git')` which returned
+    False for worktrees, silently disabling this code path. The fix
+    uses `os.path.exists`, which works for both files and directories.
+
+    This test calls the production `build_session_map` against a fake
+    worktree created in tmp_path — so it runs in any environment (no
+    dependency on the real /root/wt-tms-8 path).
+    """
+    import json
+    from unittest.mock import patch
+    from tms.session_map import build_session_map
+
+    fake_wt = tmp_path / "wt-distillery-99"
+    fake_wt.mkdir()
+    (fake_wt / ".git").write_text("gitdir: /tmp/fake\n")
+
+    panes = [("c5", "pi", str(fake_wt))]
+    panes_str = '\n'.join('|'.join(p) for p in panes)
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:3] == ["tmq", "list", "--machine"]:
+            return subprocess.CompletedProcess(cmd, 0, FAKE_REGISTRY, "")
+        if cmd and cmd[0] == "tmux" and "list-panes" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, panes_str, "")
+        if cmd[0] == "git" and cmd[1] == "-C" and "branch" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "feat/issue-99-test", "")
+        return real_run(cmd, *args, **kwargs)
+
+    out = tmp_path / "map.json"
+    with patch("tms.session_map.subprocess.run", side_effect=fake_run):
+        build_session_map(str(out))
+    mapping = json.loads(out.read_text())
+
+    assert "distillery#99" in mapping, (
+        f"scratch session on a worktree-style path was not linked "
+        f"(P1#1 regression — isdir check skipped the session); "
+        f"mapping={mapping}"
+    )
 
 
 # ── P1#2: worktree convention uses re.search, not re.match ───────
