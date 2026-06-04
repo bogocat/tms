@@ -1,5 +1,8 @@
 # tms conventions
 
+> **Dispatched agents:** see [AGENTS.md](AGENTS.md) for the in-session loop
+> (state-marker contract + plan-gate / TDD-first / AC-verify discipline).
+
 ## Project structure
 - `bin/tms` — session manager (deploy to /usr/local/bin)
 - `bin/tmq` — issue dispatcher (deploy to /usr/local/bin)
