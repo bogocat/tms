@@ -284,14 +284,16 @@ spawn_agent() {
             echo "Monitor:  aoe status"
             echo "Attach:   aoe session attach $session_name   # when ready"
         else
-            # Honest failure: tell the user which step failed. Cleanup the
-            # half-registered session so it doesn't dangle in `aoe list`.
-            echo "ERROR: spawn failed (add_ok=$add_ok, start_ok=$start_ok)" >&2
-            if (( add_ok )); then
-                echo "  session was registered but the agent did not start" >&2
-                echo "  cleanup: aoe remove $session_name" >&2
-            else
-                echo "  aoe add rejected the session (likely duplicate title or worktree)" >&2
+            # Honest failure: tell the user which step failed, and if we
+            # got far enough to register a session, clean it up so it
+            # doesn't dangle in `aoe list`.
+            if (( add_ok && ! start_ok )); then
+                echo "ERROR: agent did not start (see aoe output above)" >&2
+                echo "  cleaning up the half-registered session..." >&2
+                aoe remove "$session_name" >&2 || true
+            elif (( ! add_ok )); then
+                echo "ERROR: aoe add failed (see output above)" >&2
+                echo "  (likely duplicate title, missing worktree, or invalid tool)" >&2
             fi
             return 1
         fi

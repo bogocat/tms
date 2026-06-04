@@ -1166,7 +1166,7 @@ session_browser() {
         col1=$(echo "$selected" | awk '{print $1}')
         col2=$(echo "$selected" | awk '{print $2}' | tr -d '#')
         real_name=$(echo "$selected" | sed 's/.*\t//')
-        if echo "$col1" | grep -qE '^(distillery|home-portal|tower-fleet|scripts|palimpsest|rms)$'; then
+        if echo "$col1" | grep -qE '^(distillery|home-portal|tower-fleet|scripts|palimpsest|rms|tms)$'; then
             tmq "$col1" "$col2"
             exec tms
         else
@@ -1268,28 +1268,17 @@ case "${1:-}" in
     -h|--help)
         sed -n '2,30p' "$0"
         ;;
-    sessions|session)
-        shift
-        session_browser
-        ;;
-    ls|list) session_list_text ;;
-    kill)
-        [[ -z "${2:-}" ]] && { echo "Usage: tms kill <name>"; exit 1; }
-        kill_session "$2" "${3:-}"
-        ;;
-    rename)
-        [[ -z "${2:-}" ]] && { echo "Usage: tms rename <name>"; exit 1; }
-        rename_session "$2"
-        ;;
-    stale) stale_sessions ;;
-    clean) clean_stale "$@" ;;
-    compact) compact_scratch_sessions ;;
     *)
         # Unknown first arg → treat as `tms issues <args>` (e.g. `tms distillery`,
         # `tms home-portal --view stale`). Only delegate if it looks like either
-        # a known repo shortname or a known flag; otherwise show usage.
-        if [[ "$1" =~ ^(distillery|home-portal|tower-fleet|scripts|palimpsest|rms|tms)$ ]] \
-            || [[ "$1" == --* ]]; then
+        # a known repo shortname OR a known issue-browser flag; unknown `--*`
+        # flags fall through to the usage error so `tms --version` doesn't
+        # silently open the issue browser. Repo list is derived from
+        # `issue_repos` so it can't drift.
+        repo_re=$(issue_repos | cut -d: -f1 | tr '\n' '|' | sed 's/|$//')
+        if [[ "$1" =~ ^(${repo_re})$ ]] \
+            || [[ "$1" == "--all" || "$1" == "--raw" || "$1" == --raw=* \
+              || "$1" == "--force" || "$1" == "--view" || "$1" == "--clear-cache" ]]; then
             _route_issues_inline "$@"
         else
             echo "Usage: tms [sessions|issues|ls|kill|rename|stale|clean|compact|<repo>]"
