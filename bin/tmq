@@ -147,22 +147,53 @@ build_prompt() {
         local body
         body=$(echo "$pr_json" | jq -r '.body')
 
+        # Branch info: gate on TMQ_REUSED (set only when create_worktree
+        # actually reused a feat session's worktree), not TMQ_BRANCH —
+        # detached HEAD leaves TMQ_BRANCH empty even though we DID reuse,
+        # and that would make the prompt mis-report.
+        local branch_section pull_step fixup_step
+        if [[ "$TMQ_REUSED" -eq 1 ]]; then
+            local live_note=""
+            if [[ "$TMQ_FEAT_LIVE" -ne 1 ]]; then
+                live_note=" (note: feat session is not currently running)"
+            fi
+            branch_section="**Worktree:** $TMQ_CWD (shared with the feature agent${live_note})
+**Branch:** ${TMQ_BRANCH:-<detached>}"
+            pull_step="You are in a git worktree shared with the feature
+   agent. Pull the latest branch state before reviewing:
+   \`git -C \"$TMQ_CWD\" pull --ff-only\`
+   If that fails because the feat agent has un-pushed local commits,
+   skip the pull — your local view of the branch is already ahead
+   of origin. If it fails for a different reason, report the failure
+   to the user before proceeding."
+            fixup_step="Shared-worktree case: push fixups to the same
+   branch so the feat agent sees them on their next read."
+        else
+            branch_section="**Worktree:** $TMQ_CWD (main checkout — no feat session to reuse)"
+            pull_step="Check out the PR branch and review the diff."
+            fixup_step="Main-checkout case: do not push to the PR branch
+   directly — the PR branch is owned by whoever opened it. Surface
+   review findings for the human to apply."
+        fi
+
         cat <<PROMPT
 ## Code Review: ${REPO_GH[$repo]}#$number
 
 **PR:** $title
 **URL:** $url
 **State:** $state (+$adds -$dels)
+$branch_section
 
 ### PR Description
 $body
 
 ### Review Instructions
-1. Check out the PR branch and review the diff
+1. $pull_step
 2. Evaluate: correctness, architecture, security, performance, test coverage
 3. Classify issues as P0 (must fix), P1 (should fix), P2 (nice to have)
 4. Focus on logic errors and design flaws over style nits
 5. Output a structured review: Summary / P0 Issues / P1 Issues / P2 Notes / Overall
+6. $fixup_step
 PROMPT
     else
         local issue_json
@@ -294,10 +325,84 @@ spawn_agent() {
 # Globals: set by create_worktree, read by main() + build_prompt()
 TMQ_CWD=""
 TMQ_BRANCH=""
+# Set to 1 by create_worktree when review reuses a feat session's worktree.
+# Decoupled from TMQ_BRANCH so detached-HEAD doesn't make the prompt
+# mis-report "no feat session to reuse" while the worktree IS being reused.
+TMQ_REUSED=0
+# Set to 1 by create_worktree when the reused feat session's tmux is alive.
+# Drives whether the prompt can claim the feat agent will see fixups.
+TMQ_FEAT_LIVE=0
+
+# Find an existing feat-<repo>#<num> aoe session and return its
+# worktree path (the caller reads the branch separately via git).
+# Empty stdout + non-zero exit if no live session is found.
+#
+# When multiple feat sessions match (e.g. user re-dispatched after a
+# crash), pick the most recent by created_at — the older session's
+# worktree is the stale one.
+#
+# Bound the aoe CLI with `timeout` so a hung daemon can't freeze
+# `tmq review` indefinitely.
+find_feat_session() {
+    local repo=$1 issue_num=$2
+    local title="feat-${repo}#${issue_num}"
+
+    command -v aoe &>/dev/null || return 1
+
+    local wt_path
+    wt_path=$(timeout 5 aoe list --json 2>/dev/null | \
+        jq -r --arg t "$title" '
+            [.[] | select(.title == $t)]
+            | sort_by(.created_at)
+            | last
+            | .path // empty
+        ' 2>/dev/null) || return 1
+
+    # Path must exist as a directory and be a git worktree (or bare main
+    # checkout for non-worktree repos). Skip if stale.
+    if [[ -z "$wt_path" ]] || [[ ! -d "$wt_path" ]] \
+        || ! git -C "$wt_path" rev-parse --git-dir &>/dev/null; then
+        return 1
+    fi
+
+    echo "$wt_path"
+    return 0
+}
 
 create_worktree() {
     local repo=$1 issue_num=$2 type=$3
     local path="${REPO_PATH[$repo]}"
+
+    # REVIEW TYPE: try to reuse an existing feat-<repo>#<num> session's
+    # worktree so the reviewer sees the same code the feature agent is
+    # pushing, and fixups land on the same branch.
+    if [[ "$type" == "review" ]]; then
+        local feat_path feat_branch
+        if feat_path=$(find_feat_session "$repo" "$issue_num") && [[ -n "$feat_path" ]]; then
+            feat_branch=$(git -C "$feat_path" branch --show-current 2>/dev/null)
+
+            # Liveness: aoe sessions appear as tmux sessions named
+            # `aoe_<title>_<id_prefix>`, but `#` in the title is
+            # replaced with `_` for the tmux session name. A
+            # closed/killed feat session leaves the worktree behind
+            # but no live tmux session, in which case the prompt
+            # shouldn't claim the feat agent will see fixups.
+            local feat_session_pattern="aoe_feat-${repo}_${issue_num}_*"
+            if tmux has-session -t "$feat_session_pattern" 2>/dev/null; then
+                TMQ_FEAT_LIVE=1
+            fi
+
+            echo "Reusing feat session worktree: $feat_path" >&2
+            echo "  branch: ${feat_branch:-<detached>}" >&2
+            echo "  feat agent live: $([[ $TMQ_FEAT_LIVE -eq 1 ]] && echo yes || echo no)" >&2
+            TMQ_CWD="$feat_path"
+            TMQ_BRANCH="$feat_branch"
+            TMQ_REUSED=1
+            echo "$feat_path"
+            return
+        fi
+        # No feat session found — fall through to standard handling
+    fi
 
     # Only create worktrees for feature branches on worktree repos
     if (( REPO_WORKTREE[$repo] != 1 )); then
@@ -422,9 +527,12 @@ main() {
         echo "URL: $(echo "$issue_json" | jq -r '.url')"
     fi
 
-    # Set up working directory (worktree for features)
-    local cwd
-    cwd=$(create_worktree "$repo" "$number" "$type")
+    # Set up working directory (worktree for features). Call
+    # create_worktree directly (not via $()) so its TMQ_CWD/TMQ_BRANCH
+    # globals propagate to this scope — build_prompt and spawn_agent
+    # both read them.
+    create_worktree "$repo" "$number" "$type"
+    local cwd="$TMQ_CWD"
 
     # Build the prompt
     local prompt
