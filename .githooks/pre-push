@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Block pushes that would fail tests.
+# Mirrors `pytest tests/` — same failures CI would hit.
+# Bypass with `git push --no-verify` (don't make it a habit).
+#
+# Setup: `git config core.hooksPath .githooks` (or copy this file to
+# .git/hooks/pre-push). The repo's hooks live in .githooks/ so they're
+# version-controlled; core.hooksPath points git at the checked-in copy.
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Skip if no tests dir (just-init'd, vendored repo, etc.)
+if [[ ! -d tests/ ]] && [[ ! -f pytest.ini ]]; then
+    exit 0
+fi
+
+echo "→ pre-push: running pytest tests/..."
+START=$(date +%s)
+
+if ! pytest tests/ -q --tb=short; then
+    ELAPSED=$(($(date +%s) - START))
+    echo
+    echo "✗ tests failed in ${ELAPSED}s — push blocked."
+    echo "  Fix the failures above, or bypass with: git push --no-verify"
+    exit 1
+fi
+
+ELAPSED=$(($(date +%s) - START))
+echo "✓ tests passed in ${ELAPSED}s"

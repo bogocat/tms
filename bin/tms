@@ -117,35 +117,15 @@ _aoe_status_map() {
         return 1
     fi
 
-    # Get all aoe session titles, then per-session status.
-    # ~15ms per call, so 50 sessions = ~750ms. Acceptable for picker.
-    # Note: per-call timeout=3, so a hung daemon can block up to
-    # 3s * N sessions. The TTL cache hides the slow path after one
-    # healthy collection; a hung daemon will time out per call.
-    local tmp_cache="${AOE_STATUS_CACHE}.new.$$"
-    aoe list --json 2>/dev/null | python3 -c "
-import json, subprocess, sys
-try:
-    sessions = json.load(sys.stdin)
-except (json.JSONDecodeError, ValueError):
-    sys.exit(0)
-for s in sessions:
-    title = s.get('title','')
-    if not title:
-        continue
-    try:
-        r = subprocess.run(
-            ['aoe', 'session', 'show', title, '--json'],
-            capture_output=True, text=True, timeout=3
-        )
-        if r.returncode == 0:
-            d = json.loads(r.stdout)
-            print(f'{title}\t{d.get(\"status\",\"unknown\")}')
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError, ValueError):
-        pass
-" > "$tmp_cache" 2>/dev/null
-    # Atomic replace so a concurrent reader never sees a half-written file.
-    mv -f "$tmp_cache" "$AOE_STATUS_CACHE"
+    # Delegate to the lib/tms/aoe_status module (extracted from this
+    # heredoc in issue #8). The module does its own atomic write
+    # (lib/tms/atomic.py: tmp + os.replace), so a concurrent reader
+    # never sees a half-written file. P0#2 fix (narrowed exceptions)
+    # lives in the module.
+    if ! PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" \
+            python3 -m tms.aoe_status "$AOE_STATUS_CACHE" 2>/dev/null; then
+        return 1
+    fi
 
     echo "$AOE_STATUS_CACHE"
 }
@@ -719,168 +699,13 @@ fetch_all_issues() {
 }
 
 # Build session → issue mapping (JSON: repo#num → [agent info])
-# Batched into single tmux call + single git sweep for speed
+# Delegates to lib/tms/session_map.py (extracted in issue #8). The
+# module batches into a single tmux call + single git sweep for speed,
+# and closes the P1#1 / P1#2 / P1#3 regressions from PR #7's review.
 _issue_session_map() {
     local tmp="/tmp/tms-session-map-$$.json"
-    python3 - "$tmp" << 'PYEOF'
-import json, subprocess, re, os, sys
-
-ICONS = {'pi': '\u03c0', 'claude': 'cc', 'opencode': 'oc', 'python3': 'py', 'bash': 'sh', 'zsh': 'sh'}
-# Loaded from `tmq list --machine` so we don't drift from the canonical registry
-REPOS = []
-def load_repos():
-    global REPOS
-    try:
-        r = subprocess.run(['tmq', 'list', '--machine'],
-                           capture_output=True, text=True, timeout=3)
-        if r.returncode == 0:
-            for line in r.stdout.splitlines():
-                parts = line.split('\t')
-                if parts and parts[0]:
-                    REPOS.append(parts[0])
-    except Exception:
-        REPOS = ['home-portal', 'distillery', 'tower-fleet', 'scripts', 'palimpsest', 'rms', 'deploy']
-
-def shell(cmd, timeout=5):
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.stdout.strip()
-    except:
-        return ''
-
-# Resolve a worktree/cwd path to a registered repo shortname. Longest path
-# match first, so a worktree at /root/wt-distillery-108/... matches distillery
-# (not a longer-named subpath of another repo). Falls back to the
-# /root/wt-<short>-<num> convention if no registered path matches.
-def detect_repo_from_path(path):
-    if not path:
-        return ''
-    try:
-        r = subprocess.run(['tmq', 'list', '--machine'],
-                           capture_output=True, text=True, timeout=3)
-        rows = r.stdout.splitlines() if r.returncode == 0 else []
-    except Exception:
-        rows = []
-    best, bestlen = '', 0
-    known_shorts = set()
-    for row in rows:
-        parts = row.split('\t')
-        if len(parts) < 2:
-            continue
-        short, p = parts[0], parts[1]
-        if not short:
-            continue
-        known_shorts.add(short)
-        if not p:
-            continue
-        if path == p or path.startswith(p + '/'):
-            if len(p) > bestlen:
-                best, bestlen = short, len(p)
-    if best:
-        return best
-    # Worktree convention: /root/wt-<short>-<num> (or any path containing
-    # /wt-<short>-<num> followed by / or end of string). Use search, not
-    # match — the path may be /root/wt-distillery-108, not /wt-... at pos 0.
-    wm = re.search(r'/wt-([a-z0-9-]+)-\d+(/|$)', path)
-    if wm and wm.group(1) in known_shorts:
-        return wm.group(1)
-    return ''
-
-# Parse a (feat|fix|chore|review)/issue-<num>-<slug> branch → (type, num)
-def parse_issue_branch(branch):
-    m = re.match(r'(feat|fix|chore|review)/issue-(\d+)', branch or '')
-    if not m:
-        return None
-    return (m.group(1), m.group(2))
-
-# Parse an aoe title like "feat-home-portal#5" → (type, repo, num)
-def parse_issue_title(title):
-    m = re.match(r'(feat|fix|chore|review)-(.+?)#(\d+)$', title or '')
-    if not m:
-        return None
-    return (m.group(1), m.group(2), m.group(3))
-
-# Single tmux call: all panes → session, command, cwd
-panes_raw = shell(['tmux', 'list-panes', '-a', '-F', '#{session_name}|#{pane_current_command}|#{pane_current_path}'])
-panes = []
-for line in panes_raw.split('\n'):
-    if '|' in line:
-        p = line.split('|', 2)
-        panes.append({'session': p[0], 'cmd': p[1], 'cwd': p[2]})
-
-# Build session→(cmd,cwd) map (first pane per session)
-ses_info = {}
-for p in panes:
-    if p['session'] not in ses_info:
-        ses_info[p['session']] = (p['cmd'], p['cwd'])
-
-# aoe sessions: keyed by the 8-char id prefix that aoe uses as the tmux-name
-# suffix. Using the id (not the title) means titles with spaces (e.g.
-# "tms issue filing") still resolve correctly.
-aoe_by_id = {}
-try:
-    for s in json.loads(shell(['aoe', 'list', '--json'], timeout=3)):
-        sid = s.get('id', '')
-        if len(sid) >= 8:
-            aoe_by_id[sid[:8]] = {
-                'title': s.get('title', ''),
-                'path':  s.get('path', ''),
-                'tool':  s.get('tool', ''),
-            }
-except (json.JSONDecodeError, ValueError, subprocess.TimeoutExpired, OSError):
-    pass
-
-load_repos()
-mapping = {}
-
-for session, (cmd, cwd) in ses_info.items():
-    icon = ICONS.get(cmd, cmd[:3] if cmd else '?')
-
-    # tmq sessions: feat|fix|chore|review-<repo>#<num>[-cc|-oc]
-    m = re.match(r'(feat|fix|chore|review)-(.+?)#(\d+)(-cc|-oc)?$', session)
-    if m:
-        key = f'{m.group(2)}#{m.group(3)}'
-        mapping.setdefault(key, []).append(f'{session} {icon}')
-        continue
-
-    # aoe sessions: aoe_<title>_<uuid> — join key is the 8-char id prefix,
-    # which is what aoe appends to the tmux session name.
-    #
-    # For aoe sessions, the title is the source of truth. We do NOT
-    # fall back to the worktree branch: a session titled "tms issue
-    # filing" on /root/tms should not auto-link to whatever feature
-    # branch the user happens to have checked out there.
-    if session.startswith('aoe_'):
-        um = re.match(r'^aoe_.+_([0-9a-f]{6,})$', session)
-        if um:
-            uuid_prefix = um.group(1)[:8]
-            info = aoe_by_id.get(uuid_prefix, {})
-            tp = parse_issue_title(info.get('title', ''))
-            if tp:
-                _type, repo_name, num = tp
-                mapping.setdefault(f'{repo_name}#{num}', []).append(f'{session} {icon}')
-        continue
-
-    # scratch: c<n>, o<n>, p<n>
-    m = re.match(r'^([cop])(\d+)$', session)
-    if not m:
-        continue
-    if not cwd or not os.path.exists(os.path.join(cwd, '.git')):
-        continue
-    branch = shell(['git', '-C', cwd, 'branch', '--show-current'])
-    parsed = parse_issue_branch(branch)
-    if not parsed:
-        continue
-    _type, num = parsed
-    repo_name = detect_repo_from_path(cwd)
-    if not repo_name:
-        continue
-    key = f'{repo_name}#{num}'
-    mapping.setdefault(key, []).append(f'{session} {icon}')
-
-with open(sys.argv[1], 'w') as f:
-    json.dump(mapping, f)
-PYEOF
+    PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" \
+        python3 -m tms.session_map "$tmp" 2>/dev/null
     echo "$tmp"
 }
 
@@ -897,8 +722,10 @@ _cached_session_map() {
     fi
     local map_file
     map_file=$(_issue_session_map)
-    cp "$map_file" "$cache_file"
-    rm -f "$map_file"
+    # `mv` is atomic on the same filesystem (both /tmp). Replaces the
+    # previous `cp`+`rm` pattern, which was non-atomic and could leave
+    # a concurrent reader seeing a partial file. P0#1 (cache-race fix).
+    mv "$map_file" "$cache_file"
     echo "$cache_file"
 }
 
