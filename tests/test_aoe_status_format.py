@@ -11,9 +11,13 @@ scope for the initial extraction, but this test pins the values so a
 follow-up sync can be verified mechanically.
 """
 
+import re
 import subprocess
+from pathlib import Path
 
 from tms.aoe_status import FORMAT_TABLE, format_status, emit_bash_format_fn
+
+BIN_TMS = Path(__file__).resolve().parent.parent / 'bin' / 'tms'
 
 
 # ── FORMAT_TABLE has the right entries ────────────────────────────
@@ -93,3 +97,52 @@ def test_emitted_bash_contains_all_statuses():
     bash_src = emit_bash_format_fn()
     for status in FORMAT_TABLE:
         assert f'{status})' in bash_src, f"missing case branch for {status}"
+
+
+# ── drift guard: bin/tms bash must match FORMAT_TABLE ─────────────
+#
+# FORMAT_TABLE is the source of truth, but bin/tms still carries its own
+# `_format_status` / `_status_color` case statements (they are NOT yet
+# generated from emit_bash_format_fn). Until they are, the two copies can
+# silently diverge. This test fails the moment they do — edit one without
+# the other and the push is blocked.
+
+
+def _parse_bash_case(func_name, cmd):
+    """Extract {case_key: quoted_value} from a bash case statement in bin/tms.
+
+    func_name e.g. '_format_status'; cmd is the command inside each arm
+    ('printf' or 'echo'). Includes the '*' default arm.
+    """
+    src = BIN_TMS.read_text()
+    m = re.search(
+        rf'^{re.escape(func_name)}\(\)\s*\{{(.*?)^\}}', src, re.S | re.M
+    )
+    assert m, f"{func_name}() not found in {BIN_TMS}"
+    body = m.group(1)
+    return dict(re.findall(rf"(\S+?)\)\s*{cmd} '([^']*)'", body))
+
+
+def test_bin_tms_case_statements_match_format_table():
+    """Drift guard for the un-extracted bash copy of the status table."""
+    labels = _parse_bash_case('_format_status', 'printf')
+    colors = _parse_bash_case('_status_color', 'echo')
+
+    for status, (label, color) in FORMAT_TABLE.items():
+        assert labels.get(status) == label, (
+            f"bin/tms _format_status[{status}]={labels.get(status)!r} "
+            f"!= FORMAT_TABLE label {label!r} — tables have drifted"
+        )
+        assert colors.get(status) == color, (
+            f"bin/tms _status_color[{status}]={colors.get(status)!r} "
+            f"!= FORMAT_TABLE color {color!r} — tables have drifted"
+        )
+
+    # The default (*) arm must match format_status's unknown-placeholder.
+    ph_label, ph_color = format_status('__unknown__')
+    assert labels.get('*') == ph_label, (
+        f"bin/tms default label {labels.get('*')!r} != placeholder {ph_label!r}"
+    )
+    assert colors.get('*') == ph_color, (
+        f"bin/tms default color {colors.get('*')!r} != placeholder {ph_color!r}"
+    )
