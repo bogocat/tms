@@ -257,27 +257,44 @@ spawn_agent() {
     # `aoe session attach <name>` after the fact, or set TMS_TMQ_LAUNCH=1
     # for direct `tmq` invocations.
     if command -v aoe &>/dev/null; then
-        local wt_flag=""
+        local wt_flag="" add_ok=0 start_ok=0
         [[ -n "$branch" ]] && wt_flag="-w $branch"
 
-        aoe add "$cwd" -t "$session_name" --tool "$aoe_tool" \
-            $wt_flag --trust-hooks \
-            --cmd-override "$cmd_override" 2>&1
-
-        # Start the agent in the new session (aoe add alone just registers it).
-        if [[ "${TMS_TMQ_LAUNCH:-}" == "1" ]]; then
-            # Legacy path: -l tries to auto-attach via tmux switch-client.
-            # Kept for backward compat with direct `tmq` invocations where
-            # the user does want to drop straight in.
-            aoe session attach "$session_name" 2>&1 || true
-        else
-            aoe session start "$session_name" 2>&1 || true
+        # `aoe add` may fail (duplicate title, network, etc.). Capture exit.
+        if aoe add "$cwd" -t "$session_name" --tool "$aoe_tool" \
+                $wt_flag --trust-hooks \
+                --cmd-override "$cmd_override" 2>&1; then
+            add_ok=1
         fi
 
-        echo "Spawned: $session_name ($agent in $cwd) [via aoe]"
-        echo "Prompt:   $prompt_file"
-        echo "Monitor:  aoe status"
-        echo "Attach:   aoe session attach $session_name   # when ready"
+        # `aoe session start` may fail (worktree not ready, agent missing).
+        # In TMS_TMQ_LAUNCH=1 mode we go through the legacy attach path which
+        # also requires the session to exist; the same failure modes apply.
+        if (( add_ok )); then
+            if [[ "${TMS_TMQ_LAUNCH:-}" == "1" ]]; then
+                aoe session attach "$session_name" 2>&1 && start_ok=1 || true
+            else
+                aoe session start "$session_name" 2>&1 && start_ok=1 || true
+            fi
+        fi
+
+        if (( add_ok && start_ok )); then
+            echo "Spawned: $session_name ($agent in $cwd) [via aoe]"
+            echo "Prompt:   $prompt_file"
+            echo "Monitor:  aoe status"
+            echo "Attach:   aoe session attach $session_name   # when ready"
+        else
+            # Honest failure: tell the user which step failed. Cleanup the
+            # half-registered session so it doesn't dangle in `aoe list`.
+            echo "ERROR: spawn failed (add_ok=$add_ok, start_ok=$start_ok)" >&2
+            if (( add_ok )); then
+                echo "  session was registered but the agent did not start" >&2
+                echo "  cleanup: aoe remove $session_name" >&2
+            else
+                echo "  aoe add rejected the session (likely duplicate title or worktree)" >&2
+            fi
+            return 1
+        fi
     else
         # Fallback: direct tmux spawn (no aoe dashboard visibility)
         case "$agent" in

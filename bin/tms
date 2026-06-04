@@ -82,11 +82,25 @@ _cache_valid() {
     local cf
     cf=$(_cache_file "$1")
     [[ -f "$cf" ]] || return 1
+    # Empty or near-empty cache is invalid (gh fetch likely failed)
+    local sz
+    sz=$(stat -c %s "$cf" 2>/dev/null || echo 0)
+    (( sz > 200 )) || return 1
+    # First line must be valid JSON starting with '{'
+    head -1 "$cf" 2>/dev/null | grep -q '^{' || return 1
     local age
     age=$(($(date +%s) - $(stat -c %Y "$cf" 2>/dev/null || echo 0)))
     (( age < ISSUE_CACHE_TTL ))
 }
-_write_cache() { mkdir -p "$ISSUE_CACHE_DIR"; cat - > "$(_cache_file "$1")"; }
+_write_cache() {
+    # Atomic write via .tmp + rename. Prevents readers from seeing a
+    # half-written / truncated file if the writer is killed mid-stream.
+    mkdir -p "$ISSUE_CACHE_DIR"
+    local cf tmp
+    cf=$(_cache_file "$1")
+    tmp="${cf}.tmp.$$"
+    cat - > "$tmp" && mv -f "$tmp" "$cf" || rm -f "$tmp"
+}
 _clear_cache() { rm -rf "$ISSUE_CACHE_DIR"; mkdir -p "$ISSUE_CACHE_DIR"; }
 
 # Fetch a single repo: open + closed issues, open PRs. NDJSON out.
@@ -94,8 +108,9 @@ _fetch_repo() {
     local short=$1 gh_repo=$2
 
     # All issues (open + closed); stateReason fetched in preview only (not
-    # available via `gh issue list --json`).
-    gh issue list --repo "$gh_repo" --state all --limit 100 \
+    # available via `gh issue list --json`). Limit 500 covers all current
+    # repos in the registry; bump if you have a repo with >500 issues.
+    gh issue list --repo "$gh_repo" --state all --limit 500 \
         --json number,title,state,labels,url,createdAt,updatedAt,closedAt,assignees 2>/dev/null \
     | python3 -c "
 import json, sys
@@ -114,19 +129,30 @@ for iss in json.load(sys.stdin):
 "
 
     # Open PRs — for status (review state, draft, etc.)
-    gh pr list --repo "$gh_repo" --state open --limit 100 \
+    gh pr list --repo "$gh_repo" --state open --limit 200 \
         --json number,title,body,headRefName,reviewDecision,isDraft,url 2>/dev/null \
     | python3 -c "
 import json, sys, re
 def _match_issue(pr):
+    # Branch-based: the PR is in this repo's namespace, so the branch
+    # unambiguously refers to issues in this repo.
     branch = pr.get('headRefName','') or ''
     title = pr.get('title','') or ''
     body = pr.get('body','') or ''
     m = re.search(r'issue-(\d+)', branch)
-    if not m: m = re.search(r'(?:^|/)([0-9]+)-[a-z]', branch)  # feat/244-foo
-    if not m: m = re.search(r'\(#([0-9]+)\)', title)             # Title: ... (#248)
-    if not m: m = re.search(r'(?:close|fix|resolve)[sd]?\s+#([0-9]+)', body, re.I)
-    return int(m.group(1)) if m else None
+    if m: return int(m.group(1))
+    # Shorthand: feat/244-foo, fix/248-bar. Anchored to start (or after /)
+    # to avoid matching arbitrary numbers mid-string.
+    m = re.search(r'(?:^|/)([0-9]+)-[a-z]', branch)
+    if m: return int(m.group(1))
+    # Title: '... (#248)'. In rare cases this could be a cross-repo reference,
+    # but that's also true of the branch name and gh pr list filtered by repo.
+    m = re.search(r'\(#([0-9]+)\)', title)
+    if m: return int(m.group(1))
+    # Body: 'Closes #248' / 'Fixes #248' / 'Resolves #248'. Same caveat.
+    m = re.search(r'(?:close|fix|resolve)[sd]?\s+#([0-9]+)', body, re.I)
+    if m: return int(m.group(1))
+    return None
 for pr in json.load(sys.stdin):
     issue_num = _match_issue(pr)
     rd = pr.get('reviewDecision') or ''
@@ -148,7 +174,7 @@ for pr in json.load(sys.stdin):
 "
 
     # Recently closed/merged PRs — for "merged" status on closed issues
-    gh pr list --repo "$gh_repo" --state closed --limit 50 \
+    gh pr list --repo "$gh_repo" --state closed --limit 200 \
         --json number,state,mergedAt,headRefName,title,body 2>/dev/null \
     | python3 -c "
 import json, sys, re
@@ -157,10 +183,14 @@ def _match_issue(pr):
     title = pr.get('title','') or ''
     body = pr.get('body','') or ''
     m = re.search(r'issue-(\d+)', branch)
-    if not m: m = re.search(r'(?:^|/)([0-9]+)-[a-z]', branch)
-    if not m: m = re.search(r'\(#([0-9]+)\)', title)
-    if not m: m = re.search(r'(?:close|fix|resolve)[sd]?\s+#([0-9]+)', body, re.I)
-    return int(m.group(1)) if m else None
+    if m: return int(m.group(1))
+    m = re.search(r'(?:^|/)([0-9]+)-[a-z]', branch)
+    if m: return int(m.group(1))
+    m = re.search(r'\(#([0-9]+)\)', title)
+    if m: return int(m.group(1))
+    m = re.search(r'(?:close|fix|resolve)[sd]?\s+#([0-9]+)', body, re.I)
+    if m: return int(m.group(1))
+    return None
 for pr in json.load(sys.stdin):
     issue_num = _match_issue(pr)
     print(json.dumps({
@@ -232,10 +262,20 @@ with open(merged) as f:
         except Exception: continue
         r = d.get('repo','')
         if r: out[r].append(line)
+import tempfile
 for r in repos:
-    if r in out:
-        with open(os.path.join(cache_dir, f'{r}.ndjson'), 'w') as f:
-            f.write('\n'.join(out[r]) + '\n')
+    if r in out and out[r]:
+        # Atomic write: .tmp + rename, so a crash mid-write can't leave a
+        # truncated cache file that passes the mtime check but is broken.
+        final = os.path.join(cache_dir, f'{r}.ndjson')
+        tmp = f'{final}.tmp.{os.getpid()}'
+        try:
+            with open(tmp, 'w') as f:
+                f.write('\n'.join(out[r]) + '\n')
+            os.replace(tmp, final)
+        except Exception:
+            try: os.unlink(tmp)
+            except Exception: pass
 PYEOF
     rm -f "$merged"
 }
@@ -510,14 +550,29 @@ for (repo, n), iss in issues.items():
     agents = sessions.get(key, [])
 
     is_open = iss['state'] == 'OPEN'
-    is_recently_closed = (not is_open) and iss['closed'] > 0 and (now - iss['closed']) < RECENT_CLOSED_SECS
+    # A closed issue with missing/unparseable closedAt is treated as "old closed"
+    # (not shown in `all` view), but NOT silently dropped — see `view == 'all'`
+    # logic below: we still keep it as a row but flag it. The "all" view
+    # intentionally hides older closed issues to keep the list focused; the
+    # preview still works for any issue. If the user wants to see them,
+    # `tms issues --raw <repo> | grep` finds them in the cache.
+    if is_open:
+        is_recently_closed = False
+    elif iss['closed'] > 0:
+        is_recently_closed = (now - iss['closed']) < RECENT_CLOSED_SECS
+    else:
+        # Missing closedAt — show it in 'all' to avoid silent data loss.
+        is_recently_closed = True
     has_agent = bool(agents)
     is_yours = bool(gh_user) and (gh_user in iss['assignees'])
+    # `is_stale` only requires `created` to be parseable. `updated` defaults to
+    # `created` if missing (defensive: an issue is stale iff it was opened long
+    # ago and hasn't been touched since).
+    upd_for_stale = iss['updated'] if iss['updated'] > 0 else iss['created']
     is_stale = (is_open
                 and not has_agent
-                and iss['updated'] > 0
-                and (now - iss['updated']) > STALE_SECS
-                and (now - iss['created']) > STALE_SECS)
+                and iss['created'] > 0
+                and (now - upd_for_stale) > STALE_SECS)
 
     # View filter
     if view == 'active' and not has_agent: continue
@@ -666,7 +721,7 @@ issue_browser() {
     if [[ "$repo_filter" == "--force" ]]; then force_flag="--force"; repo_filter=""; fi
     [[ "$force_flag" == "--all" ]] && { repo_filter=""; force_flag="--force"; }
 
-    if [[ -z "$repo_filter" ]]; then
+    if [[ -z "$repo_filter" && -z "${TMS_NO_AUTO:-}" ]]; then
         repo_filter=$(detect_repo_from_cwd)
         if [[ -n "$repo_filter" ]]; then
             echo "Auto-detected repo: $repo_filter (add --all for all repos)" >&2
@@ -745,7 +800,7 @@ issue_browser() {
         --bind="ctrl-o:execute(gh issue view \$(echo {} | sed -n 's/.*\\t\\([^[:space:]]*#[0-9]*\\)\$/\\1/p' | cut -d# -f2) --repo bogocat/\$(echo {} | sed -n 's/.*\\t\\([^[:space:]]*#[0-9]*\\)\$/\\1/p' | cut -d# -f1) --web 2>/dev/null)" \
         --bind="ctrl-p:execute(tms --preview {} | less -R)" \
         --bind="ctrl-e:execute(key=\$(echo {} | sed -n 's/.*\\t\\([^[:space:]]*#[0-9]*\\)\$/\\1/p'); repo=\${key%#*}; iss=\${key#*#}; pr=\$(gh pr list --repo bogocat/\$repo --search \"issue:\$iss\" --json number --jq '.[0].number' 2>/dev/null); if [[ -n \"\$pr\" ]]; then tmq review \$repo \$pr; else echo \"No linked PR found for \$repo#\$iss\"; fi)" \
-        --bind="ctrl-s:reload(tms sessions)+change-header(enter:attach  ctrl-x/d:kill  ctrl-r:rename  ctrl-k:clean  ctrl-i:issues  ?:help  esc:cancel)+change-preview(name=\"\$(echo {} | sed 's/.*\\t//')\"; tmux capture-pane -t \"\$name\" -p -S -40 2>/dev/null | sed 's/^/  /')" \
+        --bind="ctrl-s:become(tms sessions)" \
         --bind="ctrl-v:become($become_v)" \
         --bind="ctrl-r:become($become_r)" \
         --bind="?:execute(printf '%s\n\n' 'KEYBINDINGS' '-----------' 'enter      dispatch agent (via tmq)' 'ctrl-o     open issue in browser' 'ctrl-p     full preview' 'ctrl-e     code review linked PR' 'ctrl-v     cycle view (All/Active/Yours/Stale)' 'ctrl-r     force refresh (skip cache)' 'ctrl-s     switch to session browser' '?          this help' 'esc        cancel' '' 'VIEW MODES' '-----------' 'All      all open + recently closed (14d)' 'Active   issues with a live agent session' 'Yours    assigned to you' 'Stale    open >14d, no activity, no agent' '' 'COLUMNS' '--------' 'ST  status (○open ●active ▶pr ◐draft ◎review ✎changes ✓ready ✗blocked ✔reviewed ?question)' 'AGE since created  UPD since last update  ★ assigned to you' | less -R)" \
@@ -1121,6 +1176,40 @@ session_browser() {
     fi
 }
 
+# Shared router for `tms issues`, `tms --raw`, `tms --view`, and the
+# unknown-arg fallback. Parses flags, applies CWD auto-detect (skippable
+# via TMS_NO_AUTO=1), then either prints rows or opens the fzf browser.
+# Must be defined ABOVE the main case so the case branches can call it
+# (bash does NOT hoist function defs).
+_route_issues_inline() {
+    local view="all" raw="" force="" repo_arg="" clear="" saw_all=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --view) [[ -n "${2:-}" ]] && view="$2" && shift 2 || shift ;;
+            --raw) raw="--raw"; shift ;;
+            --force) force="--force"; shift ;;
+            --all) repo_arg="--all"; saw_all=1; shift ;;
+            --clear-cache) clear=1; shift ;;
+            *) [[ -z "$repo_arg" ]] && repo_arg="$1"; shift ;;
+        esac
+    done
+    if [[ -n "$clear" ]]; then _clear_cache; echo "Issue cache cleared."; exit 0; fi
+    if [[ "$repo_arg" == "--all" ]]; then repo_arg=""; fi
+    # --all explicitly opts out of CWD auto-detect (P0-2/P0-3). Also respect
+    # TMS_NO_AUTO if set by the caller.
+    if (( saw_all )); then export TMS_NO_AUTO=1; fi
+    if [[ -z "$repo_arg" && -z "${TMS_NO_AUTO:-}" ]]; then
+        local detected
+        detected=$(detect_repo_from_cwd)
+        [[ -n "$detected" ]] && repo_arg="$detected"
+    fi
+    if [[ -n "$raw" ]]; then
+        issue_list "$view" "$repo_arg" "$force"
+        exit 0
+    fi
+    issue_browser "$repo_arg" "$force" "$view"
+}
+
 # ── main ────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -1144,60 +1233,34 @@ case "${1:-}" in
         ;;
     issues)
         shift
-        # Parse --view / --raw / --force / --all / --clear-cache
-        view="all"; raw=""; force=""; repo_arg=""; clear=""
-        while [[ $# -gt 0 ]]; do
-            case "$1" in
-                --view) view="$2"; shift 2 ;;
-                --raw) raw="--raw"; shift ;;
-                --force) force="--force"; shift ;;
-                --all) repo_arg="--all"; shift ;;
-                --clear-cache) clear=1; shift ;;
-                *) [[ -z "$repo_arg" ]] && repo_arg="$1"; shift ;;
-            esac
-        done
-        if [[ -n "$clear" ]]; then _clear_cache; echo "Issue cache cleared."; exit 0; fi
-        if [[ "$repo_arg" == "--all" ]]; then repo_arg=""; fi
-        if [[ -z "$repo_arg" && -z "${TMS_NO_AUTO:-}" ]]; then
-            detected=$(detect_repo_from_cwd)
-            if [[ -n "$detected" ]]; then
-                repo_arg="$detected"
-            fi
-        fi
-        if [[ -n "$raw" ]]; then
-            issue_list "$view" "$repo_arg" "$force"
-            exit 0
-        fi
-        issue_browser "$repo_arg" "$force" "$view"
+        _route_issues_inline "$@"
         ;;
     "")
-        # DEFAULT: issue browser
+        # DEFAULT: issue browser (auto-detect from CWD)
         issue_browser
         ;;
     --all)
+        # Top-level: force all repos (skip CWD auto-detect)
         TMS_NO_AUTO=1 issue_browser --all
         ;;
     --raw|--raw=*)
-        # Convenience: tms --raw [--all | repo] [--view X]
+        # Top-level shortcut: `tms --raw [repo|--all] [--view X] [--force]`
         shift
-        TMS_NO_AUTO=1
-        repo_arg=""
-        force_flag=""
-        view="all"
-        while [[ $# -gt 0 ]]; do
-            case "$1" in
-                --all) repo_arg="--all"; shift ;;
-                --view) view="$2"; shift 2 ;;
-                --force) force_flag="--force"; shift ;;
-                *) [[ -z "$repo_arg" ]] && repo_arg="$1"; shift ;;
-            esac
-        done
-        if [[ -z "$repo_arg" ]]; then
-            detected=$(detect_repo_from_cwd)
-            [[ -n "$detected" ]] && repo_arg="$detected"
-        fi
-        [[ "$repo_arg" == "--all" ]] && repo_arg=""
-        issue_list "$view" "$repo_arg" "$force_flag"
+        _route_issues_inline --raw "$@"
+        ;;
+    --force)
+        # Top-level shortcut: skip cache, default repo
+        shift
+        _route_issues_inline --force "$@"
+        ;;
+    --view)
+        # Top-level shortcut: `tms --view active`
+        shift
+        _route_issues_inline --view "$@"
+        ;;
+    --clear-cache)
+        _clear_cache
+        echo "Issue cache cleared."
         ;;
     --preview)
         issue_preview "${2:-}"
@@ -1205,8 +1268,34 @@ case "${1:-}" in
     -h|--help)
         sed -n '2,30p' "$0"
         ;;
+    sessions|session)
+        shift
+        session_browser
+        ;;
+    ls|list) session_list_text ;;
+    kill)
+        [[ -z "${2:-}" ]] && { echo "Usage: tms kill <name>"; exit 1; }
+        kill_session "$2" "${3:-}"
+        ;;
+    rename)
+        [[ -z "${2:-}" ]] && { echo "Usage: tms rename <name>"; exit 1; }
+        rename_session "$2"
+        ;;
+    stale) stale_sessions ;;
+    clean) clean_stale "$@" ;;
+    compact) compact_scratch_sessions ;;
     *)
-        echo "Usage: tms [sessions|issues|ls|kill|rename|stale|clean|compact]"
-        exit 1
+        # Unknown first arg → treat as `tms issues <args>` (e.g. `tms distillery`,
+        # `tms home-portal --view stale`). Only delegate if it looks like either
+        # a known repo shortname or a known flag; otherwise show usage.
+        if [[ "$1" =~ ^(distillery|home-portal|tower-fleet|scripts|palimpsest|rms|tms)$ ]] \
+            || [[ "$1" == --* ]]; then
+            _route_issues_inline "$@"
+        else
+            echo "Usage: tms [sessions|issues|ls|kill|rename|stale|clean|compact|<repo>]"
+            echo "       tms --all | --raw | --view <mode> | --force | --clear-cache"
+            exit 1
+        fi
         ;;
 esac
+
