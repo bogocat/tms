@@ -6,7 +6,10 @@
 ## Project structure
 - `bin/tms` — session manager (deploy to /usr/local/bin)
 - `bin/tmq` — issue dispatcher (deploy to /usr/local/bin)
-- Deploy: `sudo cp bin/* /usr/local/bin/`
+- `lib/tms/` — Python modules extracted from bin/tms (issue #8)
+- `tests/` — pytest test suite (run `pytest tests/`)
+- `.githooks/pre-push` — runs `pytest tests/` before push
+- Deploy: `sudo cp -r bin lib /usr/local/` (lib must travel with bin)
 
 ## Conventions
 - Bash, `set -euo pipefail`

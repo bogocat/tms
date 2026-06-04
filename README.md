@@ -5,8 +5,9 @@ Session management and GitHub issue dispatch for multi-agent coding workflows.
 ## Quick start
 
 ```bash
-# Deploy to /usr/local/bin
-sudo cp bin/tms bin/tmq /usr/local/bin/
+# Deploy to /usr/local/bin (bin + lib — the Python modules in lib/tms/
+# must be installed alongside the scripts)
+sudo cp -r bin lib /usr/local/
 
 # Browse sessions
 tms
@@ -73,4 +74,28 @@ title only when the session is on a main checkout.
 - `fzf` — interactive picker
 - `gh` — GitHub CLI (issue/PR queries + creation)
 - `python3` — JSON processing
+- `pytest` (dev) — `pip install pytest`
 - `aoe` (optional) — session registration + status in Agent of Empires
+
+## Development
+
+```bash
+# Run the test suite (fast — 72 tests, ~0.4s)
+pytest tests/ -v
+
+# The pre-push hook runs the same tests before allowing a push.
+# To install (one-time):
+git config core.hooksPath .githooks
+# Bypass with `git push --no-verify` if needed.
+
+# Test layout
+#   lib/tms/                  Python modules extracted from bin/tms
+#   tests/                    pytest test suite
+#   .githooks/pre-push        version-controlled pre-push hook
+```
+
+The test suite guards the five P0/P1 regressions from PR #7's
+multi-model review (cache-write races, bare `except`, `os.path.isdir`
+vs worktrees, `re.match` vs `re.search`, branch-first false-positives).
+See `tests/test_session_matcher.py` and `tests/test_cache_atomic_writes.py`
+for the named regression tests.
