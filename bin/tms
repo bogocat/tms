@@ -627,7 +627,7 @@ fetch_repo_issues() {
 
     # Fetch open issues + PRs to temp files
     gh issue list --repo "$gh_repo" --state open \
-        --limit 50 --json number,title,labels,url,createdAt > "$tmp.issues" 2>/dev/null || return
+        --limit 50 --json number,title,labels,url,createdAt,updatedAt > "$tmp.issues" 2>/dev/null || return
 
     gh pr list --repo "$gh_repo" --state open \
         --limit 50 --json number,title,body,headRefName,reviewDecision,url > "$tmp.prs" 2>/dev/null || echo '[]' > "$tmp.prs"
@@ -670,6 +670,8 @@ for iss in issues:
         'title': iss['title'],
         'labels': labels,
         'status': status,
+        'createdAt': iss.get('createdAt', ''),
+        'updatedAt': iss.get('updatedAt', ''),
     }
     print(json.dumps(out))
 PYEOF
@@ -737,7 +739,7 @@ issue_list() {
     local map_file
     map_file=$(_cached_session_map)
 
-    printf "%-12s %-5s %-3s %-7s %-6s %s\n" "REPO" "#" "ST" "STATUS" "AGENT" "TITLE"
+    printf "%-12s %-5s %-3s %-7s %-6s %-4s %-4s %s\n" "REPO" "#" "ST" "STATUS" "AGENT" "AGE" "UPD" "TITLE"
     printf "%s\n" "─────────────────────────────────────────────────────────────────"
 
     # Pipe all NDJSON through a single Python process — avoids spawning
@@ -818,6 +820,8 @@ for line in sys.stdin:
         continue
     num = iss.get('number', '')
     title = iss.get('title', '')
+    created_at = iss.get('createdAt', '')
+    updated_at = iss.get('updatedAt', '')
 
     sym, status_text, status_color = get_status(iss)
     key = f'{repo}#{num}'
@@ -833,12 +837,31 @@ for line in sys.stdin:
     else:
         agent_colored = color(D, '—'.ljust(6))
 
+    # AGE / UPD columns (compact 4-char formatter; dim color)
+    from datetime import datetime, timezone
+    def _age(iso):
+        if not iso: return '—'
+        try:
+            ts = datetime.fromisoformat(iso.replace('Z', '+00:00')).timestamp()
+            diff = max(0, datetime.now(timezone.utc).timestamp() - ts)
+        except Exception:
+            return '—'
+        if   diff < 60:       return f'{int(diff)}s'
+        elif diff < 3600:     return f'{int(diff // 60)}m'
+        elif diff < 86400:    return f'{int(diff // 3600)}h'
+        elif diff < 604800:   return f'{int(diff // 86400)}d'
+        elif diff < 2592000:  return f'{int(diff // 604800)}w'
+        elif diff < 31536000: return f'{int(diff // 2592000)}mo'
+        else:                 return f'{int(diff // 31536000)}y'
+    age_str = color(D, _age(created_at))
+    upd_str = color(D, _age(updated_at))
+
     # Title: dim if open+no-agent, otherwise normal
     if sym == '○':
         title = color(D, title)
 
     # Truncate title to fit terminal
-    print(f'{repo:<12} #{num:<4}  {sym_colored} {status_colored} {agent_colored} {title}')
+    print(f'{repo:<12} #{num:<4}  {sym_colored} {status_colored} {agent_colored} {age_str:<4} {upd_str:<4} {title}')
 PYEOF
 
     fetch_all_issues "$repo_filter" "$force_flag" | python3 "$pyfmt" "$map_arg"
