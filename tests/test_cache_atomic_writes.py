@@ -190,55 +190,112 @@ def _build_aoe_status_map_with(monkeypatch, stdout: str = "", returncode: int = 
 
 
 def test_aoe_invalid_json_is_skipped(tmp_path, monkeypatch):
-    """Invalid JSON from aoe must be skipped (no crash, no output)."""
+    """Invalid JSON from aoe must be skipped (no crash) and the cache
+    must still be written as a single-newline empty file (issue #21:
+    no stale data is allowed to survive a parse failure)."""
     out = tmp_path / "map.tsv"
+    out.write_text("stale_session\trunning\n")
     _build_aoe_status_map_with(monkeypatch, stdout="not json {", returncode=0)
-    # Should exit cleanly, writing nothing
+    # Should exit cleanly, replacing the stale cache with empty
     aoe_status.build_status_map(str(out))
-    assert not out.exists() or out.read_text() == ""
-
-
-def test_aoe_valid_empty_list_writes_no_file(tmp_path, monkeypatch):
-    """aoe list returns [] (no sessions) — no cache file is written.
-
-    The original heredoc always wrote the (possibly empty) file. The
-    extracted module now skips the write when there are no rows. The
-    bash wrapper handles a missing file correctly (it re-invokes the
-    module), so the behavior is intentional — pin it here so a future
-    refactor can't silently re-introduce the empty-file write.
-    """
-    out = tmp_path / "map.tsv"
-    _build_aoe_status_map_with(monkeypatch, stdout="[]", returncode=0)
-    aoe_status.build_status_map(str(out))
-    assert not out.exists(), (
-        f"expected no file when aoe list returns []; "
-        f"got {out.read_text()!r}"
+    assert out.exists()
+    assert out.read_text() == "\n", (
+        f"expected single-newline empty file; got {out.read_text()!r}"
     )
 
 
-def test_aoe_sessions_with_empty_titles_writes_no_file(tmp_path, monkeypatch):
-    """aoe list returns sessions with empty titles — same as no rows.
+def test_aoe_empty_list_writes_empty_file(tmp_path, monkeypatch):
+    """aoe list returns [] — must write a single-newline empty file
+    so any stale cache is replaced (not left in place).
 
-    Pairs with the above: even valid JSON with rows is dropped when
-    every title is empty (the matcher skips them). No file written.
+    Regression for issue #21: PR #8's extraction skipped the write
+    when no rows were collected, leaving the previous cache file
+    stale. The original bash heredoc always wrote (a 0-byte file);
+    the new module must match — a single '\\n' is the minimal
+    'valid empty TSV' shape and matches what 'no rows' looks like
+    under the same writer (the normal path emits '\\n'.join(lines)+'\\n').
+    The pre-populated stale data below proves the file is REPLACED,
+    not appended or kept.
     """
     out = tmp_path / "map.tsv"
+    out.write_text("stale_session\trunning\n")
+    _build_aoe_status_map_with(monkeypatch, stdout="[]", returncode=0)
+    aoe_status.build_status_map(str(out))
+    assert out.exists(), "expected file to be written (even if empty)"
+    assert out.read_text() == "\n", (
+        f"expected single-newline empty file; got {out.read_text()!r}"
+    )
+
+
+def test_aoe_sessions_with_empty_titles_writes_empty_file(tmp_path, monkeypatch):
+    """aoe list returns rows with empty titles — same as no rows: the
+    loop drops them, the file is written as empty (single newline).
+    Pre-populated stale data is replaced, proving no leakage.
+    """
+    out = tmp_path / "map.tsv"
+    out.write_text("stale_session\trunning\n")
     _build_aoe_status_map_with(
         monkeypatch,
         stdout=json.dumps([{"id": "abc", "title": ""}]),
         returncode=0,
     )
     aoe_status.build_status_map(str(out))
-    assert not out.exists()
+    assert out.exists()
+    assert out.read_text() == "\n", (
+        f"expected single-newline empty file; got {out.read_text()!r}"
+    )
+
+
+def test_aoe_all_session_shows_fail_writes_empty_file(tmp_path, monkeypatch):
+    """aoe list returns N sessions but every `aoe session show` fails
+    (non-zero exit). No rows survive; the file is written as empty
+    (single newline). Stale data is replaced.
+
+    This is the second half of issue #21: even if `aoe list` is
+    healthy, when all per-session lookups fail we should not show
+    last-known-good statuses as if they were current.
+    """
+    out = tmp_path / "map.tsv"
+    out.write_text("stale_session\trunning\n")
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:3] == ["aoe", "list", "--json"]:
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                json.dumps([{"id": "1", "title": "a"},
+                            {"id": "2", "title": "b"}]),
+                "",
+            )
+        if cmd[:2] == ["aoe", "session"] and cmd[2] == "show":
+            # All session shows fail — returncode != 0, no stdout
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr("tms.aoe_status.subprocess.run", fake_run)
+    aoe_status.build_status_map(str(out))
+    assert out.exists()
+    assert out.read_text() == "\n", (
+        f"expected single-newline empty file; got {out.read_text()!r}"
+    )
 
 
 def test_aoe_nonzero_exit_is_skipped(tmp_path, monkeypatch):
-    """Non-zero exit from `aoe list --json` is treated as 'no aoe'."""
+    """Non-zero exit from `aoe list --json` is treated as 'no aoe' —
+    but the cache is still WRITTEN as empty (single newline) so any
+    prior stale file is replaced. Issue #21: leaving stale data
+    behind is the bug; writing an empty file matches the original
+    heredoc semantics.
+    """
     out = tmp_path / "map.tsv"
+    out.write_text("stale_session\trunning\n")
     _build_aoe_status_map_with(monkeypatch, stdout="", returncode=1)
     # Should not crash
     aoe_status.build_status_map(str(out))
-    assert not out.exists() or out.read_text() == ""
+    assert out.exists(), "expected file to be written (even if empty)"
+    assert out.read_text() == "\n", (
+        f"expected single-newline empty file; got {out.read_text()!r}"
+    )
 
 
 def test_aoe_timeout_is_swallowed(tmp_path, monkeypatch):
