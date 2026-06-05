@@ -925,8 +925,8 @@ issue_browser() {
         force_flag="--force"
     fi
 
-    # No repo filter specified → auto-detect from CWD
-    if [[ -z "$repo_filter" ]]; then
+    # No repo filter specified → auto-detect from CWD (skippable via TMS_NO_AUTO=1)
+    if [[ -z "$repo_filter" && -z "${TMS_NO_AUTO:-}" ]]; then
         repo_filter=$(detect_repo_from_cwd)
         if [[ -n "$repo_filter" ]]; then
             echo "Auto-detected repo: $repo_filter (add --all for all repos)" >&2
@@ -1296,6 +1296,33 @@ EOF
     fi
 }
 
+
+# Shared router for top-level flags that forward to \`tms issues\`.
+_route_issues_top() {
+    local args=()
+    case "$1" in
+        --view)
+            shift
+            local view="${1:-all}"
+            shift
+            local repo=$(detect_repo_from_cwd)
+            issue_browser "$repo" "" "$view"
+            ;;
+        --clear-cache)
+            _clear_cache
+            echo "Issue cache cleared."
+            ;;
+        --new)
+            shift
+            new_issue "$@"
+            ;;
+        --import)
+            shift
+            import_session "$@"
+            ;;
+    esac
+}
+
 # ── main ─────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -1324,6 +1351,44 @@ case "${1:-}" in
         ;;
     compact)
         compact_scratch_sessions
+        ;;
+    sessions|session)
+        # Secondary: session browser (use aoe for live monitoring)
+        if ! command -v fzf &>/dev/null; then
+            echo "fzf not found. Install with: apt install fzf" >&2
+            session_list
+            return 1
+        fi
+        stty -ixon 2>/dev/null
+        local selected
+        selected=$(session_list | fzf \
+            --header='enter:attach  ctrl-x/d:kill  ctrl-r:rename  ctrl-k:clean  ctrl-p:peek  ctrl-i:issues  ?:help  esc:cancel' \
+            --header-first --ansi --no-sort \
+            --preview='name=$(echo {} | sed "s/.*\t//"); tmux capture-pane -t "$name" -p -S -40 2>/dev/null | sed "s/^/  /"' \
+            --preview-window='right:60%:wrap' \
+            --bind="enter:accept" \
+            --bind="ctrl-x:execute(real=\$(echo {} | sed 's/.*\t//'); tms kill \$real --force)+reload(tms ls | tail -n +3)" \
+            --bind="ctrl-d:execute(real=\$(echo {} | sed 's/.*\t//'); tms kill \$real --force)+reload(tms ls | tail -n +3)" \
+            --bind="ctrl-r:become(stty sane; real=\$(echo {} | sed 's/.*\t//'); tms rename \$real; exec tms)" \
+            --bind="ctrl-p:execute(real=\$(echo {} | sed 's/.*\t//'); tmux capture-pane -t \"\$real\" -p -S -40 | less -R)" \
+            --bind="ctrl-k:execute(tms clean --yes)+reload(tms ls | tail -n +3)" \
+            --bind="ctrl-i:reload(tms issues --raw --all)+change-header(issues: enter=dispatch  ctrl-o=browser  ctrl-p=preview  ctrl-s=back  ?=help  esc=cancel)+change-preview(tms --preview {})" \
+            --bind="ctrl-s:reload(tms ls | tail -n +3)+change-header(enter:attach  ctrl-x/d=kill  ctrl-r:rename  ctrl-k=clean  ctrl-p=peek  ctrl-i=issues  ?:help  esc=cancel)+change-preview(name=\"\$(echo {} | sed 's/.*\\t//')\"; tmux capture-pane -t \"\$name\" -p -S -40 2>/dev/null | sed 's/^/  /')" \
+            --bind="?:execute(printf '%s\n\n' 'KEYBINDINGS' '-----------' 'enter      attach' 'ctrl-x/d   kill session' 'ctrl-r     rename' 'ctrl-k     clean stale' 'ctrl-i     switch to issues' 'ctrl-s     back to sessions' 'ctrl-p     peek terminal' '?          help' 'esc        cancel' | less -R)" \
+            --tac) || true
+        if [[ -n "$selected" ]]; then
+            local col1 col2 real_name
+            col1=$(echo "$selected" | awk '{print $1}')
+            col2=$(echo "$selected" | awk '{print $2}' | tr -d '#')
+            real_name=$(echo "$selected" | sed 's/.*\t//')
+            if is_known_repo "$col1"; then
+                tmq "$col1" "$col2"
+                exec tms
+            else
+                attach_session "$real_name"
+                [[ -z "${TMUX:-}" ]] && exec tms
+            fi
+        fi
         ;;
     new)
         shift
@@ -1357,54 +1422,55 @@ case "${1:-}" in
         issue_browser "${2:-}" "${3:-}"
         ;;
     "")
-        # Interactive fzf picker
-        if ! command -v fzf &>/dev/null; then
-            echo "fzf not found. Install with: apt install fzf"
-            echo ""
-            echo "Available sessions:"
-            session_list
-            exit 1
-        fi
-
-        stty -ixon 2>/dev/null  # enable ctrl+s passthrough
-        selected=$(session_list | fzf \
-            --header='enter:attach  ctrl-x/d:kill  ctrl-r:rename  ctrl-k:clean  ctrl-p:peek  ctrl-i:issues  ?:help  esc:cancel' \
-            --header-first \
-            --ansi \
-            --no-sort \
-            --preview='name=$(echo {} | sed "s/.*\t//"); tmux capture-pane -t "$name" -p -S -40 2>/dev/null | sed "s/^/  /"' \
-            --preview-window='right:60%:wrap' \
-            --bind="enter:accept" \
-            --bind="ctrl-x:execute(real=\$(echo {} | sed 's/.*\t//'); tms kill \$real --force)+reload(tms ls | tail -n +3)" \
-            --bind="ctrl-d:execute(real=\$(echo {} | sed 's/.*\t//'); tms kill \$real --force)+reload(tms ls | tail -n +3)" \
-            --bind="ctrl-r:become(stty sane; real=\$(echo {} | sed 's/.*\t//'); tms rename \$real; exec tms)" \
-            --bind="ctrl-p:execute(real=\$(echo {} | sed 's/.*\t//'); tmux capture-pane -t \"\$real\" -p -S -40 | less -R)" \
-            --bind="ctrl-k:execute(tms clean --yes)+reload(tms ls | tail -n +3)" \
-            --bind="ctrl-i:reload(tms issues --raw --all)+change-header(issues (all repos): enter=dispatch  ctrl-o=browser  ctrl-p=preview  ctrl-s=back  ?=help  esc=cancel)+change-preview(tms --preview {})" \
-            --bind="ctrl-s:reload(tms ls | tail -n +3)+change-header(enter:attach  ctrl-x/d:kill  ctrl-r:rename  ctrl-k:clean  ctrl-p:peek  ctrl-i:issues  ?:help  esc:cancel)+change-preview(name=\"\$(echo {} | sed 's/.*\\t//')\"; tmux capture-pane -t \"\$name\" -p -S -40 2>/dev/null | sed 's/^/  /')" \
-            --bind="?:execute(printf '%s\n\n' 'KEYBINDINGS' '-----------' 'enter      attach to session' 'ctrl-x/d   kill session' 'ctrl-r     rename session' 'ctrl-k     clean stale' 'ctrl-i     browse issues' 'ctrl-s     back to sessions' 'ctrl-p     peek terminal' '?          this help' 'esc        cancel' | less -R)" \
-            --tac)
-
-        if [[ -n "$selected" ]]; then
-            col1=$(echo "$selected" | awk '{print $1}')
-            col2=$(echo "$selected" | awk '{print $2}' | tr -d '#')
-            # Extract real session name from hidden tab field
-            real_name=$(echo "$selected" | sed 's/.*\t//')
-            # Smart enter: issues dispatch via tmq, sessions attach directly
-            if is_known_repo "$col1"; then
-                tmq "$col1" "$col2"
-                exec tms
-            else
-                attach_session "$real_name"
-                [[ -z "${TMUX:-}" ]] && exec tms
-            fi
-        fi
+        # DEFAULT: issue browser. The user mainly uses tms to
+        # dispatch agents on GitHub issues; aoe handles live
+        # session monitoring. `tms sessions` opens the session
+        # browser when needed.
+        issue_browser
+        ;;
+    --all)
+        # Top-level: force all repos (skip CWD auto-detect)
+        export TMS_NO_AUTO=1
+        issue_browser --all
+        ;;
+    --raw|--raw=*)
+        # Top-level: \`tms --raw [repo|--all] [--force]\`
+        shift
+        raw_repo=""
+        raw_force=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --all) raw_repo="--all"; shift ;;
+                --force) raw_force="--force"; shift ;;
+                *) [[ -z "$raw_repo" ]] && raw_repo="$1"; shift ;;
+            esac
+        done
+        [[ "$raw_repo" == "--all" ]] && raw_repo=""
+        [[ -z "$raw_repo" ]] && { detected=$(detect_repo_from_cwd); [[ -n "$detected" ]] && raw_repo="$detected"; }
+        issue_list "$raw_repo" "$raw_force"
+        ;;
+    --force)
+        # Top-level: skip cache, default repo
+        shift
+        forced_repo=$(detect_repo_from_cwd)
+        issue_list "$forced_repo" --force
+        ;;
+    --view|--clear-cache|--new|--import)
+        # Forward to the issues subcommand
+        _route_issues_top "$@"
         ;;
     --preview)
         issue_preview "${2:-}"
         ;;
     *)
-        echo "Usage: tms [ls|kill <name>|rename <name>|stale|clean|compact|issues [repo|--all|--force]|issues --clear-cache|new|import]"
-        exit 1
+        # Unknown first arg: if it looks like a known repo shortname,
+        # forward to \`tms issues <repo>\`. Otherwise show usage.
+        if is_known_repo "$1"; then
+            issue_browser "$1"
+        else
+            echo "Usage: tms [ls|kill <name>|rename <name>|stale|clean|compact|issues [repo|--all|--force]|issues --clear-cache|new|import|<repo>]"
+            echo "       tms --all | --raw | --view <mode> | --force"
+            exit 1
+        fi
         ;;
 esac
