@@ -85,27 +85,35 @@ def emit_bash_format_fn():
 def build_status_map(out_path):
     """Build a title<TAB>status TSV map for all aoe sessions.
 
-    Writes nothing if `aoe` is missing, hung, or returns invalid data.
-    Returns silently. The atomic write ensures concurrent readers see
-    a complete file, never a torn line.
+    The cache is ALWAYS written, even when no rows resolve
+    (no sessions, all session-shows fail, aoe list errors / times out /
+    returns invalid JSON, etc.). The previous code returned without
+    writing in these cases, leaving the prior cache file stale. The
+    original bash heredoc always wrote (a 0-byte file on failure);
+    this matches that. The single-newline empty shape (`'\n'.join([])
+    + '\n'` == `'\n'`) is also the trailing-newline terminator the
+    normal path emits, so the consumer's `cut`/`grep` parsers see the
+    same line shape either way. See issue #21.
+
+    The atomic write ensures concurrent readers see a complete file,
+    never a torn line.
     """
+    sessions = []
     # aoe list --json
     try:
         r = subprocess.run(
             ['aoe', 'list', '--json'],
             capture_output=True, text=True, timeout=3,
         )
+        # P0#2 fix: narrow exception types below. Bare `except: pass`
+        # would also catch KeyboardInterrupt / SystemExit, breaking Ctrl+C.
+        if r.returncode == 0:
+            try:
+                sessions = json.loads(r.stdout)
+            except (json.JSONDecodeError, ValueError):
+                pass  # invalid JSON — fall through, write empty
     except (subprocess.TimeoutExpired, OSError):
-        return  # aoe missing or hung
-    if r.returncode != 0:
-        return
-
-    # P0#2 fix: narrow exception types. Bare `except: pass` swallowed
-    # KeyboardInterrupt and SystemExit, breaking Ctrl+C.
-    try:
-        sessions = json.loads(r.stdout)
-    except (json.JSONDecodeError, ValueError):
-        return
+        pass  # aoe missing or hung — fall through, write empty
 
     lines = []
     for s in sessions:
@@ -125,9 +133,10 @@ def build_status_map(out_path):
             # and SystemExit are NOT subclasses of these and propagate.
             pass
 
-    if not lines:
-        return
-
+    # Always write. For non-empty `lines`, this produces the normal
+    # `title\tstatus\n` rows; for empty `lines` it produces a single
+    # newline — matching the original heredoc's truncate-to-empty
+    # behavior and replacing any stale cache. Issue #21.
     atomic_write_text(out_path, '\n'.join(lines) + '\n')
 
 
