@@ -300,7 +300,10 @@ spawn_agent() {
     local cmd_override
     case "$agent" in
         cc) cmd_override="claude --dangerously-skip-permissions -p \$(cat '$prompt_file' | jq -Rs .); echo; echo '--- CLAUDE DONE ---'; exec bash" ;;
-        pi) cmd_override="pi @$prompt_file; echo; echo '--- PI DONE ---'; exec bash" ;;
+        # PI_DISPATCH_AUTOAPPROVE: the safety-guards extension auto-approves its
+        # CONFIRM tier (keeps HARD_BLOCK) so a dispatched agent doesn't stall on
+        # a permission prompt with no human attached (issue #30). Worktree-isolated.
+        pi) cmd_override="PI_DISPATCH_AUTOAPPROVE=1 pi @$prompt_file; echo; echo '--- PI DONE ---'; exec bash" ;;
         oc) cmd_override="cat '$prompt_file' | opencode 2>&1; echo; echo '--- OPENCODE DONE ---'; exec bash" ;;
     esac
 
