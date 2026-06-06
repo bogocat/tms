@@ -49,3 +49,11 @@ def test_build_prompt_receives_agent_arg():
         "build_prompt no longer declares the agent parameter"
     assert 'build_prompt "$repo" "$number" "$type" "$agent"' in src, \
         "build_prompt is not called with $agent"
+
+
+def test_pi_dispatch_sets_autoapprove_env():
+    """Dispatched pi agents must auto-approve the safety-guards CONFIRM tier
+    (#30) or they stall on permission prompts with no human attached."""
+    src = BIN_TMQ.read_text()
+    assert 'PI_DISPATCH_AUTOAPPROVE=1 pi @' in src, \
+        "pi cmd_override no longer sets PI_DISPATCH_AUTOAPPROVE — dispatched pi stalls on prompts"
