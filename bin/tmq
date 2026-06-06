@@ -306,16 +306,41 @@ spawn_agent() {
 
     # Use Agent of Empires if available (session appears in aoe dashboard + web)
     if command -v aoe &>/dev/null; then
-        local wt_flag=""
+        local wt_flag="" add_ok=0 start_ok=0
         [[ -n "$branch" ]] && wt_flag="-w $branch"
 
-        aoe add "$cwd" -t "$session_name" --tool "$aoe_tool" \
-            $wt_flag -l --trust-hooks \
-            --cmd-override "$cmd_override" 2>&1
-        echo "Spawned: $session_name ($agent in $cwd) [via aoe]"
-        echo "Prompt:   $prompt_file"
-        echo "Monitor:  aoe status"
-        echo "Attach:   aoe session attach $session_name"
+        # `aoe add` may fail (duplicate, network, etc). Capture exit.
+        if aoe add "$cwd" -t "$session_name" --tool "$aoe_tool" \
+                $wt_flag --trust-hooks \
+                --cmd-override "$cmd_override" 2>&1; then
+            add_ok=1
+        fi
+
+        # Chain `aoe session start` to actually launch the agent.
+        # (aoe add alone just registers the session — without start the
+        # session sits idle in the dashboard and the agent never runs.)
+        if (( add_ok )); then
+            aoe session start "$session_name" 2>&1 && start_ok=1 || true
+        fi
+
+        if (( add_ok && start_ok )); then
+            echo "Spawned: $session_name ($agent in $cwd) [via aoe]"
+            echo "Prompt:   $prompt_file"
+            echo "Monitor:  aoe status"
+            echo "Attach:   aoe session attach $session_name   # when ready"
+        else
+            # Honest failure. Clean up the half-registered session so it
+            # doesn't dangle in `aoe list` waiting for manual cleanup.
+            if (( add_ok && ! start_ok )); then
+                echo "ERROR: agent did not start (see aoe output above)" >&2
+                echo "  cleaning up the half-registered session..." >&2
+                aoe remove "$session_name" >&2 || true
+            else
+                echo "ERROR: aoe add failed (see output above)" >&2
+                echo "  (likely duplicate title, missing worktree, or invalid tool)" >&2
+            fi
+            return 1
+        fi
     else
         # Fallback: direct tmux spawn (no aoe dashboard visibility)
         case "$agent" in
