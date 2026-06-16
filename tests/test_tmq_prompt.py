@@ -34,12 +34,35 @@ def test_pi_branch_requests_state_markers():
     assert '<<AGENT-STATE' in block, "loop pointer dropped the AGENT-STATE marker contract"
 
 
-def test_cc_oc_branch_falls_back_to_agents_md():
-    block = _agent_case_block()
-    cc_arm = re.search(r'cc\|oc\)(.*?);;', block, re.S)
-    assert cc_arm, "no cc|oc) arm in the loop_instruction case block"
-    assert 'AGENTS.md' in cc_arm.group(1), \
-        "cc/oc dispatch prompt lost the AGENTS.md fallback (they have no pi skills)"
+def _arm(block, label):
+    """Return the body of a single `<label>)` arm in the case block."""
+    m = re.search(re.escape(label) + r'\)(.*?);;', block, re.S)
+    assert m, f"no {label}) arm in the loop_instruction case block"
+    return m.group(1)
+
+
+def test_cc_branch_prefers_dispatch_loop_skill():
+    """#38: cc agents prefer the Claude-native dispatch-loop skill when it is
+    installed, so the loop travels even into a repo with no AGENTS.md."""
+    cc_arm = _arm(_agent_case_block(), 'cc')
+    assert '.claude/skills/dispatch-loop/SKILL.md' in cc_arm, \
+        "cc arm no longer detects the installed Claude dispatch-loop skill"
+    assert 'dispatch-loop' in cc_arm, \
+        "cc arm no longer points at the dispatch-loop skill"
+
+
+def test_cc_branch_falls_back_to_agents_md():
+    """cc must still fall back to AGENTS.md when the skill is not installed."""
+    cc_arm = _arm(_agent_case_block(), 'cc')
+    assert 'agents_md_ptr' in cc_arm or 'AGENTS.md' in cc_arm, \
+        "cc arm lost the AGENTS.md fallback"
+
+
+def test_oc_branch_falls_back_to_agents_md():
+    """oc has no Claude skill (out of scope); keeps the AGENTS.md fallback."""
+    oc_arm = _arm(_agent_case_block(), 'oc')
+    assert 'agents_md_ptr' in oc_arm or 'AGENTS.md' in oc_arm, \
+        "oc arm lost the AGENTS.md fallback"
 
 
 def test_build_prompt_receives_agent_arg():

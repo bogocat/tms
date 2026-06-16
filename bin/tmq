@@ -235,19 +235,29 @@ PROMPT
                 ;;
         esac
 
-        # Loop discipline pointer (#20). pi loads the dispatch-loop skill;
-        # cc/oc have no pi skills, so point them at the repo's AGENTS.md if it
-        # exists. Keeps the in-session loop traveling with every dispatched
-        # agent instead of relying on a hand-injected prompt pointer.
+        # Loop discipline pointer (#20, #38). pi loads its dispatch-loop skill;
+        # cc now has a Claude-native dispatch-loop skill (#38) — prefer it when
+        # installed so the loop travels with every cc dispatch even in a repo
+        # with no AGENTS.md. Fall back to the repo's AGENTS.md, then to nothing.
+        # oc (opencode) has no skill, so it keeps the AGENTS.md fallback only.
+        local agents_md_ptr=""
+        if [[ -f "${TMQ_CWD}/AGENTS.md" ]]; then
+            agents_md_ptr="**Read and follow \`AGENTS.md\`** in the repo root — the in-session loop: \`<<AGENT-STATE: ...>>\` markers + plan-gate / TDD-first / AC-verify."
+        fi
         local loop_instruction=""
         case "$agent" in
             pi)
                 loop_instruction="**Follow the \`dispatch-loop\` skill.** Print \`<<AGENT-STATE: ...>>\` on its own line at every transition, and run the loop: plan-gate (STOP at PLAN-REVIEW for human approval before writing code) -> TDD-first -> AC-verify before opening the PR. For large/sensitive plans call \`proposal-review\` at the plan gate; \`code-review\` runs at PR-REVIEW."
                 ;;
-            cc|oc)
-                if [[ -f "${TMQ_CWD}/AGENTS.md" ]]; then
-                    loop_instruction="**Read and follow \`AGENTS.md\`** in the repo root — the in-session loop: \`<<AGENT-STATE: ...>>\` markers + plan-gate / TDD-first / AC-verify."
+            cc)
+                if [[ -f "${HOME}/.claude/skills/dispatch-loop/SKILL.md" ]]; then
+                    loop_instruction="**Follow the \`dispatch-loop\` skill.** Print \`<<AGENT-STATE: ...>>\` on its own line at every transition, and run the loop: plan-gate (STOP at PLAN-REVIEW for human approval before writing code) -> TDD-first -> AC-verify before opening the PR. \`/code-review\` runs at PR-REVIEW."
+                else
+                    loop_instruction="$agents_md_ptr"
                 fi
+                ;;
+            oc)
+                loop_instruction="$agents_md_ptr"
                 ;;
         esac
 
