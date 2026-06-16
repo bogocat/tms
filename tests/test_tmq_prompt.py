@@ -120,3 +120,31 @@ def test_root_cc_fails_fast_with_message():
         "root cc default path lost its clear fail-fast message"
     assert re.search(r'return 1', body), \
         "root cc default path no longer aborts (return 1) before spawning"
+
+
+# ── #42: cc prompt must not be word-split ────────────────────────
+# An unquoted $(cat ... | jq) passed to `-p` word-splits the prompt: only its
+# first token reaches claude and any `--word` in the issue body becomes a stray
+# flag. The prompt must travel via stdin (like the oc branch) instead.
+
+def test_cc_prompt_not_word_split_inline():
+    """No cc launch line may pass the prompt as an inline command
+    substitution to -p (the word-splitting bug, #42)."""
+    src = BIN_TMQ.read_text()
+    for line in src.splitlines():
+        if 'claude --dangerously-skip-permissions' not in line:
+            continue
+        assert not re.search(r'-p\s+\$\(', line), \
+            f"cc launch still word-splits the prompt into -p: {line.strip()}"
+
+
+def test_cc_prompt_piped_via_stdin():
+    """Every cc launch must feed the prompt file to claude on stdin."""
+    src = BIN_TMQ.read_text()
+    cc_lines = [l for l in src.splitlines()
+                if 'claude --dangerously-skip-permissions' in l]
+    assert cc_lines, "no cc claude launch lines found in bin/tmq"
+    for line in cc_lines:
+        assert re.search(r"cat '[^']*prompt_file[^']*'\s*\|", line) \
+            or re.search(r"cat \"[^\"]*prompt_file[^\"]*\"\s*\|", line), \
+            f"cc launch does not pipe the prompt file via stdin: {line.strip()}"
