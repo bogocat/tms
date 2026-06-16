@@ -43,6 +43,8 @@ add_repo tms          /root/tms                    bogocat/tms           1
 # ── defaults ─────────────────────────────────────────────────────
 
 DEFAULT_AGENT="pi"
+PI_PROVIDER=""          # forwarded to pi --provider (empty = pi default)
+PI_MODEL=""             # forwarded to pi --model   (empty = pi default)
 ISSUE_TYPE="feature"   # feature | fix | chore | review
 
 # ── help ─────────────────────────────────────────────────────────
@@ -53,8 +55,13 @@ tmq — spawn a coding agent on a GitHub issue
 
 Usage:
   tmq <repo> <issue> [--agent cc|pi|oc] [--type feature|fix|chore|review]
+                     [--provider <name>] [--model <id>]
   tmq list
   tmq review <repo> <pr-number> [--agent cc|pi|oc]
+
+Examples:
+  tmq distillery 245 --agent pi --model MiniMax-M3   # pi on a specific model
+  tmq home-portal 57 --agent cc                      # claude (auto)
 
 Repos:
   distillery    home-portal   tower-fleet   scripts
@@ -64,6 +71,12 @@ Agents:
   pi    Pi Coding Agent (default, auto mode)
   cc    Claude Code (auto mode)
   oc    Opencode
+
+Model flags (pi only — forwarded to pi's --provider/--model):
+  --provider <name>   Override pi's provider (e.g. minimax)
+  --model <id>        Override pi's model    (e.g. MiniMax-M3)
+  Using --provider/--model with --agent cc or oc is an error (cc model
+  selection is out of band; oc has no model flag). pi validates the id.
 
 Root note (cc): Claude Code refuses --dangerously-skip-permissions under
   root/sudo, so `--agent cc` fails fast on a root host. To spawn an
@@ -348,7 +361,13 @@ spawn_agent() {
         # PI_DISPATCH_AUTOAPPROVE: the safety-guards extension auto-approves its
         # CONFIRM tier (keeps HARD_BLOCK) so a dispatched agent doesn't stall on
         # a permission prompt with no human attached (issue #30). Worktree-isolated.
-        pi) cmd_override="PI_DISPATCH_AUTOAPPROVE=1 pi @$prompt_file; echo; echo '--- PI DONE ---'; exec bash" ;;
+        # --provider/--model forward to pi when set (#37); empty = pi default.
+        pi)
+            local pi_extra=""
+            [[ -n "$PI_PROVIDER" ]] && pi_extra+=" --provider $PI_PROVIDER"
+            [[ -n "$PI_MODEL" ]]    && pi_extra+=" --model $PI_MODEL"
+            cmd_override="PI_DISPATCH_AUTOAPPROVE=1 pi${pi_extra} @$prompt_file; echo; echo '--- PI DONE ---'; exec bash"
+            ;;
         oc) cmd_override="cat '$prompt_file' | opencode 2>&1; echo; echo '--- OPENCODE DONE ---'; exec bash" ;;
     esac
 
@@ -397,8 +416,11 @@ spawn_agent() {
                     "cat '$prompt_file' | ${cc_env_prefix}claude --dangerously-skip-permissions -p; echo; echo '--- CLAUDE DONE ---'; exec bash"
                 ;;
             pi)
+                local pi_extra=""
+                [[ -n "$PI_PROVIDER" ]] && pi_extra+=" --provider $PI_PROVIDER"
+                [[ -n "$PI_MODEL" ]]    && pi_extra+=" --model $PI_MODEL"
                 tmux new-session -d -s "$session_name" -c "$cwd" \
-                    "pi @$prompt_file; echo; echo '--- PI DONE ---'; exec bash"
+                    "pi${pi_extra} @$prompt_file; echo; echo '--- PI DONE ---'; exec bash"
                 ;;
             oc)
                 tmux new-session -d -s "$session_name" -c "$cwd" \
@@ -562,8 +584,10 @@ main() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --agent) agent="$2"; shift 2 ;;
-            --type)  type="$2"; shift 2 ;;
+            --agent)    agent="$2"; shift 2 ;;
+            --type)     type="$2"; shift 2 ;;
+            --provider) PI_PROVIDER="$2"; shift 2 ;;
+            --model)    PI_MODEL="$2"; shift 2 ;;
             -h|--help) usage ;;
             *)
                 if [[ -z "$repo" ]]; then
@@ -594,6 +618,23 @@ main() {
         cc|pi|oc) ;;
         *) echo "Unknown agent: $agent (use cc, pi, or oc)"; exit 1 ;;
     esac
+
+    # --provider/--model only mean something for pi (forwarded to pi's flags).
+    # cc model selection is out of band; oc has no such flag. Fail fast rather
+    # than silently ignoring the flag (#37).
+    if [[ -n "$PI_PROVIDER" || -n "$PI_MODEL" ]]; then
+        if [[ "$agent" != "pi" ]]; then
+            echo "Error: --provider/--model only apply to --agent pi (got: $agent)." >&2
+            echo "  cc model selection is out of band; oc has no model flag." >&2
+            exit 1
+        fi
+        # Guard against the empty-value footgun ('--model' with no argument
+        # would otherwise consume the repo/number as its value).
+        [[ -n "$PI_MODEL" && "$PI_MODEL" == -* ]] && {
+            echo "Error: --model expects a value (got: '$PI_MODEL')." >&2; exit 1; }
+        [[ -n "$PI_PROVIDER" && "$PI_PROVIDER" == -* ]] && {
+            echo "Error: --provider expects a value (got: '$PI_PROVIDER')." >&2; exit 1; }
+    fi
 
     # Validate type
     case "$type" in
