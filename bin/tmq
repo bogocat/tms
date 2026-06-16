@@ -65,6 +65,12 @@ Agents:
   cc    Claude Code (auto mode)
   oc    Opencode
 
+Root note (cc): Claude Code refuses --dangerously-skip-permissions under
+  root/sudo, so `--agent cc` fails fast on a root host. To spawn an
+  autonomous root cc agent anyway (no permission guardrails — deliberate
+  security tradeoff, tms#39), opt in explicitly:
+    TMQ_ALLOW_ROOT_CC=1 tmq <repo> <issue> --agent cc
+
 Types:
   feature   new feature branch + worktree (default)
   fix       bugfix, typically on main
@@ -296,10 +302,35 @@ spawn_agent() {
         oc) aoe_tool="opencode" ;;
     esac
 
+    # #39: Claude Code refuses --dangerously-skip-permissions under root/sudo,
+    # so a cc dispatch on a root host dies instantly (pane exit 1) and then
+    # vanishes on the next aoe daemon restart — silent and traceless. Fail fast
+    # by default; allow an explicit, opt-in IS_SANDBOX=1 escape hatch for a
+    # deliberately autonomous root agent.
+    local cc_env_prefix=""
+    if [[ "$agent" == "cc" && "$EUID" -eq 0 ]]; then
+        if [[ "${TMQ_ALLOW_ROOT_CC:-0}" == "1" ]]; then
+            cc_env_prefix="IS_SANDBOX=1 "
+            echo "WARNING: spawning an AUTONOMOUS ROOT cc agent (TMQ_ALLOW_ROOT_CC=1)." >&2
+            echo "         IS_SANDBOX=1 lets --dangerously-skip-permissions run under root —" >&2
+            echo "         no permission guardrails. Deliberate security tradeoff (tms#39)." >&2
+        else
+            echo "ERROR: cc dispatch refused under root." >&2
+            echo "  Claude Code blocks --dangerously-skip-permissions for root/sudo, so the" >&2
+            echo "  session would die instantly and vanish without a trace (tms#39)." >&2
+            echo "  Options:" >&2
+            echo "    * dispatch with --agent pi   (no such restriction), or" >&2
+            echo "    * run the issue in a supervised (non-dispatched) Claude session, or" >&2
+            echo "    * opt in explicitly:  TMQ_ALLOW_ROOT_CC=1 tmq ... --agent cc" >&2
+            echo "      (spawns an autonomous root agent with permissions disabled)." >&2
+            return 1
+        fi
+    fi
+
     # Build full command line (prompt injection)
     local cmd_override
     case "$agent" in
-        cc) cmd_override="claude --dangerously-skip-permissions -p \$(cat '$prompt_file' | jq -Rs .); echo; echo '--- CLAUDE DONE ---'; exec bash" ;;
+        cc) cmd_override="${cc_env_prefix}claude --dangerously-skip-permissions -p \$(cat '$prompt_file' | jq -Rs .); echo; echo '--- CLAUDE DONE ---'; exec bash" ;;
         # PI_DISPATCH_AUTOAPPROVE: the safety-guards extension auto-approves its
         # CONFIRM tier (keeps HARD_BLOCK) so a dispatched agent doesn't stall on
         # a permission prompt with no human attached (issue #30). Worktree-isolated.
@@ -349,7 +380,7 @@ spawn_agent() {
         case "$agent" in
             cc)
                 tmux new-session -d -s "$session_name" -c "$cwd" \
-                    "claude --dangerously-skip-permissions -p \$(cat '$prompt_file' | jq -Rs .); echo; echo '--- CLAUDE DONE ---'; exec bash"
+                    "${cc_env_prefix}claude --dangerously-skip-permissions -p \$(cat '$prompt_file' | jq -Rs .); echo; echo '--- CLAUDE DONE ---'; exec bash"
                 ;;
             pi)
                 tmux new-session -d -s "$session_name" -c "$cwd" \
