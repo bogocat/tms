@@ -57,3 +57,43 @@ def test_pi_dispatch_sets_autoapprove_env():
     src = BIN_TMQ.read_text()
     assert 'PI_DISPATCH_AUTOAPPROVE=1 pi @' in src, \
         "pi cmd_override no longer sets PI_DISPATCH_AUTOAPPROVE — dispatched pi stalls on prompts"
+
+
+# ── #39: cc dispatch under root ──────────────────────────────────
+# Claude Code refuses --dangerously-skip-permissions for root/sudo, so a cc
+# dispatch on a root host dies instantly and vanishes on the next aoe daemon
+# restart. spawn_agent must gate the root cc path: fail fast by default, with
+# an explicit opt-in IS_SANDBOX=1 escape hatch.
+
+def _spawn_agent_src():
+    src = BIN_TMQ.read_text()
+    m = re.search(r'\nspawn_agent\(\)\s*\{(.*?)\n\}', src, re.S)
+    assert m, "spawn_agent function not found in bin/tmq"
+    return m.group(1)
+
+
+def test_root_cc_gate_exists():
+    """spawn_agent must detect root (EUID 0) for the cc agent."""
+    body = _spawn_agent_src()
+    assert re.search(r'EUID', body) and re.search(r'cc', body), \
+        "spawn_agent no longer gates the cc path on root (EUID)"
+
+
+def test_root_cc_escape_hatch_is_opt_in():
+    """The IS_SANDBOX=1 escape hatch must be guarded by the explicit
+    TMQ_ALLOW_ROOT_CC opt-in, never enabled by default."""
+    body = _spawn_agent_src()
+    assert 'TMQ_ALLOW_ROOT_CC' in body, \
+        "root cc escape hatch lost its TMQ_ALLOW_ROOT_CC opt-in guard"
+    assert 'IS_SANDBOX=1' in body, \
+        "root cc path no longer offers the IS_SANDBOX=1 escape hatch"
+
+
+def test_root_cc_fails_fast_with_message():
+    """Default (no opt-in) root cc must abort with a non-zero return and a
+    clear message rather than spawning a vanishing dead pane."""
+    body = _spawn_agent_src()
+    assert re.search(r'refused under root', body), \
+        "root cc default path lost its clear fail-fast message"
+    assert re.search(r'return 1', body), \
+        "root cc default path no longer aborts (return 1) before spawning"
