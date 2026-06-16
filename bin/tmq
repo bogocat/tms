@@ -340,7 +340,11 @@ spawn_agent() {
     # Build full command line (prompt injection)
     local cmd_override
     case "$agent" in
-        cc) cmd_override="${cc_env_prefix}claude --dangerously-skip-permissions -p \$(cat '$prompt_file' | jq -Rs .); echo; echo '--- CLAUDE DONE ---'; exec bash" ;;
+        # Prompt via stdin (like the oc branch), NOT an inline arg: an unquoted
+        # $(cat ... | jq) word-splits the prompt so only its first token reaches
+        # -p, and any `--word` in the issue body becomes a stray claude flag
+        # (#42). claude -p reads the prompt from stdin.
+        cc) cmd_override="cat '$prompt_file' | ${cc_env_prefix}claude --dangerously-skip-permissions -p; echo; echo '--- CLAUDE DONE ---'; exec bash" ;;
         # PI_DISPATCH_AUTOAPPROVE: the safety-guards extension auto-approves its
         # CONFIRM tier (keeps HARD_BLOCK) so a dispatched agent doesn't stall on
         # a permission prompt with no human attached (issue #30). Worktree-isolated.
@@ -390,7 +394,7 @@ spawn_agent() {
         case "$agent" in
             cc)
                 tmux new-session -d -s "$session_name" -c "$cwd" \
-                    "${cc_env_prefix}claude --dangerously-skip-permissions -p \$(cat '$prompt_file' | jq -Rs .); echo; echo '--- CLAUDE DONE ---'; exec bash"
+                    "cat '$prompt_file' | ${cc_env_prefix}claude --dangerously-skip-permissions -p; echo; echo '--- CLAUDE DONE ---'; exec bash"
                 ;;
             pi)
                 tmux new-session -d -s "$session_name" -c "$cwd" \
