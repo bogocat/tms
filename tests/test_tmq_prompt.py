@@ -78,7 +78,9 @@ def test_pi_dispatch_sets_autoapprove_env():
     """Dispatched pi agents must auto-approve the safety-guards CONFIRM tier
     (#30) or they stall on permission prompts with no human attached."""
     src = BIN_TMQ.read_text()
-    assert 'PI_DISPATCH_AUTOAPPROVE=1 pi @' in src, \
+    # pi launch is `PI_DISPATCH_AUTOAPPROVE=1 pi${pi_extra} @<file>` — pi_extra
+    # (the #37 --provider/--model forwarding) sits between `pi` and `@`.
+    assert re.search(r'PI_DISPATCH_AUTOAPPROVE=1 pi(\$\{pi_extra\})? @', src), \
         "pi cmd_override no longer sets PI_DISPATCH_AUTOAPPROVE — dispatched pi stalls on prompts"
 
 
@@ -148,3 +150,46 @@ def test_cc_prompt_piped_via_stdin():
         assert re.search(r"cat '[^']*prompt_file[^']*'\s*\|", line) \
             or re.search(r"cat \"[^\"]*prompt_file[^\"]*\"\s*\|", line), \
             f"cc launch does not pipe the prompt file via stdin: {line.strip()}"
+
+
+# ── #37: --provider/--model pass-through to pi ───────────────────
+
+def test_provider_model_args_parsed():
+    """main() must parse --provider/--model into the PI_* globals."""
+    src = BIN_TMQ.read_text()
+    assert re.search(r'--provider\)\s*PI_PROVIDER="\$2"', src), \
+        "--provider is not parsed into PI_PROVIDER"
+    assert re.search(r'--model\)\s*PI_MODEL="\$2"', src), \
+        "--model is not parsed into PI_MODEL"
+
+
+def test_pi_launch_forwards_provider_model():
+    """Every pi launch must forward PI_PROVIDER/PI_MODEL via pi_extra."""
+    src = BIN_TMQ.read_text()
+    pi_lines = [l for l in src.splitlines()
+                if re.search(r'(PI_DISPATCH_AUTOAPPROVE=1 pi|"pi)\$\{pi_extra\}', l)]
+    assert pi_lines, "no pi launch line forwards ${pi_extra}"
+    # pi_extra must be built from both flags
+    assert 'pi_extra+=" --provider $PI_PROVIDER"' in src, \
+        "pi_extra does not forward --provider"
+    assert 'pi_extra+=" --model $PI_MODEL"' in src, \
+        "pi_extra does not forward --model"
+
+
+def test_model_help_documented():
+    """--provider/--model must appear in usage()."""
+    src = BIN_TMQ.read_text()
+    assert '--model <id>' in src and '--provider <name>' in src, \
+        "usage() no longer documents --provider/--model"
+
+
+def test_model_with_non_pi_agent_errors_fast():
+    """tmq <repo> <n> --agent cc --model X must exit non-zero with a clear
+    message rather than silently ignoring the flag (#37)."""
+    import subprocess
+    r = subprocess.run(
+        ['bash', str(BIN_TMQ), 'tms', '37', '--agent', 'cc', '--model', 'MiniMax-M3'],
+        capture_output=True, text=True)
+    assert r.returncode != 0, "cc + --model should fail fast, not proceed"
+    assert 'only apply to --agent pi' in r.stderr, \
+        f"cc + --model error message unclear: {r.stderr!r}"
