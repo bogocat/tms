@@ -492,27 +492,35 @@ create_worktree() {
     if [[ "$type" == "review" ]]; then
         local feat_path feat_branch
         if feat_path=$(find_feat_session "$repo" "$issue_num") && [[ -n "$feat_path" ]]; then
-            feat_branch=$(git -C "$feat_path" branch --show-current 2>/dev/null)
+            # Item 2 (#10): non-worktree repos can't reuse — the main
+            # checkout isn't a worktree; "shared with the feature agent"
+            # wording is misleading (the feat branch is a different ref
+            # the reviewer isn't checked out to).
+            if (( REPO_WORKTREE[$repo] != 1 )); then
+                echo "  skipping reuse: $repo is a non-worktree repo" >&2
+            else
+                feat_branch=$(git -C "$feat_path" branch --show-current 2>/dev/null)
 
-            # Liveness: aoe sessions appear as tmux sessions named
-            # `aoe_<title>_<id_prefix>`, but `#` in the title is
-            # replaced with `_` for the tmux session name. A
-            # closed/killed feat session leaves the worktree behind
-            # but no live tmux session, in which case the prompt
-            # shouldn't claim the feat agent will see fixups.
-            local feat_session_pattern="aoe_feat-${repo}_${issue_num}_*"
-            if tmux has-session -t "$feat_session_pattern" 2>/dev/null; then
-                TMQ_FEAT_LIVE=1
+                # Liveness: aoe sessions appear as tmux sessions named
+                # `aoe_<title>_<id_prefix>`, but `#` in the title is
+                # replaced with `_` for the tmux session name. A
+                # closed/killed feat session leaves the worktree behind
+                # but no live tmux session, in which case the prompt
+                # shouldn't claim the feat agent will see fixups.
+                local feat_session_pattern="aoe_feat-${repo}_${issue_num}_*"
+                if tmux has-session -t "$feat_session_pattern" 2>/dev/null; then
+                    TMQ_FEAT_LIVE=1
+                fi
+
+                echo "Reusing feat session worktree: $feat_path" >&2
+                echo "  branch: ${feat_branch:-<detached>}" >&2
+                echo "  feat agent live: $([[ $TMQ_FEAT_LIVE -eq 1 ]] && echo yes || echo no)" >&2
+                TMQ_CWD="$feat_path"
+                TMQ_BRANCH="$feat_branch"
+                TMQ_REUSED=1
+                echo "$feat_path"
+                return
             fi
-
-            echo "Reusing feat session worktree: $feat_path" >&2
-            echo "  branch: ${feat_branch:-<detached>}" >&2
-            echo "  feat agent live: $([[ $TMQ_FEAT_LIVE -eq 1 ]] && echo yes || echo no)" >&2
-            TMQ_CWD="$feat_path"
-            TMQ_BRANCH="$feat_branch"
-            TMQ_REUSED=1
-            echo "$feat_path"
-            return
         fi
         # No feat session found — fall through to standard handling
     fi

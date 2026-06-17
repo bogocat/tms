@@ -193,3 +193,165 @@ def test_model_with_non_pi_agent_errors_fast():
     assert r.returncode != 0, "cc + --model should fail fast, not proceed"
     assert 'only apply to --agent pi' in r.stderr, \
         f"cc + --model error message unclear: {r.stderr!r}"
+
+
+# ── #10: tmq review reuse follow-up improvements ─────────────────
+
+
+def _create_worktree_review_body():
+    """Extract the review-reuse block from create_worktree — the code
+    between feat_path=$(find_feat_session ...) and TMQ_REUSED=1."""
+    src = BIN_TMQ.read_text()
+    m = re.search(
+        r'feat_path=\$\(find_feat_session.*?\n(.*?)TMQ_REUSED=1',
+        src, re.S,
+    )
+    assert m, "review reuse block (find_feat_session → TMQ_REUSED) not found"
+    return m.group(1)
+
+
+def test_create_worktree_gates_reuse_on_worktree_repo():
+    """Item 2: Non-worktree repos must skip the reuse path. The
+    create_worktree review-reuse block must check REPO_WORKTREE before
+    accepting the worktree."""
+    body = _create_worktree_review_body()
+    assert 'REPO_WORKTREE' in body, (
+        "create_worktree review reuse path no longer checks REPO_WORKTREE"
+    )
+
+
+def test_create_worktree_logs_non_worktree_skip():
+    """Item 2: When the non-worktree gate fires, the operator should see
+    why reuse was skipped. Check for a log message near the gate."""
+    body = _create_worktree_review_body()
+    assert 'non-worktree' in body or 'skipping reuse' in body, (
+        "create_worktree no longer logs when skipping reuse for non-worktree repos"
+    )
+
+
+def test_find_feat_session_loops_over_prefixes():
+    """Item 1: find_feat_session must try feat-, fix-, chore- prefixes
+    in a loop, not just the hardcoded feat-."""
+    src = BIN_TMQ.read_text()
+    # The find_feat_session function body must contain a loop over prefixes
+    m = re.search(r'find_feat_session\(\).*?^\}', src, re.S | re.M)
+    assert m, "find_feat_session function not found"
+    body = m.group(0)
+    assert re.search(r'for\s+\w+\s+in\s+.*feat.*fix.*chore', body), (
+        "find_feat_session no longer loops over feat/fix/chore prefixes"
+    )
+
+
+def test_find_feat_session_returns_prefix():
+    """Item 1: find_feat_session must communicate which prefix matched
+    so the liveness check in create_worktree can use a precise aoe id
+    match instead of a broad glob (P0 fix from proposal review)."""
+    src = BIN_TMQ.read_text()
+    m = re.search(r'find_feat_session\(\).*?^\}', src, re.S | re.M)
+    assert m, "find_feat_session function not found"
+    body = m.group(0)
+    # Must output more than just the path — either two lines or a global
+    has_prefix_out = 'TMQ_FEAT_PREFIX' in body or 'TMQ_SESSION_PREFIX' in body
+    has_id_out = 'TMQ_AOE_ID' in body or 'aoe_id' in body.lower()
+    assert has_prefix_out or has_id_out, (
+        "find_feat_session no longer communicates the matched prefix/id "
+        "— liveness check can't use a precise match (P0)"
+    )
+
+
+def test_create_worktree_liveness_uses_precise_match():
+    """Item 1: The liveness check must use a precise aoe session id
+    match, not a broad glob (P0 fix from proposal review: aoe_*-...
+    matches review- sessions and cross-type ghosts)."""
+    body = _create_worktree_review_body()
+    # The liveness check must reference a captured prefix or id, not a
+    # hardcoded glob with a wildcard for the prefix portion
+    assert 'TMQ_FEAT_PREFIX' in body or 'TMQ_SESSION_PREFIX' in body \
+        or re.search(r'\$\{prefix\}', body) or 'aoe_id' in body.lower(), (
+        "create_worktree liveness check no longer uses a precise session match"
+    )
+
+
+def test_create_worktree_validates_upstream_branch():
+    """Item 3: Before accepting a worktree for reuse, validate that the
+    upstream branch still exists on the remote (git rev-parse --verify
+    origin/$branch)."""
+    body = _create_worktree_review_body()
+    assert 'rev-parse' in body or 'origin/' in body, (
+        "create_worktree review reuse path no longer validates upstream branch"
+    )
+
+
+def test_upstream_validation_skips_detached_head():
+    """Item 3: Upstream validation must be guarded by [[ -n $feat_branch ]]
+    — detached HEAD has no branch, and origin/ would fail spuriously."""
+    body = _create_worktree_review_body()
+    # The branch variable must be checked for non-empty before rev-parse
+    has_branch_guard = re.search(
+        r'\[\[\s+-n\s+\$\{?feat_branch', body
+    ) or re.search(r'\[\[\s+-n\s+"\$\{?feat_branch', body) \
+        or 'feat_branch' in body and 'rev-parse' in body
+    assert has_branch_guard, (
+        "upstream validation no longer guards against detached HEAD "
+        "(empty branch variable)"
+    )
+
+
+def test_fetch_pr_non_fatal():
+    """Item 4: fetch_pr must not call exit 1 — it must be non-fatal so
+    the caller can fall back to issue→PR lookup (P0 fix from proposal
+    review)."""
+    src = BIN_TMQ.read_text()
+    m = re.search(r'fetch_pr\(\).*?^\}', src, re.S | re.M)
+    assert m, "fetch_pr function not found"
+    body = m.group(0)
+    # Must NOT contain exit 1
+    assert 'exit 1' not in body, (
+        "fetch_pr still calls exit 1 — must be non-fatal for issue→PR fallback"
+    )
+
+
+def test_resolve_pr_number_exists():
+    """Item 4: A resolve_pr_number (or equivalent) function must exist
+    that tries gh pr view first, then falls back to gh issue view +
+    gh pr list --search."""
+    src = BIN_TMQ.read_text()
+    assert 'resolve_pr_number' in src \
+        or re.search(r'gh\s+pr\s+list.*--search.*issue:', src), (
+        "no resolve_pr_number function or issue→PR search fallback found"
+    )
+
+
+def test_review_type_uses_issue_pr_fallback():
+    """Item 4: The review code path (build_prompt review branch) must
+    use the issue→PR fallback, not call fetch_pr directly."""
+    src = BIN_TMQ.read_text()
+    # In the build_prompt review branch, the PR info must come from
+    # resolve_pr_number (or an equivalent non-fatal path), not from a
+    # direct fetch_pr call that would exit 1 on an issue number.
+    m = re.search(
+        r'build_prompt\(\).*?^\}', src, re.S | re.M,
+    )
+    assert m, "build_prompt function not found"
+    body = m.group(0)
+    # The review branch must use resolve_pr_number or have pr list fallback
+    has_resolver = 'resolve_pr_number' in body
+    has_pr_list_fallback = re.search(r'gh\s+pr\s+list.*--search', body)
+    has_non_fatal_pr = 'pr_json' in body and 'resolve_pr_number' in body
+    assert has_resolver or has_pr_list_fallback or has_non_fatal_pr, (
+        "build_prompt review branch no longer uses issue→PR fallback"
+    )
+
+
+def test_main_review_uses_issue_pr_fallback():
+    """Item 4: The main() review display path must also use the
+    issue→PR fallback, not call fetch_pr directly."""
+    src = BIN_TMQ.read_text()
+    m = re.search(r'main\(\).*?^\}', src, re.S | re.M)
+    assert m, "main function not found"
+    body = m.group(0)
+    has_resolver = 'resolve_pr_number' in body
+    has_pr_list_fallback = re.search(r'gh\s+pr\s+list.*--search', body)
+    assert has_resolver or has_pr_list_fallback, (
+        "main() review path no longer uses issue→PR fallback"
+    )
