@@ -336,13 +336,12 @@ def test_review_type_uses_issue_pr_fallback():
     )
     assert m, "build_prompt function not found"
     body = m.group(0)
-    # The review branch must use resolve_pr_number or have pr list fallback
+    # The review branch must use TMQ_REVIEW_PR_NUM (set by main())
+    # or call resolve_pr_number directly
+    has_pr_num_global = 'TMQ_REVIEW_PR_NUM' in body
     has_resolver = 'resolve_pr_number' in body
-    has_pr_list_fallback = re.search(r'gh\s+pr\s+list.*--search', body)
-    has_non_fatal_pr = 'pr_json' in body and 'resolve_pr_number' in body
-    assert has_resolver or has_pr_list_fallback or has_non_fatal_pr, (
-        "build_prompt review branch no longer uses issue→PR fallback"
-    )
+    assert has_pr_num_global or has_resolver, (
+        "build_prompt review branch no longer uses TMQ_REVIEW_PR_NUM or resolve_pr_number")
 
 
 def test_main_review_uses_issue_pr_fallback():

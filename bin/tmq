@@ -170,7 +170,7 @@ resolve_pr_number() {
     # Try as issue number: look up open linked PRs
     local pr_num
     pr_num=$(gh pr list --repo "$gh_repo" --state open --search "issue:$number" \
-        --json number --jq '.[0].number' 2>/dev/null)
+        --json number --jq '.[0].number' 2>/dev/null) || pr_num=""
     if [[ -n "$pr_num" ]]; then
         echo "$pr_num"
         return 0
@@ -178,7 +178,7 @@ resolve_pr_number() {
 
     # Try merged PRs if no open ones
     pr_num=$(gh pr list --repo "$gh_repo" --state merged --search "issue:$number" \
-        --json number --jq '.[0].number' 2>/dev/null)
+        --json number --jq '.[0].number' 2>/dev/null) || pr_num=""
     if [[ -n "$pr_num" ]]; then
         echo "$pr_num"
         return 0
@@ -193,16 +193,12 @@ build_prompt() {
     local repo=$1 number=$2 type=$3 agent=${4:-pi}
 
     if [[ "$type" == "review" ]]; then
-        # Item 4 (#10): resolve issue numbers to PR numbers. The user
-        # may pass an issue number (e.g. `tmq review tms 10`); look up
-        # the linked PR rather than dying on "Could not fetch PR".
-        local review_pr_num
-        review_pr_num=$(resolve_pr_number "$repo" "$number") || {
-            echo "ERROR: Could not find PR for ${REPO_GH[$repo]}#$number (not a PR number and no linked PRs found)" >&2
-            exit 1
-        }
+        # Item 4 (#10): use the resolved PR number from main()
+        # (stored in TMQ_REVIEW_PR_NUM) rather than calling
+        # resolve_pr_number again — avoids a duplicate gh API call
+        # (#10 review, P1).
         local pr_json
-        pr_json=$(fetch_pr "$repo" "$review_pr_num")
+        pr_json=$(fetch_pr "$repo" "$TMQ_REVIEW_PR_NUM")
         local title url state adds dels
         title=$(echo "$pr_json" | jq -r '.title')
         url=$(echo "$pr_json" | jq -r '.url')
@@ -491,6 +487,10 @@ TMQ_REUSED=0
 # Set to 1 by create_worktree when the reused feat session's tmux is alive.
 # Drives whether the prompt can claim the feat agent will see fixups.
 TMQ_FEAT_LIVE=0
+# Set by main() for review type: the resolved PR number (issue→PR fallback).
+# build_prompt() reads this instead of calling resolve_pr_number again,
+# avoiding duplicate gh API calls (#10 review, P1).
+TMQ_REVIEW_PR_NUM=""
 
 # Find an existing feat-<repo>#<num> aoe session and return its
 # worktree path (the caller reads the branch separately via git).
@@ -558,7 +558,7 @@ create_worktree() {
     # pushing, and fixups land on the same branch.
     if [[ "$type" == "review" ]]; then
         local feat_path feat_branch
-        find_feat_session "$repo" "$issue_num"
+        find_feat_session "$repo" "$issue_num" || true
         feat_path="$TMQ_FEAT_PATH"
         if [[ -n "$feat_path" ]]; then
             # Item 2 (#10): non-worktree repos can't reuse — the main
@@ -593,9 +593,9 @@ create_worktree() {
                     fi
                 fi
 
-                echo "Reusing feat session worktree: $feat_path" >&2
+                echo "Reusing ${TMQ_FEAT_PREFIX} session worktree: $feat_path" >&2
                 echo "  branch: ${feat_branch:-<detached>}" >&2
-                echo "  feat agent live: $([[ $TMQ_FEAT_LIVE -eq 1 ]] && echo yes || echo no)" >&2
+                echo "  ${TMQ_FEAT_PREFIX} agent live: $([[ $TMQ_FEAT_LIVE -eq 1 ]] && echo yes || echo no)" >&2
                 TMQ_CWD="$feat_path"
                 TMQ_BRANCH="$feat_branch"
                 TMQ_REUSED=1
@@ -736,14 +736,15 @@ main() {
 
     # Fetch issue/PR info for display
     if [[ "$type" == "review" ]]; then
-        # Item 4 (#10): resolve issue numbers to PR numbers
-        local review_pr_num
-        review_pr_num=$(resolve_pr_number "$repo" "$number") || {
-            echo "ERROR: Could not find PR for ${REPO_GH[$repo]}#$number" >&2
+        # Item 4 (#10): resolve issue numbers to PR numbers.
+        # Store in TMQ_REVIEW_PR_NUM so build_prompt() can reuse it
+        # without a duplicate gh API call (#10 review, P1).
+        TMQ_REVIEW_PR_NUM=$(resolve_pr_number "$repo" "$number") || {
+            echo "ERROR: Could not find PR for ${REPO_GH[$repo]}#$number (not a PR number and no linked PRs found)" >&2
             exit 1
         }
         local pr_json title
-        pr_json=$(fetch_pr "$repo" "$review_pr_num")
+        pr_json=$(fetch_pr "$repo" "$TMQ_REVIEW_PR_NUM")
         title=$(echo "$pr_json" | jq -r '.title')
         echo "PR: $title"
         echo "URL: $(echo "$pr_json" | jq -r '.url')"
