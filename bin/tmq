@@ -145,8 +145,46 @@ fetch_pr() {
     local repo=$1 number=$2
     local gh_repo="${REPO_GH[$repo]}"
 
-    gh pr view "$number" --repo "$gh_repo" --json title,body,state,url,additions,deletions,files 2>/dev/null \
-        || { echo "ERROR: Could not fetch PR $gh_repo#$number"; exit 1; }
+    # Non-fatal: returns empty on failure so the caller can fall back
+    # to issue→PR lookup (#10, item 4).
+    gh pr view "$number" --repo "$gh_repo" --json title,body,state,url,additions,deletions,files 2>/dev/null
+}
+
+# Resolve a number that may be a PR or an issue to a PR number.
+# Item 4 (#10): `tmq review` should accept issue numbers, not just PR
+# numbers. Tries gh pr view first; on miss, looks up linked PRs via
+# `gh pr list --search "issue:<num>"` (open first, then merged).
+# Echoes the resolved PR number on success, returns non-zero on failure.
+resolve_pr_number() {
+    local repo=$1 number=$2
+    local gh_repo="${REPO_GH[$repo]}"
+
+    # Try as PR number first (use --json number,title — single-field
+    # --json number succeeds even for issues in gh 2.46.0; multi-field
+    # triggers GraphQL validation and correctly fails for non-PRs)
+    if gh pr view "$number" --repo "$gh_repo" --json number,title &>/dev/null; then
+        echo "$number"
+        return 0
+    fi
+
+    # Try as issue number: look up open linked PRs
+    local pr_num
+    pr_num=$(gh pr list --repo "$gh_repo" --state open --search "issue:$number" \
+        --json number --jq '.[0].number' 2>/dev/null)
+    if [[ -n "$pr_num" ]]; then
+        echo "$pr_num"
+        return 0
+    fi
+
+    # Try merged PRs if no open ones
+    pr_num=$(gh pr list --repo "$gh_repo" --state merged --search "issue:$number" \
+        --json number --jq '.[0].number' 2>/dev/null)
+    if [[ -n "$pr_num" ]]; then
+        echo "$pr_num"
+        return 0
+    fi
+
+    return 1
 }
 
 # ── prompt construction ──────────────────────────────────────────
@@ -155,8 +193,16 @@ build_prompt() {
     local repo=$1 number=$2 type=$3 agent=${4:-pi}
 
     if [[ "$type" == "review" ]]; then
+        # Item 4 (#10): resolve issue numbers to PR numbers. The user
+        # may pass an issue number (e.g. `tmq review tms 10`); look up
+        # the linked PR rather than dying on "Could not fetch PR".
+        local review_pr_num
+        review_pr_num=$(resolve_pr_number "$repo" "$number") || {
+            echo "ERROR: Could not find PR for ${REPO_GH[$repo]}#$number (not a PR number and no linked PRs found)" >&2
+            exit 1
+        }
         local pr_json
-        pr_json=$(fetch_pr "$repo" "$number")
+        pr_json=$(fetch_pr "$repo" "$review_pr_num")
         local title url state adds dels
         title=$(echo "$pr_json" | jq -r '.title')
         url=$(echo "$pr_json" | jq -r '.url')
@@ -690,8 +736,14 @@ main() {
 
     # Fetch issue/PR info for display
     if [[ "$type" == "review" ]]; then
+        # Item 4 (#10): resolve issue numbers to PR numbers
+        local review_pr_num
+        review_pr_num=$(resolve_pr_number "$repo" "$number") || {
+            echo "ERROR: Could not find PR for ${REPO_GH[$repo]}#$number" >&2
+            exit 1
+        }
         local pr_json title
-        pr_json=$(fetch_pr "$repo" "$number")
+        pr_json=$(fetch_pr "$repo" "$review_pr_num")
         title=$(echo "$pr_json" | jq -r '.title')
         echo "PR: $title"
         echo "URL: $(echo "$pr_json" | jq -r '.url')"

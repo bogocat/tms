@@ -349,7 +349,7 @@ def test_main_review_uses_issue_pr_fallback():
     """Item 4: The main() review display path must also use the
     issue→PR fallback, not call fetch_pr directly."""
     src = BIN_TMQ.read_text()
-    m = re.search(r'main\(\).*?^\}', src, re.S | re.M)
+    m = re.search(r'^main\(\)\s*\{.*?^\}', src, re.S | re.M)
     assert m, "main function not found"
     body = m.group(0)
     has_resolver = 'resolve_pr_number' in body
