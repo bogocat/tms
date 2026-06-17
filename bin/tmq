@@ -145,8 +145,46 @@ fetch_pr() {
     local repo=$1 number=$2
     local gh_repo="${REPO_GH[$repo]}"
 
-    gh pr view "$number" --repo "$gh_repo" --json title,body,state,url,additions,deletions,files 2>/dev/null \
-        || { echo "ERROR: Could not fetch PR $gh_repo#$number"; exit 1; }
+    # Non-fatal: returns empty on failure so the caller can fall back
+    # to issue→PR lookup (#10, item 4).
+    gh pr view "$number" --repo "$gh_repo" --json title,body,state,url,additions,deletions,files 2>/dev/null
+}
+
+# Resolve a number that may be a PR or an issue to a PR number.
+# Item 4 (#10): `tmq review` should accept issue numbers, not just PR
+# numbers. Tries gh pr view first; on miss, looks up linked PRs via
+# `gh pr list --search "issue:<num>"` (open first, then merged).
+# Echoes the resolved PR number on success, returns non-zero on failure.
+resolve_pr_number() {
+    local repo=$1 number=$2
+    local gh_repo="${REPO_GH[$repo]}"
+
+    # Try as PR number first (use --json number,title — single-field
+    # --json number succeeds even for issues in gh 2.46.0; multi-field
+    # triggers GraphQL validation and correctly fails for non-PRs)
+    if gh pr view "$number" --repo "$gh_repo" --json number,title &>/dev/null; then
+        echo "$number"
+        return 0
+    fi
+
+    # Try as issue number: look up open linked PRs
+    local pr_num
+    pr_num=$(gh pr list --repo "$gh_repo" --state open --search "issue:$number" \
+        --json number --jq '.[0].number' 2>/dev/null) || pr_num=""
+    if [[ -n "$pr_num" ]]; then
+        echo "$pr_num"
+        return 0
+    fi
+
+    # Try merged PRs if no open ones
+    pr_num=$(gh pr list --repo "$gh_repo" --state merged --search "issue:$number" \
+        --json number --jq '.[0].number' 2>/dev/null) || pr_num=""
+    if [[ -n "$pr_num" ]]; then
+        echo "$pr_num"
+        return 0
+    fi
+
+    return 1
 }
 
 # ── prompt construction ──────────────────────────────────────────
@@ -155,8 +193,12 @@ build_prompt() {
     local repo=$1 number=$2 type=$3 agent=${4:-pi}
 
     if [[ "$type" == "review" ]]; then
+        # Item 4 (#10): use the resolved PR number from main()
+        # (stored in TMQ_REVIEW_PR_NUM) rather than calling
+        # resolve_pr_number again — avoids a duplicate gh API call
+        # (#10 review, P1).
         local pr_json
-        pr_json=$(fetch_pr "$repo" "$number")
+        pr_json=$(fetch_pr "$repo" "$TMQ_REVIEW_PR_NUM")
         local title url state adds dels
         title=$(echo "$pr_json" | jq -r '.title')
         url=$(echo "$pr_json" | jq -r '.url')
@@ -445,6 +487,10 @@ TMQ_REUSED=0
 # Set to 1 by create_worktree when the reused feat session's tmux is alive.
 # Drives whether the prompt can claim the feat agent will see fixups.
 TMQ_FEAT_LIVE=0
+# Set by main() for review type: the resolved PR number (issue→PR fallback).
+# build_prompt() reads this instead of calling resolve_pr_number again,
+# avoiding duplicate gh API calls (#10 review, P1).
+TMQ_REVIEW_PR_NUM=""
 
 # Find an existing feat-<repo>#<num> aoe session and return its
 # worktree path (the caller reads the branch separately via git).
@@ -456,30 +502,51 @@ TMQ_FEAT_LIVE=0
 #
 # Bound the aoe CLI with `timeout` so a hung daemon can't freeze
 # `tmq review` indefinitely.
+# Globals set by find_feat_session on success (never on failure).
+# TMQ_FEAT_PATH      = absolute path to the worktree
+# TMQ_FEAT_PREFIX    = which session type matched (feat, fix, or chore)
+# TMQ_AOE_ID_PREFIX  = first 8 chars of the aoe session id (for precise
+#                       liveness match — avoids broad glob false positives)
+TMQ_FEAT_PATH=""
+TMQ_FEAT_PREFIX=""
+TMQ_AOE_ID_PREFIX=""
+
 find_feat_session() {
     local repo=$1 issue_num=$2
-    local title="feat-${repo}#${issue_num}"
 
     command -v aoe &>/dev/null || return 1
 
-    local wt_path
-    wt_path=$(timeout 5 aoe list --json 2>/dev/null | \
-        jq -r --arg t "$title" '
-            [.[] | select(.title == $t)]
-            | sort_by(.created_at)
-            | last
-            | .path // empty
-        ' 2>/dev/null) || return 1
+    local prefix
+    for prefix in feat fix chore; do
+        local title="${prefix}-${repo}#${issue_num}"
 
-    # Path must exist as a directory and be a git worktree (or bare main
-    # checkout for non-worktree repos). Skip if stale.
-    if [[ -z "$wt_path" ]] || [[ ! -d "$wt_path" ]] \
-        || ! git -C "$wt_path" rev-parse --git-dir &>/dev/null; then
-        return 1
-    fi
+        local entry wt_path aoe_id
+        entry=$(timeout 5 aoe list --json 2>/dev/null | \
+            jq -r --arg t "$title" '
+                [.[] | select(.title == $t)]
+                | sort_by(.created_at)
+                | last
+                | "\(.path // empty)\	\(.id // empty)"
+            ' 2>/dev/null) || continue
 
-    echo "$wt_path"
-    return 0
+        wt_path="${entry%%$'\t'*}"
+        aoe_id="${entry##*$'\t'}"
+
+        # Path must exist as a directory and be a git worktree
+        # (or bare main checkout for non-worktree repos). Skip if stale.
+        if [[ -z "$wt_path" ]] || [[ ! -d "$wt_path" ]] \
+            || ! git -C "$wt_path" rev-parse --git-dir &>/dev/null; then
+            continue
+        fi
+
+        TMQ_FEAT_PATH="$wt_path"
+        TMQ_FEAT_PREFIX="$prefix"
+        # First 8 chars of the aoe id (enough for unique session match)
+        TMQ_AOE_ID_PREFIX="${aoe_id:0:8}"
+        return 0
+    done
+
+    return 1
 }
 
 create_worktree() {
@@ -491,28 +558,51 @@ create_worktree() {
     # pushing, and fixups land on the same branch.
     if [[ "$type" == "review" ]]; then
         local feat_path feat_branch
-        if feat_path=$(find_feat_session "$repo" "$issue_num") && [[ -n "$feat_path" ]]; then
-            feat_branch=$(git -C "$feat_path" branch --show-current 2>/dev/null)
+        find_feat_session "$repo" "$issue_num" || true
+        feat_path="$TMQ_FEAT_PATH"
+        if [[ -n "$feat_path" ]]; then
+            # Item 2 (#10): non-worktree repos can't reuse — the main
+            # checkout isn't a worktree; "shared with the feature agent"
+            # wording is misleading (the feat branch is a different ref
+            # the reviewer isn't checked out to).
+            if (( REPO_WORKTREE[$repo] != 1 )); then
+                echo "  skipping reuse: $repo is a non-worktree repo" >&2
+            else
+                feat_branch=$(git -C "$feat_path" branch --show-current 2>/dev/null)
 
-            # Liveness: aoe sessions appear as tmux sessions named
-            # `aoe_<title>_<id_prefix>`, but `#` in the title is
-            # replaced with `_` for the tmux session name. A
-            # closed/killed feat session leaves the worktree behind
-            # but no live tmux session, in which case the prompt
-            # shouldn't claim the feat agent will see fixups.
-            local feat_session_pattern="aoe_feat-${repo}_${issue_num}_*"
-            if tmux has-session -t "$feat_session_pattern" 2>/dev/null; then
-                TMQ_FEAT_LIVE=1
-            fi
+                # Item 3 (#10): validate the upstream branch still exists
+                # on the remote. Skip reuse if it was force-pushed away,
+                # deleted, or merged+cleaned (otherwise the prompt's
+                # `git pull --ff-only` instruction fails with a confusing
+                # error on a dangling branch). Skip validation on detached
+                # HEAD (empty branch) — no upstream to check.
+                if [[ -n "$feat_branch" ]] \
+                    && ! git -C "$feat_path" rev-parse --verify "origin/$feat_branch" &>/dev/null; then
+                    echo "  skipping reuse: upstream branch origin/$feat_branch not found (deleted or force-pushed?)" >&2
+                else
 
-            echo "Reusing feat session worktree: $feat_path" >&2
-            echo "  branch: ${feat_branch:-<detached>}" >&2
-            echo "  feat agent live: $([[ $TMQ_FEAT_LIVE -eq 1 ]] && echo yes || echo no)" >&2
-            TMQ_CWD="$feat_path"
-            TMQ_BRANCH="$feat_branch"
-            TMQ_REUSED=1
-            echo "$feat_path"
-            return
+                # Liveness: use the precise aoe id prefix from
+                # find_feat_session, not a broad glob. A glob like
+                # `aoe_*-${repo}_${issue_num}_*` would match
+                # review- sessions and cross-type ghosts (P0 #2
+                # from tms#10 proposal review).
+                if [[ -n "$TMQ_AOE_ID_PREFIX" ]]; then
+                    local feat_session_pattern="aoe_${TMQ_FEAT_PREFIX}-${repo}_${issue_num}_${TMQ_AOE_ID_PREFIX}*"
+                    if tmux has-session -t "$feat_session_pattern" 2>/dev/null; then
+                        TMQ_FEAT_LIVE=1
+                    fi
+                fi
+
+                echo "Reusing ${TMQ_FEAT_PREFIX} session worktree: $feat_path" >&2
+                echo "  branch: ${feat_branch:-<detached>}" >&2
+                echo "  ${TMQ_FEAT_PREFIX} agent live: $([[ $TMQ_FEAT_LIVE -eq 1 ]] && echo yes || echo no)" >&2
+                TMQ_CWD="$feat_path"
+                TMQ_BRANCH="$feat_branch"
+                TMQ_REUSED=1
+                echo "$feat_path"
+                return
+                fi  # end upstream validation guard
+            fi  # end worktree-repo gate (Item 2)
         fi
         # No feat session found — fall through to standard handling
     fi
@@ -646,8 +736,15 @@ main() {
 
     # Fetch issue/PR info for display
     if [[ "$type" == "review" ]]; then
+        # Item 4 (#10): resolve issue numbers to PR numbers.
+        # Store in TMQ_REVIEW_PR_NUM so build_prompt() can reuse it
+        # without a duplicate gh API call (#10 review, P1).
+        TMQ_REVIEW_PR_NUM=$(resolve_pr_number "$repo" "$number") || {
+            echo "ERROR: Could not find PR for ${REPO_GH[$repo]}#$number (not a PR number and no linked PRs found)" >&2
+            exit 1
+        }
         local pr_json title
-        pr_json=$(fetch_pr "$repo" "$number")
+        pr_json=$(fetch_pr "$repo" "$TMQ_REVIEW_PR_NUM")
         title=$(echo "$pr_json" | jq -r '.title')
         echo "PR: $title"
         echo "URL: $(echo "$pr_json" | jq -r '.url')"
