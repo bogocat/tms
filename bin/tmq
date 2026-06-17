@@ -40,6 +40,19 @@ add_repo deploy       /root/deploy/distillery      bogocat/distillery    0
 add_repo frame-cache  /root/projects/framecache    bogocat/framecache    0
 add_repo tms          /root/tms                    bogocat/tms           1
 
+# Active bogocat app/tool repos. worktree=0 per the rms/palimpsest convention
+# (only cron-read / CI-deploy / concurrent-clobber repos above are 1). Flip a
+# repo to 1 if it starts getting concurrent feature work on its main checkout.
+add_repo timesheet           /root/projects/timesheet           bogocat/timesheet           0
+add_repo jellyfin-3ds        /root/projects/jellyfin-3ds        bogocat/jellyfin-3ds        0
+add_repo quantumera-tactics  /root/projects/quantumera-tactics  bogocat/quantumera-tactics  0
+add_repo subtitleai          /root/projects/subtitleai          bogocat/subtitlesv2         0
+add_repo tcg                 /root/projects/tcg                 bogocat/tcg                 0
+add_repo trip-planner        /root/projects/trip-planner        bogocat/trip-planner        0
+add_repo music-control       /root/projects/music-control       bogocat/music-control       0
+add_repo music-display       /root/projects/music-display       bogocat/music-display       0
+add_repo garden              /root/projects/garden              bogocat/garden              0
+
 # ── defaults ─────────────────────────────────────────────────────
 
 DEFAULT_AGENT="pi"
