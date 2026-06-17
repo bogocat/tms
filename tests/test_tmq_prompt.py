@@ -203,10 +203,12 @@ def _create_worktree_review_body():
     between feat_path=$(find_feat_session ...) and TMQ_REUSED=1."""
     src = BIN_TMQ.read_text()
     m = re.search(
-        r'feat_path=\$\(find_feat_session.*?\n(.*?)TMQ_REUSED=1',
+        r'create_worktree\(\).*?'
+        r'if \[\[ "\$type" == "review" \]\].*?\n'
+        r'(.*?)\bTMQ_REUSED=1\b',
         src, re.S,
     )
-    assert m, "review reuse block (find_feat_session → TMQ_REUSED) not found"
+    assert m, "review reuse block (create_worktree review → TMQ_REUSED=1) not found"
     return m.group(1)
 
 

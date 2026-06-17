@@ -456,30 +456,51 @@ TMQ_FEAT_LIVE=0
 #
 # Bound the aoe CLI with `timeout` so a hung daemon can't freeze
 # `tmq review` indefinitely.
+# Globals set by find_feat_session on success (never on failure).
+# TMQ_FEAT_PATH      = absolute path to the worktree
+# TMQ_FEAT_PREFIX    = which session type matched (feat, fix, or chore)
+# TMQ_AOE_ID_PREFIX  = first 8 chars of the aoe session id (for precise
+#                       liveness match — avoids broad glob false positives)
+TMQ_FEAT_PATH=""
+TMQ_FEAT_PREFIX=""
+TMQ_AOE_ID_PREFIX=""
+
 find_feat_session() {
     local repo=$1 issue_num=$2
-    local title="feat-${repo}#${issue_num}"
 
     command -v aoe &>/dev/null || return 1
 
-    local wt_path
-    wt_path=$(timeout 5 aoe list --json 2>/dev/null | \
-        jq -r --arg t "$title" '
-            [.[] | select(.title == $t)]
-            | sort_by(.created_at)
-            | last
-            | .path // empty
-        ' 2>/dev/null) || return 1
+    local prefix
+    for prefix in feat fix chore; do
+        local title="${prefix}-${repo}#${issue_num}"
 
-    # Path must exist as a directory and be a git worktree (or bare main
-    # checkout for non-worktree repos). Skip if stale.
-    if [[ -z "$wt_path" ]] || [[ ! -d "$wt_path" ]] \
-        || ! git -C "$wt_path" rev-parse --git-dir &>/dev/null; then
-        return 1
-    fi
+        local entry wt_path aoe_id
+        entry=$(timeout 5 aoe list --json 2>/dev/null | \
+            jq -r --arg t "$title" '
+                [.[] | select(.title == $t)]
+                | sort_by(.created_at)
+                | last
+                | "\(.path // empty)\	\(.id // empty)"
+            ' 2>/dev/null) || continue
 
-    echo "$wt_path"
-    return 0
+        wt_path="${entry%%$'\t'*}"
+        aoe_id="${entry##*$'\t'}"
+
+        # Path must exist as a directory and be a git worktree
+        # (or bare main checkout for non-worktree repos). Skip if stale.
+        if [[ -z "$wt_path" ]] || [[ ! -d "$wt_path" ]] \
+            || ! git -C "$wt_path" rev-parse --git-dir &>/dev/null; then
+            continue
+        fi
+
+        TMQ_FEAT_PATH="$wt_path"
+        TMQ_FEAT_PREFIX="$prefix"
+        # First 8 chars of the aoe id (enough for unique session match)
+        TMQ_AOE_ID_PREFIX="${aoe_id:0:8}"
+        return 0
+    done
+
+    return 1
 }
 
 create_worktree() {
@@ -491,7 +512,9 @@ create_worktree() {
     # pushing, and fixups land on the same branch.
     if [[ "$type" == "review" ]]; then
         local feat_path feat_branch
-        if feat_path=$(find_feat_session "$repo" "$issue_num") && [[ -n "$feat_path" ]]; then
+        find_feat_session "$repo" "$issue_num"
+        feat_path="$TMQ_FEAT_PATH"
+        if [[ -n "$feat_path" ]]; then
             # Item 2 (#10): non-worktree repos can't reuse — the main
             # checkout isn't a worktree; "shared with the feature agent"
             # wording is misleading (the feat branch is a different ref
@@ -501,15 +524,16 @@ create_worktree() {
             else
                 feat_branch=$(git -C "$feat_path" branch --show-current 2>/dev/null)
 
-                # Liveness: aoe sessions appear as tmux sessions named
-                # `aoe_<title>_<id_prefix>`, but `#` in the title is
-                # replaced with `_` for the tmux session name. A
-                # closed/killed feat session leaves the worktree behind
-                # but no live tmux session, in which case the prompt
-                # shouldn't claim the feat agent will see fixups.
-                local feat_session_pattern="aoe_feat-${repo}_${issue_num}_*"
-                if tmux has-session -t "$feat_session_pattern" 2>/dev/null; then
-                    TMQ_FEAT_LIVE=1
+                # Liveness: use the precise aoe id prefix from
+                # find_feat_session, not a broad glob. A glob like
+                # `aoe_*-${repo}_${issue_num}_*` would match
+                # review- sessions and cross-type ghosts (P0 #2
+                # from tms#10 proposal review).
+                if [[ -n "$TMQ_AOE_ID_PREFIX" ]]; then
+                    local feat_session_pattern="aoe_${TMQ_FEAT_PREFIX}-${repo}_${issue_num}_${TMQ_AOE_ID_PREFIX}*"
+                    if tmux has-session -t "$feat_session_pattern" 2>/dev/null; then
+                        TMQ_FEAT_LIVE=1
+                    fi
                 fi
 
                 echo "Reusing feat session worktree: $feat_path" >&2
