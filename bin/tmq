@@ -524,6 +524,17 @@ create_worktree() {
             else
                 feat_branch=$(git -C "$feat_path" branch --show-current 2>/dev/null)
 
+                # Item 3 (#10): validate the upstream branch still exists
+                # on the remote. Skip reuse if it was force-pushed away,
+                # deleted, or merged+cleaned (otherwise the prompt's
+                # `git pull --ff-only` instruction fails with a confusing
+                # error on a dangling branch). Skip validation on detached
+                # HEAD (empty branch) — no upstream to check.
+                if [[ -n "$feat_branch" ]] \
+                    && ! git -C "$feat_path" rev-parse --verify "origin/$feat_branch" &>/dev/null; then
+                    echo "  skipping reuse: upstream branch origin/$feat_branch not found (deleted or force-pushed?)" >&2
+                else
+
                 # Liveness: use the precise aoe id prefix from
                 # find_feat_session, not a broad glob. A glob like
                 # `aoe_*-${repo}_${issue_num}_*` would match
@@ -544,7 +555,8 @@ create_worktree() {
                 TMQ_REUSED=1
                 echo "$feat_path"
                 return
-            fi
+                fi  # end upstream validation guard
+            fi  # end worktree-repo gate (Item 2)
         fi
         # No feat session found — fall through to standard handling
     fi
