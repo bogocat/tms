@@ -627,10 +627,10 @@ fetch_repo_issues() {
 
     # Fetch open issues + PRs to temp files
     gh issue list --repo "$gh_repo" --state open \
-        --limit 50 --json number,title,labels,url,createdAt,updatedAt > "$tmp.issues" 2>/dev/null || return
+        --limit 300 --json number,title,labels,url,createdAt,updatedAt > "$tmp.issues" 2>/dev/null || return
 
     gh pr list --repo "$gh_repo" --state open \
-        --limit 50 --json number,title,body,headRefName,reviewDecision,url > "$tmp.prs" 2>/dev/null || echo '[]' > "$tmp.prs"
+        --limit 300 --json number,title,body,headRefName,reviewDecision,url > "$tmp.prs" 2>/dev/null || echo '[]' > "$tmp.prs"
 
     # Single python pass: enrich issues with PR status
     python3 - "$tmp.issues" "$tmp.prs" "$short" << 'PYEOF'
