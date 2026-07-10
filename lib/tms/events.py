@@ -22,6 +22,7 @@ are for full-file replacement — used only for last_status.json here.
 
 import datetime
 import json
+import math
 import os
 import pathlib
 import re
@@ -356,19 +357,213 @@ def compute_stats(since=None):
         since: optional ISO date string (YYYY-MM-DD) to filter events.
 
     Returns a dict with:
-      - total_dispatches, total_sessions
-      - issue_latency_p50, issue_latency_p90
-      - review_rounds_avg
-      - blocked_rate, merge_ready_rate
-      - fast_path_rate
-      - per_model: {model: {dispatches, merges, blocked, avg_latency}}
+      - total_dispatches, total_failed_dispatches, total_transitions
+      - fast_path_count, normal_path_count, fast_path_rate
+      - review_rounds_total, review_rounds_avg
+      - blocked_count, merge_ready_count, blocked_rate
+      - latency_p50_seconds, latency_p90_seconds
+      - completed_sessions
+      - per_model: {model: {dispatches, merged, blocked, avg_latency_seconds}}
     """
-    # Phase 3 stub — implemented in a follow-up commit
+    # Read all events
+    events = []
+    try:
+        if os.path.exists(EVENTS_PATH):
+            with open(EVENTS_PATH) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        events.append(json.loads(line))
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+    except OSError:
+        pass
+
+    # Filter by --since if provided
+    if since:
+        # Accept "YYYY-MM-DD" or full ISO timestamps
+        cutoff = since if "T" in since else since + "T00:00:00+00:00"
+        events = [e for e in events if e.get("timestamp", "") >= cutoff]
+
+    # Partition by event type
+    dispatches = [e for e in events if e.get("event_type") == "dispatch"]
+    failed = [e for e in events if e.get("event_type") == "dispatch_failed"]
+    transitions = [e for e in events if e.get("event_type") == "transition"]
+
+    # Per-model dispatch counts
+    per_model = {}
+    for d in dispatches:
+        model = d.get("model", "")
+        if not model:
+            model = d.get("agent", "unknown")
+        if model not in per_model:
+            per_model[model] = {
+                "dispatches": 0, "merged": 0, "blocked": 0,
+                "avg_latency_seconds": 0,
+            }
+        per_model[model]["dispatches"] += 1
+
+    # Group transitions by aoe_id_prefix
+    transitions_by_session = {}
+    for t in transitions:
+        sid = t.get("aoe_id_prefix", "")
+        if not sid:
+            continue
+        transitions_by_session.setdefault(sid, []).append(t)
+
+    # Compute per-session metrics
+    review_rounds_total = 0
+    sessions_with_reviews = 0
+    blocked_count = 0
+    merge_ready_count = 0
+    fast_path_count = 0
+    normal_path_count = 0
+    latencies = []
+    completed_sessions = 0
+
+    # Build dispatch lookup: aoe_id_prefix → dispatch record
+    dispatch_by_session = {}
+    for d in dispatches:
+        sid = d.get("aoe_id_prefix", "")
+        if sid:
+            dispatch_by_session[sid] = d
+
+    for sid, ts in transitions_by_session.items():
+        # Review rounds: count PR-REVIEW→WORKING transitions
+        rounds = sum(
+            1 for t in ts
+            if t.get("from_status") == "PR-REVIEW"
+            and t.get("to_status") == "WORKING"
+        )
+        if rounds > 0:
+            review_rounds_total += rounds
+            sessions_with_reviews += 1
+
+        # BLOCKED detection
+        for t in ts:
+            if t.get("to_status") == "BLOCKED":
+                blocked_count += 1
+                # Tag the model
+                disp = dispatch_by_session.get(sid, {})
+                model = disp.get("model", disp.get("agent", ""))
+                if model and model in per_model:
+                    per_model[model]["blocked"] = \
+                        per_model[model].get("blocked", 0) + 1
+            if t.get("to_status") == "MERGE-READY":
+                merge_ready_count += 1
+
+        # Plan-gate: does this session have a PLAN-REVIEW marker?
+        # The marker appears as from_status when the agent transitions
+        # OUT of PLAN-REVIEW (PLAN-REVIEW→WORKING).
+        has_plan_review = any(
+            t.get("from_status") == "PLAN-REVIEW" for t in ts
+        )
+        # Fast path = dispatch exists AND first transition is NOT
+        # to PLAN-REVIEW (agent went straight to WORKING)
+        if has_plan_review:
+            normal_path_count += 1
+        else:
+            # Only count if there's at least one transition (agent ran)
+            if len(ts) > 0:
+                fast_path_count += 1
+
+        # Latency: dispatch→terminal or dispatch→DONE/MERGE-READY
+        disp = dispatch_by_session.get(sid)
+        if disp:
+            disp_ts = disp.get("timestamp", "")
+            # Find terminal event
+            terminal_t = None
+            for t in ts:
+                if t.get("to_status") in ("terminal", "DONE"):
+                    terminal_t = t
+                    break
+            if not terminal_t:
+                # Fall back to MERGE-READY as completion
+                for t in ts:
+                    if t.get("to_status") == "MERGE-READY":
+                        terminal_t = t
+                        break
+
+            if terminal_t and disp_ts:
+                try:
+                    d_start = datetime.datetime.fromisoformat(disp_ts)
+                    d_end = datetime.datetime.fromisoformat(
+                        terminal_t.get("timestamp", "")
+                    )
+                    latency = (d_end - d_start).total_seconds()
+                    if latency >= 0:
+                        latencies.append(latency)
+                        completed_sessions += 1
+                        # Per-model latency
+                        model = disp.get("model", disp.get("agent", ""))
+                        if model and model in per_model:
+                            pm = per_model[model]
+                            n = pm.get("merged", 0)
+                            old_avg = pm.get("avg_latency_seconds", 0)
+                            pm["avg_latency_seconds"] = (
+                                (old_avg * n + latency) / (n + 1)
+                            )
+                            pm["merged"] = n + 1
+                except (ValueError, OverflowError):
+                    pass
+
+    # Compute aggregate stats
+    review_rounds_avg = (
+        review_rounds_total / sessions_with_reviews
+        if sessions_with_reviews > 0 else 0.0
+    )
+    blocked_rate = (
+        blocked_count / (blocked_count + merge_ready_count)
+        if (blocked_count + merge_ready_count) > 0 else 0.0
+    )
+    fast_path_rate = (
+        fast_path_count / (fast_path_count + normal_path_count)
+        if (fast_path_count + normal_path_count) > 0 else 0.0
+    )
+
+    # Percentile latencies
+    latencies.sort()
+    latency_p50 = _percentile(latencies, 50)
+    latency_p90 = _percentile(latencies, 90)
+
     return {
-        "total_dispatches": 0,
-        "total_sessions": 0,
-        "per_model": {},
+        "total_dispatches": len(dispatches),
+        "total_failed_dispatches": len(failed),
+        "total_transitions": len(transitions),
+        "fast_path_count": fast_path_count,
+        "normal_path_count": normal_path_count,
+        "fast_path_rate": round(fast_path_rate, 3),
+        "review_rounds_total": review_rounds_total,
+        "review_rounds_avg": round(review_rounds_avg, 2),
+        "blocked_count": blocked_count,
+        "merge_ready_count": merge_ready_count,
+        "blocked_rate": round(blocked_rate, 3),
+        "latency_p50_seconds": latency_p50,
+        "latency_p90_seconds": latency_p90,
+        "completed_sessions": completed_sessions,
+        "per_model": per_model,
     }
+
+
+def _percentile(sorted_values, pct):
+    """Compute the pct-th percentile from a sorted list.
+
+    Uses linear interpolation (same as numpy.percentile with
+    method='linear'). Returns 0 for empty lists.
+    """
+    if not sorted_values:
+        return 0
+    n = len(sorted_values)
+    # Fractional rank: (pct/100) * (n-1) for 0-indexed interpolation
+    rank = (pct / 100.0) * (n - 1)
+    lo = int(math.floor(rank))
+    hi = int(math.ceil(rank))
+    if lo == hi:
+        return sorted_values[lo]
+    frac = rank - lo
+    return sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
 
 
 def format_stats_report(stats, as_json=False):
@@ -378,8 +573,52 @@ def format_stats_report(stats, as_json=False):
     """
     if as_json:
         print(json.dumps(stats, indent=2, default=str))
-    else:
-        print("(no data — stats computation is Phase 3)")
+        return
+
+    def _hms(seconds):
+        if seconds == 0:
+            return "—"
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        if h > 0:
+            return f"{h}h {m}m"
+        return f"{m}m"
+
+    print("=== Fleet Dispatch Metrics ===")
+    print()
+    print(f"  Total dispatches:       {stats['total_dispatches']}")
+    print(f"  Failed dispatches:      {stats['total_failed_dispatches']}")
+    print(f"  Total transitions:      {stats['total_transitions']}")
+    print()
+    print(f"  Completed sessions:     {stats['completed_sessions']}")
+    print(f"  Issue latency (p50):    {_hms(stats['latency_p50_seconds'])}")
+    print(f"  Issue latency (p90):    {_hms(stats['latency_p90_seconds'])}")
+    print()
+    print(f"  Plan-gate fast path:    {stats['fast_path_count']} "
+          f"({stats['fast_path_rate']:.0%})")
+    print(f"  Plan-gate normal:       {stats['normal_path_count']}")
+    print()
+    print(f"  Review rounds (avg):    {stats['review_rounds_avg']}")
+    print(f"  Review rounds (total):  {stats['review_rounds_total']}")
+    print()
+    print(f"  BLOCKED count:          {stats['blocked_count']}")
+    print(f"  MERGE-READY count:      {stats['merge_ready_count']}")
+    print(f"  BLOCKED rate:           {stats['blocked_rate']:.1%}")
+    print()
+
+    pm = stats.get("per_model", {})
+    if pm:
+        print("  Per-model breakdown:")
+        print(f"  {'Model':<24} {'Disp':>5} {'Merged':>7} {'Blocked':>8} {'Avg Lat':>8}")
+        print(f"  {'─'*24} {'─'*5} {'─'*7} {'─'*8} {'─'*8}")
+        for model, mstats in sorted(pm.items()):
+            print(
+                f"  {model:<24} "
+                f"{mstats['dispatches']:>5} "
+                f"{mstats.get('merged', 0):>7} "
+                f"{mstats.get('blocked', 0):>8} "
+                f"{_hms(mstats.get('avg_latency_seconds', 0)):>8}"
+            )
 
 
 # ── CLI entry point ───────────────────────────────────────────────
