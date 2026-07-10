@@ -169,14 +169,15 @@ def _prune_staleness_state(path=None, now=None):
 
 
 def _capture_marker(session_name, lines=50):
-    """Capture the AGENT-STATE marker from a tmux session's pane.
+    """Capture the most recent AGENT-STATE marker from a tmux session's pane.
 
     Captures the last `lines` lines of the first pane in the session,
-    greps for <<AGENT-STATE: ...>>, and returns the full marker text
-    (including delimiters) or '' if none found or tmux fails.
+    greps for <<AGENT-STATE: ...>>, and returns the **last** (most recent)
+    match — `re.search` returns the first match, which would be the oldest
+    when multiple markers are in the scrollback window.
 
-    The session_name here is the full aoe tmux session name
-    (e.g. aoe_feat-tms#56_abcdef12).
+    Returns the full marker text (including delimiters) or '' if none
+    found or tmux fails.
     """
     try:
         r = subprocess.run(
@@ -185,9 +186,11 @@ def _capture_marker(session_name, lines=50):
         )
         if r.returncode != 0:
             return ''
-        m = _MARKER_RE.search(r.stdout)
-        if m:
-            return m.group(0)  # full match including <<AGENT-STATE: ... >>
+        # Find the LAST (most recent) marker. re.search returns the first
+        # (oldest) which misses transitions within the capture window.
+        matches = list(_MARKER_RE.finditer(r.stdout))
+        if matches:
+            return matches[-1].group(0)  # most recent full match
         return ''
     except (subprocess.TimeoutExpired, OSError):
         return ''
@@ -322,6 +325,7 @@ def build_status_map(out_path, staleness_state_path=None, threshold_minutes=None
         title = s.get('title', '')
         if not title:
             continue
+        prev_emitted = -1  # reset per-session
         try:
             sr = subprocess.run(
                 ['aoe', 'session', 'show', title, '--json'],
@@ -347,16 +351,27 @@ def build_status_map(out_path, staleness_state_path=None, threshold_minutes=None
                         threshold_minutes, now,
                     )
                     if result['state'] is not None:
-                        state[title] = result['state']
-                        state_dirty = True
+                        prev_entry = state.get(title, {})
+                        # Carry forward last_emitted_stale_minutes so the
+                        # dedup check below sees the previous value.
+                        prev_emitted = prev_entry.get('last_emitted_stale_minutes', -1)
+                        # Only mark dirty if state actually changed
+                        if result['state'] != prev_entry:
+                            state[title] = result['state']
+                            state_dirty = True
                     effective_status = result['status']
 
-                    # Log staleness events for #53.
+                    # Log staleness events for #53 — only on transition
+                    # into stale (not every refresh while stale).
                     if effective_status.startswith('stale:'):
                         stale_minutes = int(effective_status.split(':')[1].rstrip('m'))
-                        log_staleness_event(title, stale_minutes,
-                                           threshold_minutes=threshold_minutes,
-                                           now=now)
+                        if stale_minutes != prev_emitted:
+                            log_staleness_event(title, stale_minutes,
+                                               threshold_minutes=threshold_minutes,
+                                               now=now)
+                            if title in state:
+                                state[title]['last_emitted_stale_minutes'] = stale_minutes
+                                state_dirty = True
                 else:
                     effective_status = aoe_status
 

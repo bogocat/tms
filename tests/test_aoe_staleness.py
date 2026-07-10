@@ -12,6 +12,7 @@ real tmux panes or aoe daemons.
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -32,43 +33,6 @@ from tms.aoe_status import (
 
 
 # ── helpers ───────────────────────────────────────────────────────
-
-
-def _mock_subprocess_run_factory(sessions, marker_map=None):
-    """Return a mock `subprocess.run` replacement.
-
-    sessions: list of {id, title, status} dicts for aoe list --json
-    marker_map: dict of title → pane text (last 50 lines) for tmux capture-pane
-    """
-    def _run(cmd, **kwargs):
-        result = subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr='')
-        if cmd[0] == 'aoe' and cmd[1] == 'list':
-            result.stdout = json.dumps(sessions)
-        elif cmd[0] == 'aoe' and cmd[1] == 'session' and cmd[2] == 'show':
-            title = cmd[3]
-            for s in sessions:
-                if s['title'] == title:
-                    result.stdout = json.dumps(s)
-                    break
-            else:
-                result.returncode = 1
-        elif cmd[0] == 'tmux' and cmd[1] == 'capture-pane':
-            target = None
-            for i, arg in enumerate(cmd):
-                if arg == '-t' and i + 1 < len(cmd):
-                    target = cmd[i + 1]
-                    break
-            if marker_map and target:
-                # target is e.g. aoe_feat-tms#56_abcdef12
-                # we key by the compact title
-                for title, pane_text in marker_map.items():
-                    if title in target:
-                        result.stdout = pane_text
-                        break
-                else:
-                    result.stdout = ''
-        return result
-    return _run
 
 
 def _state_file_path():
@@ -192,6 +156,32 @@ def test_capture_marker_returns_empty_when_no_marker(monkeypatch):
     assert marker == ''
 
 
+def test_capture_marker_returns_most_recent_when_multiple(monkeypatch):
+    """When multiple markers are in the scrollback window, returns the LAST (most recent).
+
+    tmux capture-pane prints oldest-to-newest top-to-bottom. If an agent
+    transitions PLAN-REVIEW → WORKING within the capture window, both
+    markers are visible. _capture_marker must return the most recent one
+    so the staleness timer resets correctly on the transition.
+    """
+    pane_lines = '\n'.join([
+        '<<AGENT-STATE: PLAN-REVIEW>>',   # older — older in scrollback
+        'some output',
+        '<<AGENT-STATE: WORKING>>',       # newer — should be the match
+        'more recent output',
+    ])
+
+    def _mock_run(cmd, **kwargs):
+        result = subprocess.CompletedProcess(args=cmd, returncode=0, stdout=pane_lines, stderr='')
+        return result
+
+    monkeypatch.setattr(subprocess, 'run', _mock_run)
+    marker = _capture_marker('session_name', lines=50)
+    assert marker == '<<AGENT-STATE: WORKING>>', (
+        f"expected most recent WORKING marker, got {marker!r}"
+    )
+
+
 def test_capture_marker_handles_tmux_failure(monkeypatch):
     """When tmux capture-pane fails, returns empty string gracefully."""
     def _mock_run(cmd, **kwargs):
@@ -263,6 +253,25 @@ def test_compute_status_marker_unchanged_within_threshold(monkeypatch):
     assert result['status'] == 'running'
 
 
+def test_compute_status_marker_unchanged_at_exact_threshold(monkeypatch):
+    """When elapsed exactly equals threshold, session is stale (inclusive)."""
+    now = 1752000000.0
+    monkeypatch.setattr(time, 'time', lambda: now)
+
+    state = {
+        'feat-tms#56': {
+            'last_marker': '<<AGENT-STATE: WORKING>>',
+            'last_marker_at': now - 420,  # exactly 7 min ago
+            'last_seen_at': now - 10,
+        },
+    }
+    result = _compute_status(
+        state, 'feat-tms#56', 'running', '<<AGENT-STATE: WORKING>>',
+        threshold_minutes=7, now=now,
+    )
+    assert result['status'] == 'stale:7m'
+
+
 def test_compute_status_marker_unchanged_past_threshold(monkeypatch):
     """When marker is unchanged past threshold, emit stale:Nm."""
     now = 1752000000.0
@@ -323,12 +332,10 @@ def test_compute_status_threshold_from_env(monkeypatch):
     assert STALE_THRESHOLD_MINUTES() == 3
 
 
-def test_compute_status_threshold_default():
+def test_compute_status_threshold_default(monkeypatch):
     """Default threshold is 7 when env var is not set."""
-    monkeypatch = pytest.MonkeyPatch()
     monkeypatch.delenv('TMS_STALE_THRESHOLD_MINUTES', raising=False)
     assert STALE_THRESHOLD_MINUTES() == 7
-    monkeypatch.undo()
 
 
 # ── staleness event logging ───────────────────────────────────────
@@ -352,6 +359,71 @@ def test_log_staleness_event_includes_threshold(capsys):
     captured = capsys.readouterr()
     event = json.loads(captured.err.strip())
     assert event['threshold_minutes'] == 5
+
+
+def test_build_status_map_dedup_staleness_events(tmp_path, monkeypatch):
+    """Staleness events only fire once on transition, not on every refresh."""
+    out_path = str(tmp_path / 'status.tsv')
+    state_path = str(tmp_path / 'staleness.json')
+    now = 1752000000.0
+    monkeypatch.setattr(time, 'time', lambda: now)
+
+    # Pre-populate: session has been in same marker for 10 min (past 7-min threshold)
+    # and we've already emitted a staleness event for 7m.
+    _save_staleness_state(state_path, {
+        'feat-tms#56': {
+            'last_marker': '<<AGENT-STATE: WORKING>>',
+            'last_marker_at': now - 600,  # 10 min ago
+            'last_seen_at': now - 10,
+            'last_emitted_stale_minutes': 7,  # already logged at 7m
+        },
+    })
+
+    sessions = [
+        {'id': 'abc123def456', 'title': 'feat-tms#56', 'status': 'running'},
+    ]
+    pane_lines = '<<AGENT-STATE: WORKING>>\n'
+
+    import io
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+
+    try:
+        def _mock_run(cmd, **kwargs):
+            result = subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr='')
+            if cmd[0] == 'aoe' and cmd[1] == 'list':
+                result.stdout = json.dumps(sessions)
+            elif cmd[0] == 'aoe' and cmd[1] == 'session' and cmd[2] == 'show':
+                result.stdout = json.dumps(sessions[0])
+            elif cmd[0] == 'tmux' and cmd[1] == 'capture-pane':
+                result.stdout = pane_lines
+            return result
+
+        monkeypatch.setattr(subprocess, 'run', _mock_run)
+        monkeypatch.setattr('tms.aoe_status._STALENESS_STATE_PATH', state_path)
+
+        # First call: stale for 10m but last logged at 7m — should emit
+        build_status_map(out_path)
+        events1 = sys.stderr.getvalue()
+
+        # Reset stderr
+        sys.stderr = io.StringIO()
+
+        # Second call: same state, same stale_minutes (10m), same last_emitted
+        # (the state file was updated to last_emitted_stale_minutes=10 by first call)
+        build_status_map(out_path)
+        events2 = sys.stderr.getvalue()
+
+        # First call emits (10m != 7m)
+        assert len(events1.strip().split('\n')) == 1, (
+            f"first call should emit one event, got: {events1!r}"
+        )
+        # Second call should NOT emit (10m == 10m, same as last emitted)
+        assert events2.strip() == '', (
+            f"second call should not emit event, got: {events2!r}"
+        )
+    finally:
+        sys.stderr = old_stderr
 
 
 # ── integration: build_status_map with staleness ──────────────────
