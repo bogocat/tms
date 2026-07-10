@@ -677,6 +677,43 @@ create_worktree() {
     echo "$wt_path"
 }
 
+# ── reviewer overlap warning (#55) ───────────────────────────────
+# tower-fleet#193 open question 12: warn when the author model
+# overlaps the reviewer panel. Hardcoded from ~/.pi/agent/agents/
+# reviewer definitions; revisit when bogocat/pi-dotfiles#3 /
+# tower-fleet#194 establish the canonical mapping.
+
+# Output: model<TAB>reviewer-name (one per line, may have multiple
+# lines per model — claude maps to two reviewers).
+_reviewer_panel_map() {
+    cat <<'EOF'
+deepseek-v4-pro	reviewer
+MiniMax-M3	reviewer-m3
+claude	reviewer-fast
+claude	reviewer-claude
+anthropic/claude-sonnet-4.6	reviewer-fast-api
+glm-5.2	reviewer-zai
+EOF
+}
+
+# Warn to stderr when the author model overlaps the reviewer panel.
+# $1 = author model ID (may be empty, defaults to pi's default model;
+# currently deepseek-v4-pro per ~/.pi/agent/settings.json).
+_check_reviewer_overlap() {
+    local model="${1:-deepseek-v4-pro}"
+    local overlaps
+    overlaps=$(_reviewer_panel_map | awk -F'\t' -v m="$model" '$1 == m {print $2}')
+    if [[ -n "$overlaps" ]]; then
+        local reviewer_list total
+        total=$(_reviewer_panel_map | wc -l)
+        reviewer_list=$(echo "$overlaps" | paste -sd ',' - | sed 's/,/, /g')
+        local overlap_count
+        overlap_count=$(echo "$overlaps" | wc -l)
+        local remaining=$((total - overlap_count))
+        echo "warn: author model $model is also $reviewer_list -- panel independence reduced to $remaining reviewers" >&2
+    fi
+}
+
 # ── main ─────────────────────────────────────────────────────────
 
 main() {
@@ -744,6 +781,12 @@ main() {
         feature|fix|chore|review) ;;
         *) echo "Unknown type: $type (use feature, fix, chore, or review)"; exit 1 ;;
     esac
+
+    # #55: warn when the dispatched model overlaps the reviewer panel.
+    # Only pi accepts --model; cc/oc model selection is out of band.
+    if [[ "$agent" == "pi" ]]; then
+        _check_reviewer_overlap "$PI_MODEL"
+    fi
 
     echo "=== tmq: $type ${REPO_GH[$repo]}#$number ($agent) ==="
 

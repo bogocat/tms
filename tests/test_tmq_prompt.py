@@ -356,3 +356,74 @@ def test_main_review_uses_issue_pr_fallback():
     assert has_resolver or has_pr_list_fallback, (
         "main() review path no longer uses issue→PR fallback"
     )
+
+
+# ── #55: reviewer model overlap warning ─────────────────────────
+# tmq must warn when the dispatched pi agent's --model overlaps
+# with a reviewer panel model (tower-fleet#193, open question 12).
+
+
+def _tmq_src():
+    """Return the full bin/tmq source."""
+    return BIN_TMQ.read_text()
+
+
+def test_reviewer_panel_map_exists():
+    """_reviewer_panel_map must define the hardcoded reviewer→model mapping.
+    Maps model IDs to the reviewer agent names that use them. Sourced from
+    ~/.pi/agent/agents/ reviewer definitions; revisit when
+    bogocat/pi-dotfiles#3 / tower-fleet#194 establish the canonical mapping."""
+    src = _tmq_src()
+    assert '_reviewer_panel_map' in src, \
+        "no _reviewer_panel_map function in bin/tmq"
+    # Every panel model must appear exactly once (claude appears twice
+    # because it maps to two reviewers, but it still must appear)
+    assert 'deepseek-v4-pro' in src, \
+        "panel map missing reviewer model deepseek-v4-pro"
+    # MiniMax-M3 also appears in help text (line 76, 90) — anchor to
+    # the map function body so removal from the map is detectable.
+    m = re.search(r'_reviewer_panel_map\(\)\s*\{.*?^\}', src, re.S | re.M)
+    assert m, "_reviewer_panel_map function body not found"
+    map_body = m.group(0)
+    assert 'MiniMax-M3' in map_body, \
+        "panel map missing reviewer-m3 model MiniMax-M3"
+    assert 'reviewer-claude' in src, \
+        "panel map missing reviewer-claude (claude model)"
+    assert 'reviewer-fast' in src, \
+        "panel map missing reviewer-fast (claude model)"
+    assert 'glm-5.2' in src, \
+        "panel map missing reviewer-zai model glm-5.2"
+    assert 'reviewer-fast-api' in src, \
+        "panel map missing reviewer-fast-api"
+
+
+def test_reviewer_overlap_function_exists():
+    """_check_reviewer_overlap must exist and contain the warning logic:
+    resolve effective model, grep the panel map, print warning on match."""
+    src = _tmq_src()
+    assert '_check_reviewer_overlap' in src, \
+        "no _check_reviewer_overlap function in bin/tmq"
+    # Must reference the panel map for lookup
+    assert '_reviewer_panel_map' in src, \
+        "_check_reviewer_overlap does not reference _reviewer_panel_map"
+    # Must print a warning containing 'warn:' on stderr
+    assert 'warn:' in src and '>&2' in src, \
+        "_check_reviewer_overlap must print 'warn: ...' to stderr"
+    # Must reference PI_MODEL for the effective model
+    assert 'PI_MODEL' in src, \
+        "_check_reviewer_overlap does not reference PI_MODEL"
+
+
+def test_overlap_check_called_from_main_gated_on_pi():
+    """_check_reviewer_overlap must be called from main(), gated on
+    $agent == "pi" (the only agent that accepts --model)."""
+    src = _tmq_src()
+    m = re.search(r'^main\(\)\s*\{.*?^\}', src, re.S | re.M)
+    assert m, "main function not found"
+    body = m.group(0)
+    assert '_check_reviewer_overlap' in body, \
+        "_check_reviewer_overlap not called from main()"
+    # Must be gated on the pi agent
+    assert re.search(r'"\$agent"\s*==\s*"pi"', body) \
+        or re.search(r'\$agent\s*==\s*"pi"', body), \
+        "overlap check must be gated on $agent == \"pi\""
