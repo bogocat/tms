@@ -23,8 +23,8 @@ BIN_TMS = Path(__file__).resolve().parent.parent / 'bin' / 'tms'
 # ── FORMAT_TABLE has the right entries ────────────────────────────
 
 
-def test_table_has_all_five_known_statuses():
-    for s in ('running', 'waiting', 'idle', 'error', 'stopped'):
+def test_table_has_all_six_known_statuses():
+    for s in ('running', 'waiting', 'idle', 'error', 'stopped', 'stale'):
         assert s in FORMAT_TABLE, f"missing status: {s}"
 
 
@@ -36,7 +36,7 @@ def test_table_labels_are_4_chars_padded():
 
 def test_table_color_codes_are_ansi_compatible():
     """Color codes are 'X;Y' format: bold(1)/dim(2) + fg color (30-37)."""
-    valid_prefixes = ('32;1', '33;1', '2', '31;1', '31;2')
+    valid_prefixes = ('32;1', '33;1', '2', '31;1', '31;2', '35;1')
     for status, (_, color) in FORMAT_TABLE.items():
         assert color in valid_prefixes, f"{status} color {color!r} not in {valid_prefixes}"
 
@@ -96,7 +96,10 @@ def test_emitted_bash_contains_all_statuses():
     """The emitted case statement must cover every status in the table."""
     bash_src = emit_bash_format_fn()
     for status in FORMAT_TABLE:
-        assert f'{status})' in bash_src, f"missing case branch for {status}"
+        if status == 'stale':
+            assert 'stale:*)' in bash_src, f"missing case branch for stale:*"
+        else:
+            assert f'{status})' in bash_src, f"missing case branch for {status}"
 
 
 # ── drift guard: bin/tms bash must match FORMAT_TABLE ─────────────
@@ -129,12 +132,14 @@ def test_bin_tms_case_statements_match_format_table():
     colors = _parse_bash_case('_status_color', 'echo')
 
     for status, (label, color) in FORMAT_TABLE.items():
-        assert labels.get(status) == label, (
-            f"bin/tms _format_status[{status}]={labels.get(status)!r} "
+        # The stale entry uses a wildcard prefix (stale:*) in bash.
+        lookup = 'stale:*' if status == 'stale' else status
+        assert labels.get(lookup) == label, (
+            f"bin/tms _format_status[{lookup}]={labels.get(lookup)!r} "
             f"!= FORMAT_TABLE label {label!r} — tables have drifted"
         )
-        assert colors.get(status) == color, (
-            f"bin/tms _status_color[{status}]={colors.get(status)!r} "
+        assert colors.get(lookup) == color, (
+            f"bin/tms _status_color[{lookup}]={colors.get(lookup)!r} "
             f"!= FORMAT_TABLE color {color!r} — tables have drifted"
         )
 

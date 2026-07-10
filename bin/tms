@@ -139,6 +139,7 @@ _format_status() {
         idle)     printf 'idle'  ;;  # dim
         error)    printf 'err '  ;;  # red bold
         stopped)  printf 'stop'  ;;  # red dim
+        stale:*)  printf 'stal'  ;;  # magenta bold (stale watchdog #56)
         *)        printf '—   '  ;;
     esac
 }
@@ -151,6 +152,7 @@ _status_color() {
         idle)     echo '2' ;;
         error)    echo '31;1' ;;
         stopped)  echo '31;2' ;;
+        stale:*)  echo '35;1' ;;  # magenta bold (stale watchdog #56)
         *)        echo '2' ;;
     esac
 }
