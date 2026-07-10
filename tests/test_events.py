@@ -530,6 +530,67 @@ class TestDetectTransitions:
         state = json.loads(last_status_path.read_text())
         assert "abc12345" in state
 
+    def test_derived_tmux_session_name_uses_8_char_prefix(self):
+        """P0 regression guard: _derived_tmux_session_name must use
+        the 8-char UUID prefix, not the full 16-char UUID.
+        aoe's actual tmux session names use only the first 8 chars.
+        """
+        from tms.events import _derived_tmux_session_name
+
+        # Real aoe UUID: 16 hex chars (e.g., 6e803f602e914761)
+        name = _derived_tmux_session_name(
+            "feat-tms#53", "6e803f602e914761"
+        )
+        assert name == "aoe_feat-tms_53_6e803f60", (
+            f"expected 8-char prefix, got: {name}"
+        )
+
+    def test_capture_pane_target_uses_correct_session_name(self, tmp_path, monkeypatch):
+        """P0 regression guard: the tmux capture-pane -t argument must
+        match aoe's actual 8-char-prefix naming convention.
+        Verifies the full pipeline end-to-end with a real 16-char UUID.
+        """
+        from tms.events import detect_transitions, LAST_STATUS_PATH
+
+        events_path = tmp_path / "events.jsonl"
+        last_status_path = tmp_path / "last_status.json"
+        monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
+        monkeypatch.setattr("tms.events.LAST_STATUS_PATH", str(last_status_path))
+
+        captured_targets = []
+
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    _make_aoe_list_json([
+                        {"id": "6e803f602e914761",
+                         "title": "feat-tms#53", "path": "/root/wt-tms-53"},
+                    ]), "")
+            if cmd[:2] == ["aoe", "session"] and cmd[2] == "show":
+                return subprocess.CompletedProcess(
+                    cmd, 0, _make_aoe_show_json("6e803f60"), "")
+            if cmd[0] == "tmux" and "capture-pane" in cmd:
+                # Record the -t target for validation
+                if "-t" in cmd:
+                    idx = cmd.index("-t")
+                    if idx + 1 < len(cmd):
+                        captured_targets.append(cmd[idx + 1])
+                return subprocess.CompletedProcess(
+                    cmd, 0, "<<AGENT-STATE: WORKING>>", "")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            detect_transitions()
+
+        # The capture-pane -t argument must use 8-char prefix, not 16
+        assert len(captured_targets) > 0, "capture-pane was never called"
+        assert captured_targets[0] == "aoe_feat-tms_53_6e803f60", (
+            f"expected 8-char prefix target, got: {captured_targets[0]}"
+        )
+
 
 # ── Phase 3: stats computation ───────────────────────────────────
 

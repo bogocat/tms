@@ -331,10 +331,11 @@ def _derived_tmux_session_name(title, aoe_id):
     """Derive the likely tmux session name from an aoe title + id.
 
     aoe constructs tmux session names as:
-        aoe_<sanitized-title>_<uuid>
-    where the title has '#' → '_' and spaces → '_'.
-    Example: title="feat-tms#53", id="abc12345..." →
-             "aoe_feat-tms_53_abc12345..."
+        aoe_<sanitized-title>_<8-char-uuid-prefix>
+    where the title has '#' → '_' and spaces → '_', and the UUID
+    is truncated to 8 characters.
+    Example: title="feat-tms#53", id="abc12345fedc..." →
+             "aoe_feat-tms_53_abc12345"
 
     Returns the derived name or None if derivation is impossible.
     """
@@ -342,7 +343,7 @@ def _derived_tmux_session_name(title, aoe_id):
         return None
     # Sanitize the title the same way aoe does: # → _, space → _
     sanitized = title.replace("#", "_").replace(" ", "_")
-    return f"aoe_{sanitized}_{aoe_id}"
+    return f"aoe_{sanitized}_{aoe_id[:8]}"
 
 
 # ── Stats computation ─────────────────────────────────────────────
@@ -645,7 +646,7 @@ def main():
     subcmd = sys.argv[1]
 
     if subcmd == "dispatch":
-        if len(sys.argv) < 9:
+        if len(sys.argv) < 10:
             print("usage: python3 -m tms.events dispatch <repo> <issue> "
                   "<agent> <provider> <model> <type> <worktree> <session> "
                   "[aoe_id_prefix]", file=sys.stderr)
