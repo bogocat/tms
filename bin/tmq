@@ -697,18 +697,20 @@ EOF
 }
 
 # Warn to stderr when the author model overlaps the reviewer panel.
-# $1 = author model ID (may be empty, defaults to pi's default).
+# $1 = author model ID (may be empty, defaults to pi's default model;
+# currently deepseek-v4-pro per ~/.pi/agent/settings.json).
 _check_reviewer_overlap() {
     local model="${1:-deepseek-v4-pro}"
     local overlaps
     overlaps=$(_reviewer_panel_map | awk -F'\t' -v m="$model" '$1 == m {print $2}')
     if [[ -n "$overlaps" ]]; then
-        local reviewer_list total=6
+        local reviewer_list total
+        total=$(_reviewer_panel_map | wc -l)
         reviewer_list=$(echo "$overlaps" | paste -sd ',' - | sed 's/,/, /g')
         local overlap_count
         overlap_count=$(echo "$overlaps" | wc -l)
         local remaining=$((total - overlap_count))
-        echo "warn: author model $model is also $reviewer_list — panel independence reduced to $remaining reviewers" >&2
+        echo "warn: author model $model is also $reviewer_list -- panel independence reduced to $remaining reviewers" >&2
     fi
 }
 

@@ -380,7 +380,12 @@ def test_reviewer_panel_map_exists():
     # because it maps to two reviewers, but it still must appear)
     assert 'deepseek-v4-pro' in src, \
         "panel map missing reviewer model deepseek-v4-pro"
-    assert 'MiniMax-M3' in src, \
+    # MiniMax-M3 also appears in help text (line 76, 90) — anchor to
+    # the map function body so removal from the map is detectable.
+    m = re.search(r'_reviewer_panel_map\(\)\s*\{.*?^\}', src, re.S | re.M)
+    assert m, "_reviewer_panel_map function body not found"
+    map_body = m.group(0)
+    assert 'MiniMax-M3' in map_body, \
         "panel map missing reviewer-m3 model MiniMax-M3"
     assert 'reviewer-claude' in src, \
         "panel map missing reviewer-claude (claude model)"
