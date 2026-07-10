@@ -216,8 +216,132 @@ def detect_transitions():
 
     Returns the number of transition events emitted.
     """
-    # Phase 2 stub — implemented in a follow-up commit
-    return 0
+    import json as _json
+
+    # 1. Fetch current aoe sessions
+    try:
+        r = subprocess.run(
+            ["aoe", "list", "--json"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return 0
+        aoe_sessions = _json.loads(r.stdout)
+    except (subprocess.TimeoutExpired, OSError, _json.JSONDecodeError, ValueError):
+        return 0
+
+    # 2. Load last-known status (may not exist yet)
+    last_status = {}
+    try:
+        if os.path.exists(LAST_STATUS_PATH):
+            with open(LAST_STATUS_PATH) as f:
+                last_status = _json.load(f)
+    except (_json.JSONDecodeError, OSError):
+        last_status = {}  # corrupted → treat as first run
+
+    is_first_run = len(last_status) == 0
+
+    # 3. Build current status map: aoe_id_prefix[:8] → agent_state
+    current_status = {}
+    session_titles = {}  # aoe_id_prefix → session title (for event logging)
+    for s in aoe_sessions:
+        sid = s.get("id", "")
+        if len(sid) < 8:
+            continue
+        id_prefix = sid[:8]
+        title = s.get("title", "")
+        session_titles[id_prefix] = title
+
+        # Derive tmux session name from aoe title + id.
+        # aoe session names follow the pattern:
+        #   aoe_<title-with-underscores>_<uuid>
+        # Example: title "feat-tms#53" → tmux name "aoe_feat-tms_53_abc12345..."
+        tmux_name = _derived_tmux_session_name(title, sid)
+        if not tmux_name:
+            continue
+
+        # Capture pane content and parse AGENT-STATE marker
+        pane_text = _run(
+            ["tmux", "capture-pane", "-t", tmux_name, "-p", "-S", "-200"],
+            timeout=3,
+        )
+        parsed = _parse_agent_state_from_pane(pane_text)
+        if parsed is not None:
+            current_status[id_prefix] = parsed[0]
+
+    # 4. Compare and emit transition events
+    emitted = 0
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    for id_prefix, new_state in current_status.items():
+        old_state = last_status.get(id_prefix)
+        if old_state is not None and old_state != new_state:
+            # State changed — emit transition
+            record = {
+                "event_type": "transition",
+                "timestamp": now,
+                "session": session_titles.get(id_prefix, ""),
+                "aoe_id_prefix": id_prefix,
+                "from_status": old_state,
+                "to_status": new_state,
+            }
+            append_event(record)
+            emitted += 1
+
+    # 5. Detect disappeared sessions (in last_status but not current)
+    for id_prefix, old_state in last_status.items():
+        if id_prefix in current_status:
+            continue
+        # Only emit terminal for terminal-like states
+        if old_state in ("DONE", "MERGE-READY"):
+            record = {
+                "event_type": "transition",
+                "timestamp": now,
+                "session": "",  # session is gone, title unknown
+                "aoe_id_prefix": id_prefix,
+                "from_status": old_state,
+                "to_status": "terminal",
+            }
+            append_event(record)
+            emitted += 1
+
+    # 6. Write updated last_status (atomic via atomic_write_json)
+    from tms.atomic import atomic_write_json
+
+    # Merge: keep entries for disappeared sessions that we didn't mark
+    # as terminal (they may come back), and update with current status
+    merged = {}
+    for id_prefix, old_state in last_status.items():
+        if id_prefix in current_status:
+            merged[id_prefix] = current_status[id_prefix]
+        elif old_state in ("DONE", "MERGE-READY"):
+            continue  # terminal — don't carry forward
+        else:
+            merged[id_prefix] = old_state  # keep, may come back
+    for id_prefix, new_state in current_status.items():
+        merged[id_prefix] = new_state
+
+    atomic_write_json(LAST_STATUS_PATH, merged)
+
+    return emitted
+
+
+def _derived_tmux_session_name(title, aoe_id):
+    """Derive the likely tmux session name from an aoe title + id.
+
+    aoe constructs tmux session names as:
+        aoe_<sanitized-title>_<uuid>
+    where the title has '#' → '_' and spaces → '_'.
+    Example: title="feat-tms#53", id="abc12345..." →
+             "aoe_feat-tms_53_abc12345..."
+
+    Returns the derived name or None if derivation is impossible.
+    """
+    if not title or not aoe_id:
+        return None
+    # Sanitize the title the same way aoe does: # → _, space → _
+    sanitized = title.replace("#", "_").replace(" ", "_")
+    return f"aoe_{sanitized}_{aoe_id}"
 
 
 # ── Stats computation ─────────────────────────────────────────────

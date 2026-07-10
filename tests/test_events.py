@@ -214,3 +214,318 @@ def test_append_event_handles_special_characters(tmp_path, monkeypatch):
     parsed = json.loads(lines[0])
     assert parsed["title"] == record["title"]
     assert parsed["body"] == record["body"]
+
+
+# ── Phase 2: transition detection ─────────────────────────────────
+
+
+def _make_aoe_list_json(sessions):
+    """Build a mock aoe list --json response."""
+    return json.dumps([
+        {"id": s["id"], "title": s["title"], "path": s["path"],
+         "tool": s.get("tool", "pi")}
+        for s in sessions
+    ])
+
+
+def _make_aoe_show_json(session_id, status="running"):
+    """Build a mock aoe session show --json response."""
+    return json.dumps({"id": session_id, "status": status})
+
+
+class TestDetectTransitions:
+    """Tests for detect_transitions() — polling aoe + tmux pane capture."""
+
+    def test_first_run_seeds_state_no_events(self, tmp_path, monkeypatch):
+        """On first run (no last_status.json), detect_transitions must
+        seed the state file with current statuses but emit NO transition
+        events. Spurious 'unknown→running' transitions on first poll
+        would permanently corrupt the stats.
+        """
+        from tms.events import detect_transitions, LAST_STATUS_PATH
+
+        events_path = tmp_path / "events.jsonl"
+        last_status_path = tmp_path / "last_status.json"
+        monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
+        monkeypatch.setattr("tms.events.LAST_STATUS_PATH", str(last_status_path))
+
+        # Mock: one session with PANE showing WORKING state
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    _make_aoe_list_json([
+                        {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
+                         "title": "feat-tms#53", "path": "/root/wt-tms-53"},
+                    ]), "")
+            if cmd[:2] == ["aoe", "session"] and cmd[2] == "show":
+                return subprocess.CompletedProcess(
+                    cmd, 0, _make_aoe_show_json("abc12345"), "")
+            if cmd[0] == "tmux" and "capture-pane" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    "some output\n<<AGENT-STATE: WORKING>>\nmore output", "")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            n = detect_transitions()
+
+        assert n == 0, "first run must emit no transition events"
+        assert last_status_path.exists(), "must seed last_status.json"
+        state = json.loads(last_status_path.read_text())
+        assert "abc12345" in state
+        assert state["abc12345"] == "WORKING"
+        # No events written
+        assert not events_path.exists() or events_path.read_text().strip() == ""
+
+    def test_status_change_emits_transition_event(self, tmp_path, monkeypatch):
+        """When a session's AGENT-STATE marker changes between polls,
+        detect_transitions must emit a transition event.
+        """
+        from tms.events import detect_transitions, LAST_STATUS_PATH
+
+        events_path = tmp_path / "events.jsonl"
+        last_status_path = tmp_path / "last_status.json"
+        monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
+        monkeypatch.setattr("tms.events.LAST_STATUS_PATH", str(last_status_path))
+
+        # Pre-seed: session was WORKING
+        last_status_path.write_text(json.dumps({"abc12345": "WORKING"}))
+
+        call_count = [0]
+
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    _make_aoe_list_json([
+                        {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
+                         "title": "feat-tms#53", "path": "/root/wt-tms-53"},
+                    ]), "")
+            if cmd[:2] == ["aoe", "session"] and cmd[2] == "show":
+                return subprocess.CompletedProcess(
+                    cmd, 0, _make_aoe_show_json("abc12345"), "")
+            if cmd[0] == "tmux" and "capture-pane" in cmd:
+                call_count[0] += 1
+                # Now the pane shows PR-REVIEW
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    "...\n<<AGENT-STATE: PR-REVIEW>>\nwaiting...", "")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            n = detect_transitions()
+
+        assert n == 1, f"expected 1 transition, got {n}"
+        # Verify event was written
+        lines = events_path.read_text().strip().split("\n")
+        assert len(lines) == 1
+        event = json.loads(lines[0])
+        assert event["event_type"] == "transition"
+        assert event["from_status"] == "WORKING"
+        assert event["to_status"] == "PR-REVIEW"
+        assert event["aoe_id_prefix"] == "abc12345"
+        assert event["session"] == "feat-tms#53"
+
+    def test_no_change_emits_no_event(self, tmp_path, monkeypatch):
+        """When the status hasn't changed, detect_transitions must emit 0 events."""
+        from tms.events import detect_transitions, LAST_STATUS_PATH
+
+        events_path = tmp_path / "events.jsonl"
+        last_status_path = tmp_path / "last_status.json"
+        monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
+        monkeypatch.setattr("tms.events.LAST_STATUS_PATH", str(last_status_path))
+
+        last_status_path.write_text(json.dumps({"abc12345": "WORKING"}))
+
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    _make_aoe_list_json([
+                        {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
+                         "title": "feat-tms#53", "path": "/root/wt-tms-53"},
+                    ]), "")
+            if cmd[:2] == ["aoe", "session"] and cmd[2] == "show":
+                return subprocess.CompletedProcess(
+                    cmd, 0, _make_aoe_show_json("abc12345"), "")
+            if cmd[0] == "tmux" and "capture-pane" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0, "still working\n<<AGENT-STATE: WORKING>>", "")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            n = detect_transitions()
+
+        assert n == 0
+        # No events file written (or empty)
+        content = events_path.read_text() if events_path.exists() else ""
+        assert content.strip() == ""
+
+    def test_session_disappearance_with_done_status_emits_terminal(self, tmp_path, monkeypatch):
+        """When a session that was DONE disappears from aoe list, emit a
+        terminal event. This is the common MERGE-READY→merge→cleanup path.
+        """
+        from tms.events import detect_transitions, LAST_STATUS_PATH
+
+        events_path = tmp_path / "events.jsonl"
+        last_status_path = tmp_path / "last_status.json"
+        monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
+        monkeypatch.setattr("tms.events.LAST_STATUS_PATH", str(last_status_path))
+
+        # Pre-seed: session was MERGE-READY
+        last_status_path.write_text(json.dumps({
+            "abc12345": "MERGE-READY",
+            "fed67890": "WORKING",
+        }))
+
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                # Only the WORKING session is still alive;
+                # MERGE-READY session has been cleaned up
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    _make_aoe_list_json([
+                        {"id": "fed67890-1234-1234-1234-1234567890ab",
+                         "title": "feat-tms#54", "path": "/root/wt-tms-54"},
+                    ]), "")
+            if cmd[:2] == ["aoe", "session"] and cmd[2] == "show":
+                return subprocess.CompletedProcess(
+                    cmd, 0, _make_aoe_show_json("fed67890"), "")
+            if cmd[0] == "tmux" and "capture-pane" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0, "<<AGENT-STATE: WORKING>>", "")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            n = detect_transitions()
+
+        assert n >= 1, "should emit at least the terminal event"
+        lines = events_path.read_text().strip().split("\n")
+        terminal_events = [
+            json.loads(l) for l in lines
+            if json.loads(l).get("to_status") == "terminal"
+        ]
+        assert len(terminal_events) == 1
+        assert terminal_events[0]["from_status"] == "MERGE-READY"
+        assert terminal_events[0]["aoe_id_prefix"] == "abc12345"
+
+    def test_session_disappearance_with_non_terminal_status_skipped(self, tmp_path, monkeypatch):
+        """When a WORKING session disappears (crash, not merge), do NOT
+        emit a terminal event — that would inflate the terminal count.
+        """
+        from tms.events import detect_transitions, LAST_STATUS_PATH
+
+        events_path = tmp_path / "events.jsonl"
+        last_status_path = tmp_path / "last_status.json"
+        monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
+        monkeypatch.setattr("tms.events.LAST_STATUS_PATH", str(last_status_path))
+
+        last_status_path.write_text(json.dumps({"abc12345": "WORKING"}))
+
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                return subprocess.CompletedProcess(cmd, 0, "[]", "")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            n = detect_transitions()
+
+        assert n == 0, "non-terminal disappearance must emit 0 events"
+
+    def test_parse_agent_state_from_pane(self):
+        """_parse_agent_state_from_pane must extract the most recent marker."""
+        from tms.events import _parse_agent_state_from_pane
+
+        result = _parse_agent_state_from_pane(
+            "old output\n<<AGENT-STATE: PLAN-REVIEW>>\nmore\n<<AGENT-STATE: WORKING>>"
+        )
+        assert result == ("WORKING", None)
+
+    def test_parse_agent_state_blocked_with_reason(self):
+        """BLOCKED markers carry a reason after the colon."""
+        from tms.events import _parse_agent_state_from_pane
+
+        result = _parse_agent_state_from_pane(
+            "<<AGENT-STATE: BLOCKED: review not converging — bad design>>"
+        )
+        assert result == ("BLOCKED", "review not converging — bad design")
+
+    def test_parse_agent_state_no_marker(self):
+        """No marker → None."""
+        from tms.events import _parse_agent_state_from_pane
+
+        result = _parse_agent_state_from_pane("just regular output")
+        assert result is None
+
+    def test_parse_agent_state_ansi_escapes_stripped(self):
+        """ANSI escape sequences around the marker must not prevent matching.
+        Agents often color their output; the regex must work through it.
+        """
+        from tms.events import _parse_agent_state_from_pane
+
+        # Simulated colored output
+        pane = "\x1b[32m<<AGENT-STATE: WORKING>>\x1b[0m"
+        result = _parse_agent_state_from_pane(pane)
+        assert result == ("WORKING", None)
+
+    def test_parse_agent_state_picks_last_of_multiple(self):
+        """When multiple markers exist, the LAST one wins (most recent)."""
+        from tms.events import _parse_agent_state_from_pane
+
+        pane = (
+            "<<AGENT-STATE: PLAN-REVIEW>>\n"
+            "... work ...\n"
+            "<<AGENT-STATE: WORKING>>\n"
+            "... more work ...\n"
+            "<<AGENT-STATE: PR-REVIEW>>"
+        )
+        result = _parse_agent_state_from_pane(pane)
+        assert result == ("PR-REVIEW", None)
+
+    def test_corrupted_last_status_handled_gracefully(self, tmp_path, monkeypatch):
+        """Corrupt last_status.json must not crash — treat as first run."""
+        from tms.events import detect_transitions, LAST_STATUS_PATH
+
+        events_path = tmp_path / "events.jsonl"
+        last_status_path = tmp_path / "last_status.json"
+        monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
+        monkeypatch.setattr("tms.events.LAST_STATUS_PATH", str(last_status_path))
+
+        last_status_path.write_text("not valid json {{{ ")
+
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    _make_aoe_list_json([
+                        {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
+                         "title": "feat-tms#53", "path": "/root/wt-tms-53"},
+                    ]), "")
+            if cmd[:2] == ["aoe", "session"] and cmd[2] == "show":
+                return subprocess.CompletedProcess(
+                    cmd, 0, _make_aoe_show_json("abc12345"), "")
+            if cmd[0] == "tmux" and "capture-pane" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0, "<<AGENT-STATE: WORKING>>", "")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            n = detect_transitions()
+
+        assert n == 0, "corrupted state file must not produce spurious events"
+        # Should have re-written valid JSON
+        state = json.loads(last_status_path.read_text())
+        assert "abc12345" in state
