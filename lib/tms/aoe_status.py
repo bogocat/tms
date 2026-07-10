@@ -352,11 +352,17 @@ def build_status_map(out_path, staleness_state_path=None, threshold_minutes=None
                     )
                     if result['state'] is not None:
                         prev_entry = state.get(title, {})
-                        # Carry forward last_emitted_stale_minutes so the
-                        # dedup check below sees the previous value.
+                        # Carry forward last_emitted_stale_minutes so it
+                        # survives the state overwrite. _compute_status
+                        # only returns {last_marker, last_marker_at,
+                        # last_seen_at} — it doesn't know about this field.
                         prev_emitted = prev_entry.get('last_emitted_stale_minutes', -1)
-                        # Only mark dirty if state actually changed
-                        if result['state'] != prev_entry:
+                        result['state']['last_emitted_stale_minutes'] = prev_emitted
+                        # Only mark dirty if the core fields changed.
+                        # last_seen_at always advances, so comparing full
+                        # dicts would dirty on every refresh.
+                        if (result['state']['last_marker'] != prev_entry.get('last_marker')
+                                or result['state']['last_marker_at'] != prev_entry.get('last_marker_at')):
                             state[title] = result['state']
                             state_dirty = True
                     effective_status = result['status']

@@ -362,14 +362,15 @@ def test_log_staleness_event_includes_threshold(capsys):
 
 
 def test_build_status_map_dedup_staleness_events(tmp_path, monkeypatch):
-    """Staleness events only fire once on transition, not on every refresh."""
+    """Staleness events only fire once per stale_minutes bucket, even
+    across many refreshes at the same minute."""
     out_path = str(tmp_path / 'status.tsv')
     state_path = str(tmp_path / 'staleness.json')
     now = 1752000000.0
     monkeypatch.setattr(time, 'time', lambda: now)
 
-    # Pre-populate: session has been in same marker for 10 min (past 7-min threshold)
-    # and we've already emitted a staleness event for 7m.
+    # Pre-populate: session has been in same marker for 10 min (past 7-min
+    # threshold) and we've already emitted a staleness event for 7m.
     _save_staleness_state(state_path, {
         'feat-tms#56': {
             'last_marker': '<<AGENT-STATE: WORKING>>',
@@ -385,45 +386,98 @@ def test_build_status_map_dedup_staleness_events(tmp_path, monkeypatch):
     pane_lines = '<<AGENT-STATE: WORKING>>\n'
 
     import io
+
+    def _mock_run(cmd, **kwargs):
+        result = subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr='')
+        if cmd[0] == 'aoe' and cmd[1] == 'list':
+            result.stdout = json.dumps(sessions)
+        elif cmd[0] == 'aoe' and cmd[1] == 'session' and cmd[2] == 'show':
+            result.stdout = json.dumps(sessions[0])
+        elif cmd[0] == 'tmux' and cmd[1] == 'capture-pane':
+            result.stdout = pane_lines
+        return result
+
+    monkeypatch.setattr(subprocess, 'run', _mock_run)
+    monkeypatch.setattr('tms.aoe_status._STALENESS_STATE_PATH', state_path)
+
     old_stderr = sys.stderr
-    sys.stderr = io.StringIO()
 
-    try:
-        def _mock_run(cmd, **kwargs):
-            result = subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr='')
-            if cmd[0] == 'aoe' and cmd[1] == 'list':
-                result.stdout = json.dumps(sessions)
-            elif cmd[0] == 'aoe' and cmd[1] == 'session' and cmd[2] == 'show':
-                result.stdout = json.dumps(sessions[0])
-            elif cmd[0] == 'tmux' and cmd[1] == 'capture-pane':
-                result.stdout = pane_lines
-            return result
-
-        monkeypatch.setattr(subprocess, 'run', _mock_run)
-        monkeypatch.setattr('tms.aoe_status._STALENESS_STATE_PATH', state_path)
-
-        # First call: stale for 10m but last logged at 7m — should emit
-        build_status_map(out_path)
-        events1 = sys.stderr.getvalue()
-
-        # Reset stderr
+    # Run 4 consecutive refreshes at the same stale_minutes (10m).
+    # Call 1: last_emitted=7, stale_minutes=10 → should emit
+    # Calls 2-4: last_emitted=10, stale_minutes=10 → should NOT emit
+    emitted_count = 0
+    for i in range(4):
         sys.stderr = io.StringIO()
-
-        # Second call: same state, same stale_minutes (10m), same last_emitted
-        # (the state file was updated to last_emitted_stale_minutes=10 by first call)
         build_status_map(out_path)
-        events2 = sys.stderr.getvalue()
+        events = sys.stderr.getvalue().strip()
+        if events:
+            emitted_count += 1
+            # Verify the event shape
+            event = json.loads(events)
+            assert event['type'] == 'staleness'
+            assert event['stale_minutes'] == 10
+        # Verify state file preserves last_emitted_stale_minutes
+        state = _load_staleness_state(state_path)
+        if 'feat-tms#56' in state:
+            lem = state['feat-tms#56'].get('last_emitted_stale_minutes')
+            assert lem == 10, (
+                f"call {i+1}: last_emitted_stale_minutes should be 10, "
+                f"got {lem}. state={state}"
+            )
 
-        # First call emits (10m != 7m)
-        assert len(events1.strip().split('\n')) == 1, (
-            f"first call should emit one event, got: {events1!r}"
-        )
-        # Second call should NOT emit (10m == 10m, same as last emitted)
-        assert events2.strip() == '', (
-            f"second call should not emit event, got: {events2!r}"
-        )
-    finally:
-        sys.stderr = old_stderr
+    sys.stderr = old_stderr
+
+    assert emitted_count == 1, (
+        f"expected 1 emission (on transition 7→10), got {emitted_count}"
+    )
+
+
+def test_build_status_map_no_dirty_write_when_marker_unchanged(tmp_path, monkeypatch):
+    """State file is NOT rewritten when only last_seen_at changes."""
+    out_path = str(tmp_path / 'status.tsv')
+    state_path = str(tmp_path / 'staleness.json')
+    now = 1752000000.0
+    monkeypatch.setattr(time, 'time', lambda: now)
+
+    _save_staleness_state(state_path, {
+        'feat-tms#56': {
+            'last_marker': '<<AGENT-STATE: WORKING>>',
+            'last_marker_at': now - 60,  # 1 min ago
+            'last_seen_at': now - 10,
+        },
+    })
+
+    sessions = [
+        {'id': 'abc123def456', 'title': 'feat-tms#56', 'status': 'running'},
+    ]
+    pane_lines = '<<AGENT-STATE: WORKING>>\n'
+
+    def _mock_run(cmd, **kwargs):
+        result = subprocess.CompletedProcess(args=cmd, returncode=0, stdout='', stderr='')
+        if cmd[0] == 'aoe' and cmd[1] == 'list':
+            result.stdout = json.dumps(sessions)
+        elif cmd[0] == 'aoe' and cmd[1] == 'session' and cmd[2] == 'show':
+            result.stdout = json.dumps(sessions[0])
+        elif cmd[0] == 'tmux' and cmd[1] == 'capture-pane':
+            result.stdout = pane_lines
+        return result
+
+    monkeypatch.setattr(subprocess, 'run', _mock_run)
+    monkeypatch.setattr('tms.aoe_status._STALENESS_STATE_PATH', state_path)
+
+    # Record the state file mtime before refresh.
+    mtime_before = os.path.getmtime(state_path)
+
+    build_status_map(out_path)
+
+    # Refresh again — nothing material changed (same marker, same marker_at).
+    build_status_map(out_path)
+
+    mtime_after = os.path.getmtime(state_path)
+    # The file should NOT have been rewritten.
+    assert mtime_after == mtime_before, (
+        f"state file rewritten unnecessarily: mtime {mtime_before} → {mtime_after}"
+    )
 
 
 # ── integration: build_status_map with staleness ──────────────────
