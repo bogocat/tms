@@ -1423,6 +1423,42 @@ case "${1:-}" in
         shift
         import_session "$@"
         ;;
+    events)
+        # tms events — fleet dispatch metrics (issue #53)
+        # Subcommands: transitions (poll aoe + tmux for state changes),
+        #              stats (compute and print aggregate report)
+        case "${2:-}" in
+            transitions)
+                PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" \
+                    python3 -m tms.events transitions
+                ;;
+            stats)
+                shift 2
+                PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" \
+                    python3 -m tms.events stats "$@"
+                ;;
+            -h|--help)
+                cat <<'EOF'
+tms events — fleet dispatch metrics (issue #53)
+
+Usage:
+  tms events transitions    poll aoe + tmux panes, emit transition events
+  tms events stats           compute and print aggregate metrics report
+
+Stats options:
+  --since YYYY-MM-DD        filter events from this date onward
+  --json                     output as JSON (machine-readable)
+
+See docs/events-format.md for the event log schema.
+EOF
+                ;;
+            *)
+                echo "tms events: unknown subcommand '${2:-}'" >&2
+                echo "Usage: tms events <transitions|stats>" >&2
+                exit 1
+                ;;
+        esac
+        ;;
     issues)
         if [[ "${2:-}" == "--raw" ]]; then
             raw_repo="${3:-}"

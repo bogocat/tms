@@ -31,7 +31,29 @@ tms clean            kill stale + compact scratch sessions
 tms issues [repo]    browse open GitHub issues + dispatch agents
 tms new              create a GitHub issue (gh issue create wrapper)
 tms import           wrap a legacy c/o/p scratch session as aoe
+tms events           fleet dispatch metrics (issue #53)
 ```
+
+### tms events — fleet dispatch metrics
+
+```
+tms events transitions    poll aoe + tmux panes, emit state-transition events
+tms events stats           compute and print aggregate metrics report
+tms events stats --json    machine-readable JSON output
+tms events stats --since YYYY-MM-DD   filter from date
+```
+
+Every `tmq` dispatch appends a JSONL event record. `tms events transitions`
+polls running sessions and emits transition events when `<<AGENT-STATE>>`
+markers change. `tms events stats` reads the event log and computes:
+- Issue→merge latency (p50/p90)
+- Review rounds per PR
+- BLOCKED frequency vs clean MERGE-READY
+- Plan-gate fast-path rate
+- Per-model outcome rates
+
+See [docs/events-format.md](docs/events-format.md) for the event log schema
+and consumer guide.
 
 ### tmq — issue → agent dispatcher
 
@@ -68,6 +90,19 @@ The session→issue mapping in tms reads the worktree branch directly (via
 `git -C <path> branch --show-current`) and falls back to parsing the aoe
 title only when the session is on a main checkout.
 
+## Event log (dispatch metrics)
+
+Fleet-wide dispatch metrics are stored in an append-only JSONL event log:
+
+```
+~/.local/state/tmq/events.jsonl    append-only event records (one JSON object/line)
+/tmp/tmq-last-status-cache.json    transition detector state (ephemeral)
+```
+
+Event types: `dispatch` (tmq spawn), `dispatch_failed` (spawn failure),
+`transition` (AGENT-STATE marker change). Full schema and consumer guide
+in [docs/events-format.md](docs/events-format.md).
+
 ## Dependencies
 
 - `tmux` — session substrate
@@ -80,7 +115,7 @@ title only when the session is on a main checkout.
 ## Development
 
 ```bash
-# Run the test suite (fast — 72 tests, ~0.4s)
+# Run the test suite (fast — 137 tests, ~0.5s)
 pytest tests/ -v
 
 # The pre-push hook runs the same tests before allowing a push.
