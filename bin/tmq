@@ -52,6 +52,13 @@ add_repo trip-planner        /root/projects/trip-planner        bogocat/trip-pla
 add_repo music-control       /root/projects/music-control       bogocat/music-control       0
 add_repo music-display       /root/projects/music-display       bogocat/music-display       0
 add_repo garden              /root/projects/garden              bogocat/garden              0
+# worktree=1: hostd (garmin-doctor-hostd.service) imports from this live tree, so
+# in-place branch switches would risk the running Max-sub bridge. See deploy/hostd.md.
+add_repo garmin-doctor       /root/projects/garmin-doctor       bogocat/garmin-doctor       1
+# worktree=1: LIVE skill tree -- ~/.claude/skills and ~/.pi/agent/skills symlink into
+# this repo, so an in-place branch switch instantly changes live skill content for
+# every running agent. Always isolate in a worktree.
+add_repo pi-dotfiles         /root/pi-dotfiles                  bogocat/pi-dotfiles         1
 
 # ── defaults ─────────────────────────────────────────────────────
 
