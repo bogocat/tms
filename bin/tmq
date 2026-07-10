@@ -32,7 +32,7 @@ add_repo() {
 
 add_repo distillery   /root/projects/distillery    bogocat/distillery    1
 add_repo home-portal  /root/projects/home-portal   bogocat/home-portal   1
-add_repo tower-fleet  /root/tower-fleet            bogocat/tower-fleet   0
+add_repo tower-fleet  /root/tower-fleet            bogocat/tower-fleet   1
 add_repo scripts      /root/scripts                bogocat/scripts       1
 add_repo palimpsest   /root/projects/palimpsest    bogocat/palimpsest    0
 add_repo rms          /root/projects/rms           bogocat/openrms       0
@@ -642,7 +642,7 @@ create_worktree() {
     local issue_json title branch slug wt_path
     issue_json=$(fetch_issue "$repo" "$issue_num")
     title=$(echo "$issue_json" | jq -r '.title')
-    branch="feat/issue-${issue_num}-$(slugify "$title" | cut -c1-30)"
+    branch="feat/issue-${issue_num}-$(slugify "$title" | cut -c1-30 | sed 's/-$//')"
     TMQ_BRANCH="$branch"
     slug="${repo}-${issue_num}"
     wt_path="/root/wt-${slug}"
