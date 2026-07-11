@@ -10,7 +10,7 @@ index abc1234..def5678 100644
 +    SELECT DISTINCT ON (
 +      COALESCE(abs_library_item_id, 'podcast:' || abs_episode_id)
 +    )
-+      id::text                    AS id,  -- planted: cast added but not in TS type
++      id::text                    AS id,
        abs_user_id                 AS "absUserId",
        abs_library_item_id         AS "absLibraryItemId",
        abs_episode_id              AS "absEpisodeId",
