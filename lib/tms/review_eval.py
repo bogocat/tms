@@ -27,6 +27,8 @@ import os
 import sys
 import uuid
 
+import yaml
+
 
 # ── Paths ─────────────────────────────────────────────────────────
 
@@ -542,15 +544,8 @@ def load_seeded_gold_manifest():
     """
     manifest_path = os.path.join(_SEEDED_GOLD_DIR, "manifest.yaml")
 
-    # We use a local import to keep pyyaml optional for tests.
-    # If pyyaml is not installed, fall back to a simple YAML parser
-    # that handles the subset our manifest uses.
-    try:
-        import yaml
-        with open(manifest_path) as f:
-            manifest = yaml.safe_load(f)
-    except ImportError:
-        manifest = _parse_simple_yaml(manifest_path)
+    with open(manifest_path) as f:
+        manifest = yaml.safe_load(f)
 
     if not isinstance(manifest, dict):
         raise ValueError(
@@ -687,105 +682,6 @@ def run_seeded_gold(reviewer_fn, seed_result_path=None):
         )
         results.append(result)
     return results
-
-
-def _parse_simple_yaml(path):
-    """Minimal YAML parser for the subset our manifest uses.
-
-    Handles: top-level mappings, list items (start with '-'),
-    string scalars (with > for folded blocks). Avoids pyyaml
-    dependency for tests and lightweight deploys.
-    """
-    import re
-
-    with open(path) as f:
-        text = f.read()
-
-    result = {}
-    in_fixtures = False
-    current_fixture = None
-    current_key = None
-    block_scalar = None
-    block_lines = []
-
-    for line in text.split("\n"):
-        # Skip comments and blank
-        stripped = line.strip()
-        if stripped.startswith("#") or not stripped:
-            if block_scalar:
-                block_lines.append(line)
-            continue
-
-        if block_scalar:
-            # Check if this is still the block scalar continuation
-            # (indented or starts with a non-key)
-            if line.startswith("  ") or line.startswith("\t"):
-                block_lines.append(stripped)
-                continue
-            else:
-                # End of block scalar
-                current_fixture[block_scalar] = " ".join(block_lines)
-                block_scalar = None
-                block_lines = []
-
-        # Top-level key
-        m = re.match(r'^(\w+):\s*$', line)
-        if m:
-            key = m.group(1)
-            if key == "fixtures":
-                result["fixtures"] = []
-                in_fixtures = True
-            continue
-
-        # Fixture list item
-        m = re.match(r'^\s+-\s+(\w+):\s*(.*)$', line)
-        if m and in_fixtures:
-            key = m.group(1)
-            val = m.group(2).strip()
-            if key == "id":
-                current_fixture = {}
-                result["fixtures"].append(current_fixture)
-            if current_fixture is not None:
-                current_fixture[key] = _parse_yaml_value(val)
-            continue
-
-        # Indented key-value
-        m = re.match(r'^\s+(\w+):\s*(.*)$', line)
-        if m and current_fixture is not None:
-            key = m.group(1)
-            val = m.group(2).strip()
-            if val == ">" or val == ">-":
-                block_scalar = key
-                block_lines = []
-            else:
-                current_fixture[key] = _parse_yaml_value(val)
-            continue
-
-    # Close any remaining block scalar
-    if block_scalar and current_fixture:
-        current_fixture[block_scalar] = " ".join(block_lines)
-
-    return result
-
-
-def _parse_yaml_value(val):
-    """Parse a YAML scalar value."""
-    val = val.strip()
-    if val in ("true", "True"):
-        return True
-    if val in ("false", "False"):
-        return False
-    if val in ("null", "~", ""):
-        return None
-    try:
-        return int(val)
-    except (ValueError, TypeError):
-        pass
-    # Remove surrounding quotes
-    if (val.startswith('"') and val.endswith('"')) or \
-       (val.startswith("'") and val.endswith("'")):
-        return val[1:-1]
-    return val
 
 
 # ── AC6: reports ──────────────────────────────────────────────────
