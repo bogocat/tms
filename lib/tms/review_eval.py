@@ -38,30 +38,42 @@ import yaml
 
 # ── Database connection ───────────────────────────────────────────
 
-# DSN for the unified postgres instance. tms_review schema lives
-# alongside bogocat schema in the postgres database at 10.89.97.212.
-# Tests monkeypatch _get_conn() to return a sqlite3 in-memory
-# connection; the SQL used is ANSI-standard so both backends work.
+# DSN for the unified postgres instance. Read from the fleet's
+# standard db.conf at runtime (same file consumed by distillery,
+# home-portal, and scripts). Tests monkeypatch _get_conn() to
+# return a sqlite3 in-memory connection.
 
-_DB_HOST = "10.89.97.212"
-_DB_DBNAME = "postgres"
-_DB_USER = "bogocat"
-_DB_PASSWORD = (
-    "9674a280d08654d9d8328d708cef5fd3ddf6244b9ac18c0a61382c8bca76faf6"
-)
+_DB_CONF_PATH = os.path.expanduser("~/.config/bogocat/db.conf")
+
+
+def _read_db_config():
+    """Parse db.conf into a dict {host, dbname, user, password}.
+
+    Format: space-separated key=value pairs on one line.
+    Example: host=10.89.97.212 dbname=postgres user=bogocat password=...
+    """
+    with open(_DB_CONF_PATH) as f:
+        raw = f.read().strip()
+    config = {}
+    for token in raw.split():
+        if "=" in token:
+            key, val = token.split("=", 1)
+            config[key.strip()] = val.strip()
+    return config
 
 
 def _get_conn():
     """Return a database connection.
 
-    In production: psycopg2 to unified postgres.
+    In production: psycopg2 to unified postgres via db.conf DSN.
     In tests: monkeypatched to sqlite3 in-memory.
     """
+    cfg = _read_db_config()
     return psycopg2.connect(
-        host=_DB_HOST,
-        dbname=_DB_DBNAME,
-        user=_DB_USER,
-        password=_DB_PASSWORD,
+        host=cfg["host"],
+        dbname=cfg["dbname"],
+        user=cfg["user"],
+        password=cfg["password"],
     )
 
 
@@ -231,10 +243,10 @@ def record_escaped_defect(
 
     _validate_attributions(attributions)
 
-    if defect_id is None:
-        defect_id = str(uuid.uuid4())
-        with _get_conn() as conn:
-            with conn.cursor() as cur:
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            if defect_id is None:
+                defect_id = str(uuid.uuid4())
                 cur.execute(
                     """INSERT INTO tms_review.escaped_defects
                        (defect_id, repo, introducing_pr,
@@ -250,12 +262,9 @@ def record_escaped_defect(
                         description, fix_pr,
                     ),
                 )
-            conn.commit()
 
-    # Write attribution rows (INSERT-only — re-judgment adds rows,
-    # never mutates originals)
-    with _get_conn() as conn:
-        with conn.cursor() as cur:
+            # Write attribution rows (INSERT-only — re-judgment adds
+            # rows, never mutates originals)
             for attr in attributions:
                 cur.execute(
                     """INSERT INTO tms_review.defect_attributions

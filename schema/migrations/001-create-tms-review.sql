@@ -83,9 +83,12 @@ CREATE INDEX idx_defect_attributions_run
     ON tms_review.defect_attributions (run_id);
 
 -- Grant: the bogocat role owns this schema (same role that owns
--- bogocat.*). Other roles access via the same DSN.
+-- bogocat.*). Existing tables get explicit grants; future tables
+-- get auto-grants via ALTER DEFAULT PRIVILEGES.
 
 GRANT ALL ON SCHEMA tms_review TO bogocat;
 GRANT ALL ON ALL TABLES IN SCHEMA tms_review TO bogocat;
+ALTER DEFAULT PRIVILEGES IN SCHEMA tms_review
+    GRANT ALL ON TABLES TO bogocat;
 
 COMMIT;
