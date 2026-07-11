@@ -1,0 +1,111 @@
+# Seeded-defect gold set v1 — mutation-testing precision/recall for reviewers
+#
+# Each entry is one carefully-mutated hunk with a known, planted defect.
+# The runner dispatches each fixture to each reviewer agent and records
+# detection. Combined with organic escaped-defect data, gives per-model,
+# per-defect-class detection and false-positive rates.
+#
+# All fixtures are synthetic — real patterns from fleet PRs, but the
+# mutations are planted. Runner records precision (did reviewer find it?)
+# and false-positives (did reviewer flag non-defects in the same fixture?).
+#
+# Format:
+#   fixtures:
+#     - id: unique-id
+#       defect_class: sql-syntax|logic|auth|schema|data-loss|perf|convention
+#       severity: critical|major|minor
+#       description: what the planted defect is
+#       expected_detection: true  # the defect IS present (for precision calc)
+#       known_false_positive: false  # if the diff also contains a trap
+#       fixture_file: fixtures/<id>.diff
+#       source_pattern: which real fleet pattern this is based on
+
+fixtures:
+  - id: sql-syntax-distinct-on
+    defect_class: sql-syntax
+    severity: critical
+    description: >
+      DISTINCT ON placed after ORDER BY instead of immediately after SELECT.
+      Based on the 2026-06-05 audiobook incident (home-portal#102).
+      PostgreSQL will reject this at parse time.
+    expected_detection: true
+    known_false_positive: false
+    fixture_file: fixtures/sql-syntax-distinct-on.diff
+    source_pattern: home-portal#102 DISTINCT ON / ORDER BY ordering
+
+  - id: logic-off-by-one
+    defect_class: logic
+    severity: major
+    description: >
+      Pagination limit computed as `min(limit, 51)` instead of `min(limit, 50)`,
+      allowing one extra row through. The comment says "max 50" but the code
+      allows 51. This is a common fleet pattern (Next.js API routes).
+    expected_detection: true
+    known_false_positive: false
+    fixture_file: fixtures/logic-off-by-one.diff
+    source_pattern: home-portal#214 pagination guards
+
+  - id: auth-missing-ownership-check
+    defect_class: auth
+    severity: critical
+    description: >
+      Resource query omits the user_id filter, allowing any authenticated user
+      to access another user's data. A SELECT with a where clause on resource
+      type but no owner check. The code comment says "only user's own items"
+      but the WHERE clause is missing.
+    expected_detection: true
+    known_false_positive: false
+    fixture_file: fixtures/auth-missing-ownership-check.diff
+    source_pattern: home-portal auth patterns
+
+  - id: schema-nullable-without-migration
+    defect_class: schema
+    severity: critical
+    description: >
+      A new NOT NULL column is added in a Drizzle schema without a
+      corresponding migration that provides default values for existing rows.
+      The migration file exists but the ALTER TABLE omits the DEFAULT clause,
+      so existing rows will fail the constraint.
+    expected_detection: true
+    known_false_positive: false
+    fixture_file: fixtures/schema-nullable-without-migration.diff
+    source_pattern: home-portal#87 nullable column trap
+
+  - id: data-loss-cascade-delete
+    defect_class: data-loss
+    severity: critical
+    description: >
+      Foreign key constraint with ON DELETE CASCADE where it should be
+      ON DELETE SET NULL. Deleting the parent silently destroys child rows
+      that should survive. Schema-level data loss risk.
+    expected_detection: true
+    known_false_positive: false
+    fixture_file: fixtures/data-loss-cascade-delete.diff
+    source_pattern: tower-fleet#193 data-integrity patterns
+
+  - id: perf-missing-index
+    defect_class: perf
+    severity: major
+    description: >
+      WHERE clause filters on a column that has no index, and the table is
+      expected to grow large. The query pattern is common (dashboard stats
+      with date range filtering), but the migration that adds the index is
+      missing from the hunk.
+    expected_detection: true
+    known_false_positive: false
+    fixture_file: fixtures/perf-missing-index.diff
+    source_pattern: home-portal#214 dashboard queries
+
+  - id: convention-unsafe-assertion
+    defect_class: convention
+    severity: minor
+    description: >
+      Test uses assert.deepEqual(a, b) without checking the keys exist first,
+      so type errors (undefined fields) pass silently. The test would pass
+      even if the function returned completely wrong type. The fixture also
+      has a valid logic change so the reviewer must distinguish the planted
+      convention defect from the valid change.
+    expected_detection: true
+    known_false_positive: true  # valid logic change could distract
+    fixture_file: fixtures/convention-unsafe-assertion.diff
+    source_pattern: tms#8 test patterns

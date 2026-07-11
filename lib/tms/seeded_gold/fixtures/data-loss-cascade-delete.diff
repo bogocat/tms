@@ -1,0 +1,31 @@
+diff --git a/src/db/schema.ts b/src/db/schema.ts
+index 999gggg..aaahhhh 100644
+--- a/src/db/schema.ts
++++ b/src/db/schema.ts
+@@ -90,7 +90,7 @@ export const mediaItems = pgTable('media_items', {
+ export const mediaRelations = relations(mediaItems, ({ one, many }) => ({
+   creator: one(mediaCreators, {
+     fields: [mediaItems.creatorId],
+-    references: [mediaCreators.id],
++    references: [mediaCreators.id],  // PLANTED DEFECT: FK should cascade SET NULL, not DELETE
+   }),
+ }))
+ 
+@@ -102,6 +102,6 @@ export const mediaCreators = pgTable('media_creators', {
+ export const mediaCreatorRelations = relations(mediaCreators, ({ many }) => ({
+   items: many(mediaItems, {
+-    // ON DELETE SET NULL — keep items if creator is removed
++    // PLANTED: changed to CASCADE — deletes all items when creator removed
+   }),
+ }))
+
+diff --git a/src/db/migrations/0010_add_creator_fk.sql b/src/db/migrations/0010_add_creator_fk.sql
+index iiiiiii..jjjjjjj 100644
+--- a/src/db/migrations/0010_add_creator_fk.sql
++++ b/src/db/migrations/0010_add_creator_fk.sql
+@@ -1,4 +1,4 @@
+ ALTER TABLE media_items
+   ADD CONSTRAINT fk_media_items_creator
+   FOREIGN KEY (creator_id) REFERENCES media_creators(id)
+-  ON DELETE SET NULL;
++  ON DELETE CASCADE;  -- PLANTED DEFECT: SET NULL → CASCADE — data loss on creator delete
