@@ -1237,46 +1237,6 @@ class TestBackfillAudiobookIncident:
         )
         assert len(attrs) >= 5  # 4 original + 1 new re-judgment
 
-    def test_backfill_data_matches_known_incident(self):
-        """The hardcoded backfill data matches the known incident details.
-
-        Verifies static facts (not dependent on local git repos):
-        - repo=home-portal, introducing_pr=102, defect_class=sql-syntax
-        - severity=critical, discovery_source=ci, fix_pr=102
-        - 1 author + 3 reviewer attributions
-
-        The git commit SHAs and attribution content are validated in
-        test_backfill_writes_defect_and_attributions. This test
-        guards that the backfill function's data contract matches
-        the known incident."""
-        # These are the static, immutable facts from the 2026-06-05
-        # audiobook DISTINCT ON incident (home-portal#102).
-        # They must never change without a corresponding incident doc.
-        incident_facts = {
-            "repo": "home-portal",
-            "introducing_pr": 102,
-            "defect_class": "sql-syntax",
-            "severity": "critical",
-            "discovery_source": "ci",
-            "fix_pr": 102,
-            "num_attributions": 4,  # 1 author + 3 reviewers
-            "description_contains": "DISTINCT ON",
-        }
-
-        # The backfill function encodes these facts. We don't call
-        # backfill_audiobook_incident() here because the test runs in
-        # a temp directory context — the data contract is tested in
-        # test_backfill_writes_defect_and_attributions.
-        #
-        # Instead, assert the static facts are self-consistent.
-        assert incident_facts["repo"] == "home-portal"
-        assert incident_facts["introducing_pr"] == 102
-        assert incident_facts["defect_class"] == "sql-syntax"
-        assert incident_facts["severity"] == "critical"
-        assert incident_facts["discovery_source"] == "ci"
-        assert incident_facts["fix_pr"] == 102
-        assert incident_facts["num_attributions"] == 4
-        assert "DISTINCT ON" in incident_facts["description_contains"]
 
 
 # ── AC1: reviewer_runs audit records ──────────────────────────────
