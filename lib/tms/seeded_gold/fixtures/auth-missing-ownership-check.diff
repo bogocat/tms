@@ -1,0 +1,14 @@
+diff --git a/src/lib/items/queries.ts b/src/lib/items/queries.ts
+index 444cccc..555dddd 100644
+--- a/src/lib/items/queries.ts
++++ b/src/lib/items/queries.ts
+@@ -25,9 +25,9 @@ export async function getUserItems(
+ ): Promise<Item[]> {
+   // Only return the user's own items
+   return await db.select()
+     .from(items)
+-    .where(eq(items.userId, userId))  // ownership check
++    .where(eq(items.type, type))     // PLANTED DEFECT: user_id filter removed
+     .orderBy(desc(items.updatedAt))
+     .limit(50)
+ }

@@ -1,0 +1,20 @@
+diff --git a/src/lib/dashboard/stats.ts b/src/lib/dashboard/stats.ts
+index kkkkkkk..lllllll 100644
+--- a/src/lib/dashboard/stats.ts
++++ b/src/lib/dashboard/stats.ts
+@@ -18,7 +18,7 @@ export async function getDashboardStats(
+   // Aggregate counts by type for the dashboard cards
+   const rows = await db.select({
+     type: items.type,
+-    count: count(items.id),
++    count: count(items.id),  // PLANTED: no index on items.created_at but query filters on it
+   })
+     .from(items)
+     .where(and(
+diff --git a/src/db/migrations/0011_add_items_created_at_index.sql b/src/db/migrations/0011_add_items_created_at_index.sql
+new file mode 100644
+index 0000000..mmmmmmm
+--- /dev/null
++++ b/src/db/migrations/0011_add_items_created_at_index.sql
+@@ -0,0 +1 @@
++-- PLANTED: this migration file exists but is EMPTY — the index was never created

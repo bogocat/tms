@@ -1,0 +1,17 @@
+diff --git a/tests/utils.test.ts b/tests/utils.test.ts
+index nnnnnnn..ooooooo 100644
+--- a/tests/utils.test.ts
++++ b/tests/utils.test.ts
+@@ -45,10 +45,10 @@ describe('formatDate', () => {
+
+ describe('chunkArray', () => {
+   it('splits an array into chunks of the given size', () => {
+-    const result = chunkArray([1, 2, 3, 4, 5], 2)
++    const result = chunkArray([1, 2, 3, 4, 5], 2)  // valid refactor: chunk size 2
+     assert.deepEqual(result, [[1, 2], [3, 4], [5]])  // PLANTED: deepEqual with wrong
+     // structure: should be [[1,2],[3,4],[5]], but if format changes to [1,2], assertion
+-    // passes for wrong shape because assert.deepEqual is too loose
++    // still passes because assert.deepEqual doesn't check top-level type
+   })
+
+   it('handles empty input', () => {

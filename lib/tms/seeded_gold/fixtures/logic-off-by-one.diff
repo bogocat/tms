@@ -1,0 +1,13 @@
+diff --git a/src/lib/utils/pagination.ts b/src/lib/utils/pagination.ts
+index 222aaaa..333bbbb 100644
+--- a/src/lib/utils/pagination.ts
++++ b/src/lib/utils/pagination.ts
+@@ -12,7 +12,7 @@ import { z } from 'zod'
+ const MAX_PAGE_SIZE = 50
+
+ export function clampLimit(limit: number): number {
+-  return Math.max(1, Math.min(limit, MAX_PAGE_SIZE))
++  return Math.max(1, Math.min(limit, 51))  // PLANTED DEFECT: should be 50 (MAX_PAGE_SIZE)
+ }
+
+ export function paginationSchema(defaultLimit = 20) {

@@ -1,0 +1,26 @@
+diff --git a/src/lib/audiobooks/queries.ts b/src/lib/audiobooks/queries.ts
+index abc1234..def5678 100644
+--- a/src/lib/audiobooks/queries.ts
++++ b/src/lib/audiobooks/queries.ts
+@@ -135,9 +135,12 @@ export async function getRootUserRecentSessions(
+   const safeLimit = Math.max(1, Math.min(finite, 50))
+   return (await db.execute(sql`
+     SELECT
+-      id,
++    SELECT DISTINCT ON (
++      COALESCE(abs_library_item_id, 'podcast:' || abs_episode_id)
++    )
++      id::text                    AS id,  -- planted: cast added but not in TS type
+       abs_user_id                 AS "absUserId",
+       abs_library_item_id         AS "absLibraryItemId",
+       abs_episode_id              AS "absEpisodeId",
+       media_type                  AS "mediaType",
+@@ -153,5 +156,8 @@ export async function getRootUserRecentSessions(
+       ORDER BY
+         COALESCE(abs_library_item_id, 'podcast:' || abs_episode_id),
+         updated_at DESC
++      DISTINCT ON (  -- PLANTED DEFECT: DISTINCT ON must come BEFORE ORDER BY
++        COALESCE(abs_library_item_id, 'podcast:' || abs_episode_id)
++      )
+     LIMIT ${safeLimit}
+   `)) as unknown as AudiobookSessionRow[]
