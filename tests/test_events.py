@@ -177,12 +177,51 @@ def test_log_dispatch_failed_event(test_db):
 
     conn = test_db()
     with conn.cursor() as cur:
-        cur.execute("SELECT event_type, reason, repo, issue FROM events")
+        cur.execute("SELECT event_type, reason, repo, issue, aoe_id_prefix FROM events")
         row = cur.fetchone()
     assert row[0] == "dispatch_failed"
     assert row[1] == "cc dispatch refused under root"
     assert row[2] == "tms"
     assert row[3] == 1
+    # P0 regression: aoe_id_prefix must NOT be NULL for UNIQUE idempotency
+    assert row[4] is not None
+    assert row[4] != ""
+    assert row[4].startswith("failed-")
+
+
+def test_dispatch_failed_idempotent(test_db):
+    """Re-inserting same dispatch_failed must not create duplicate rows.
+
+    P0 regression: NULL aoe_id_prefix bypasses UNIQUE index.
+    Now dispatch_failed gets a synthetic prefix for idempotency.
+    """
+    import datetime as dt
+    from unittest.mock import patch as mock_patch
+    from tms.events import log_dispatch_failed_event
+
+    # Freeze time so both calls get identical timestamps
+    frozen = dt.datetime(2026, 7, 1, 10, 0, 0, tzinfo=dt.timezone.utc)
+
+    with mock_patch("tms.events.datetime.datetime") as mock_dt:
+        mock_dt.now.return_value = frozen
+        mock_dt.fromisoformat = dt.datetime.fromisoformat
+        mock_dt.timezone = dt.timezone
+        with mock_patch("tms.events._resolve_default_model", return_value=("minimax", "MiniMax-M3")):
+            log_dispatch_failed_event(
+                repo="tms", issue=1, agent="cc", provider="", model="",
+                dispatch_type="feature", reason="cc dispatch refused under root",
+            )
+            log_dispatch_failed_event(
+                repo="tms", issue=1, agent="cc", provider="", model="",
+                dispatch_type="feature", reason="cc dispatch refused under root",
+            )
+
+    conn = test_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM events WHERE event_type = 'dispatch_failed'")
+        assert cur.fetchone()[0] == 1, (
+            "ON CONFLICT DO NOTHING should prevent duplicate dispatch_failed"
+        )
 
 
 # ── Phase 2: transition detection ─────────────────────────────────

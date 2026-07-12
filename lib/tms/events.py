@@ -90,9 +90,19 @@ def append_event(record: dict) -> None:
     forward compatibility; flat columns are denormalized query indices.
     """
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    event_ts = record.get("timestamp", now)
+    event_ts = record.get("timestamp") or now
     event_type = record.get("event_type", "")
     payload = json.dumps(record, ensure_ascii=False)
+
+    # Derive aoe_id_prefix: for dispatch_failed events (no aoe session),
+    # generate a synthetic deterministic prefix so the composite UNIQUE
+    # index catches duplicates. Same input → same prefix.
+    aoe_prefix = record.get("aoe_id_prefix") or ""
+    if not aoe_prefix and event_type == "dispatch_failed":
+        aoe_prefix = (
+            f"failed-{record.get('repo','')}-"
+            f"{record.get('issue','')}-{event_ts[:19]}"
+        )
 
     with _get_conn() as conn:
         with conn.cursor() as cur:
@@ -104,7 +114,9 @@ def append_event(record: dict) -> None:
                     aoe_id_prefix, reason, from_status, to_status,
                     payload)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
-                           %s, %s, %s, %s, %s, %s, %s, %s)""",
+                           %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (event_type, aoe_id_prefix, event_timestamp)
+                   DO NOTHING""",
                 (
                     str(uuid.uuid4()),
                     now,
@@ -118,7 +130,7 @@ def append_event(record: dict) -> None:
                     record.get("dispatch_type"),
                     record.get("worktree"),
                     record.get("session"),
-                    record.get("aoe_id_prefix"),
+                    aoe_prefix,
                     record.get("reason"),
                     record.get("from_status"),
                     record.get("to_status"),

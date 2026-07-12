@@ -21,8 +21,7 @@ BEGIN;
 CREATE TABLE tms_review.events (
     id              TEXT PRIMARY KEY,
     created_at      TEXT NOT NULL,
-    event_type      TEXT NOT NULL
-                    CHECK (event_type IN ('dispatch', 'dispatch_failed', 'transition')),
+    event_type      TEXT NOT NULL,
     event_timestamp TEXT NOT NULL,
     repo            TEXT,
     issue           INTEGER,

@@ -16,8 +16,7 @@ _CREATE_EVENTS_TABLE = """
 CREATE TABLE IF NOT EXISTS events (
     id              TEXT PRIMARY KEY,
     created_at      TEXT NOT NULL,
-    event_type      TEXT NOT NULL
-                    CHECK (event_type IN ('dispatch', 'dispatch_failed', 'transition')),
+    event_type      TEXT NOT NULL,
     event_timestamp TEXT NOT NULL,
     repo            TEXT,
     issue           INTEGER,
