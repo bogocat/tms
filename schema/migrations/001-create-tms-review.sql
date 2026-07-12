@@ -91,4 +91,11 @@ GRANT ALL ON ALL TABLES IN SCHEMA tms_review TO bogocat;
 ALTER DEFAULT PRIVILEGES IN SCHEMA tms_review
     GRANT ALL ON TABLES TO bogocat;
 
+-- Grant read-only access to bogocat_ro (fixes production gap —
+-- before this, bogocat_ro saw 0 tables in tms_review).
+GRANT USAGE ON SCHEMA tms_review TO bogocat_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA tms_review TO bogocat_ro;
+ALTER DEFAULT PRIVILEGES IN SCHEMA tms_review
+    GRANT SELECT ON TABLES TO bogocat_ro;
+
 COMMIT;

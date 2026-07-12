@@ -28,12 +28,49 @@ import pathlib
 import re
 import subprocess
 import sys
+import uuid
+
+import psycopg2
 
 
 # ── Paths ─────────────────────────────────────────────────────────
 
 EVENTS_PATH = os.path.expanduser("~/.local/state/tmq/events.jsonl")
 LAST_STATUS_PATH = "/tmp/tmq-last-status-cache.json"
+
+# ── Database connection ───────────────────────────────────────────
+
+_DB_CONF_PATH = os.path.expanduser("~/.config/bogocat/db.conf")
+
+
+def _read_db_config():
+    """Parse db.conf into a dict {host, dbname, user, password}.
+
+    Format: space-separated key=value pairs on one line.
+    """
+    with open(_DB_CONF_PATH) as f:
+        raw = f.read().strip()
+    config = {}
+    for token in raw.split():
+        if "=" in token:
+            key, val = token.split("=", 1)
+            config[key.strip()] = val.strip()
+    return config
+
+
+def _get_conn():
+    """Return a database connection.
+
+    In production: psycopg2 to unified postgres via db.conf DSN.
+    In tests: monkeypatched to sqlite3 in-memory.
+    """
+    cfg = _read_db_config()
+    return psycopg2.connect(
+        host=cfg["host"],
+        dbname=cfg["dbname"],
+        user=cfg["user"],
+        password=cfg["password"],
+    )
 
 # Regex for extracting AGENT-STATE markers from pane content.
 # Matches: <<AGENT-STATE: WORKING>>, <<AGENT-STATE: BLOCKED: reason>>
@@ -46,20 +83,61 @@ _AGENT_STATE_RE = re.compile(
 # ── Core append ───────────────────────────────────────────────────
 
 def append_event(record: dict) -> None:
-    """Append one JSONL record to the events file.
+    """INSERT one record into the tms_review.events table.
 
-    Uses open(path, 'a') for O_APPEND atomicity — safe for concurrent
-    writers as long as each write() call is ≤ PIPE_BUF (records are
-    always <1KB, well under the ~4KB limit). Does NOT use the repo's
-    atomic_write_* helpers which do temp+os.replace (whole-file replace,
-    would drop concurrent writes).
-
-    Creates the parent directory if it doesn't exist.
+    Replaces the JSONL append with a postgres INSERT (tms#65).
+    The payload column stores the canonical full JSON record for
+    forward compatibility; flat columns are denormalized query indices.
     """
-    os.makedirs(os.path.dirname(EVENTS_PATH), exist_ok=True)
-    line = json.dumps(record, ensure_ascii=False) + "\n"
-    with open(EVENTS_PATH, "a") as f:
-        f.write(line)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    event_ts = record.get("timestamp") or now
+    event_type = record.get("event_type", "")
+    payload = json.dumps(record, ensure_ascii=False)
+
+    # Derive aoe_id_prefix: for dispatch_failed events (no aoe session),
+    # generate a synthetic deterministic prefix so the composite UNIQUE
+    # index catches duplicates. Same input → same prefix.
+    aoe_prefix = record.get("aoe_id_prefix") or ""
+    if not aoe_prefix and event_type == "dispatch_failed":
+        aoe_prefix = (
+            f"failed-{record.get('repo','')}-"
+            f"{record.get('issue','')}-{event_ts[:19]}"
+        )
+
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO tms_review.events
+                   (id, created_at, event_type, event_timestamp,
+                    repo, issue, agent, provider, model,
+                    dispatch_type, worktree, session,
+                    aoe_id_prefix, reason, from_status, to_status,
+                    payload)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                           %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (event_type, aoe_id_prefix, event_timestamp)
+                   DO NOTHING""",
+                (
+                    str(uuid.uuid4()),
+                    now,
+                    event_type,
+                    event_ts,
+                    record.get("repo"),
+                    record.get("issue"),
+                    record.get("agent"),
+                    record.get("provider"),
+                    record.get("model"),
+                    record.get("dispatch_type"),
+                    record.get("worktree"),
+                    record.get("session"),
+                    aoe_prefix,
+                    record.get("reason"),
+                    record.get("from_status"),
+                    record.get("to_status"),
+                    payload,
+                ),
+            )
+        conn.commit()
 
 
 # ── Model resolution ──────────────────────────────────────────────
@@ -347,12 +425,55 @@ def _derived_tmux_session_name(title, aoe_id):
 
 
 # ── Stats computation ─────────────────────────────────────────────
-# Phase 3: read events.jsonl, compute aggregate stats.
-# These are stubs until Phase 3 implementation.
+# Reads from tms_review.events via _read_events_from_db().
+# The rest of the computation is identical to the JSONL version —
+# only the data source changed (tms#65).
+
+
+def _read_events_from_db(since=None):
+    """Read events from tms_review.events as dicts (mirrors JSONL format).
+
+    Deserializes payload column back to dicts. The events are ordered
+    by event_timestamp for deterministic stats (replaces JSONL append order).
+
+    Args:
+        since: optional ISO date string (YYYY-MM-DD) to filter events.
+    """
+    events = []
+    cutoff = None
+    if since:
+        cutoff = since if "T" in since else since + "T00:00:00+00:00"
+
+    try:
+        with _get_conn() as conn:
+            with conn.cursor() as cur:
+                if cutoff:
+                    cur.execute(
+                        """SELECT payload
+                           FROM tms_review.events
+                           WHERE event_timestamp >= %s
+                           ORDER BY event_timestamp, id""",
+                        (cutoff,),
+                    )
+                else:
+                    cur.execute(
+                        """SELECT payload
+                           FROM tms_review.events
+                           ORDER BY event_timestamp, id"""
+                    )
+                for (payload,) in cur.fetchall():
+                    try:
+                        events.append(json.loads(payload))
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+    except (psycopg2.OperationalError, psycopg2.DatabaseError, OSError):
+        pass
+
+    return events
 
 
 def compute_stats(since=None):
-    """Read events.jsonl and compute aggregate dispatch metrics.
+    """Read events from postgres and compute aggregate dispatch metrics.
 
     Args:
         since: optional ISO date string (YYYY-MM-DD) to filter events.
@@ -366,27 +487,8 @@ def compute_stats(since=None):
       - completed_sessions
       - per_model: {model: {dispatches, merged, blocked, avg_latency_seconds}}
     """
-    # Read all events
-    events = []
-    try:
-        if os.path.exists(EVENTS_PATH):
-            with open(EVENTS_PATH) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        events.append(json.loads(line))
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-    except OSError:
-        pass
-
-    # Filter by --since if provided
-    if since:
-        # Accept "YYYY-MM-DD" or full ISO timestamps
-        cutoff = since if "T" in since else since + "T00:00:00+00:00"
-        events = [e for e in events if e.get("timestamp", "") >= cutoff]
+    # Read all events from postgres (replaces JSONL file read)
+    events = _read_events_from_db(since)
 
     # Partition by event type
     dispatches = [e for e in events if e.get("event_type") == "dispatch"]

@@ -1,27 +1,31 @@
 # Event Log Format — Fleet Dispatch Metrics
 
-Canonical schema for the append-only JSONL event log at
-`~/.local/state/tmq/events.jsonl`. Consumed by `tms events stats`
-and designed for forward-compatible extension (tms#56 staleness
-watchdog, tower-fleet#193 downstream consumers).
+Canonical schema for the fleet dispatch event log, stored in
+`tms_review.events` (postgres) as of tms#65. Previously `~/.local/state/tmq/events.jsonl`
+(JSONL) until 2026-07-12.
 
-## File location
+Designed for forward-compatible extension (tms#56 staleness watchdog,
+tower-fleet#193 downstream consumers).
+
+## Storage location
 
 ```
-~/.local/state/tmq/events.jsonl
+tms_review.events (postgres, schema: tms_review)
 ```
 
-The directory is created on first write. Each record is one JSON
-object followed by a newline (JSONL / NDJSON). The file is append-only;
-no in-place edits or deletions.
+Each record is one row. The `payload` column stores the canonical
+full JSON record; flat columns (`repo`, `issue`, `agent`, etc.) are
+denormalized query indices.
+
+See `schema/migrations/002-create-events-table.sql` for the full DDL.
 
 ## Concurrency safety
 
-Records are written via `open(path, 'a')` (POSIX O_APPEND). A single
-`write()` call of one JSONL line is ≤ 1 KB, well under PIPE_BUF
-(~4 KB). POSIX guarantees these appends are atomic across processes
-without locking — concurrent tmq dispatches never produce torn lines
-or silently dropped events.
+Postgres handles concurrent INSERTs natively via MVCC. Multiple writers
+(tmq dispatch, cron-driven transition detection) can write simultaneously
+without lost updates or torn records. The composite UNIQUE index on
+`(event_type, aoe_id_prefix, event_timestamp)` prevents duplicates from
+re-entrant backfill runs.
 
 The `last_status.json` cache at `/tmp/tmq-last-status-cache.json`
 uses atomic replacement (tmp+`os.replace`) via `lib/tms/atomic.py`.
@@ -142,15 +146,18 @@ solve a non-problem and increase aoe API load for no statistical gain.
 
 | Consumer | How |
 |----------|-----|
-| `tms events stats` | Reads the full log, computes aggregate metrics |
+| `tms events stats` | Queries `tms_review.events` via `_read_events_from_db()`, computes aggregate metrics |
 | `tms events stats --json` | Outputs JSON for piping to downstream tools |
-| tms#56 (staleness watchdog) | Reads transition events, detects sessions stuck in a non-progressing state |
+| tms#56 (staleness watchdog) | Queries transition events via postgres |
 | tower-fleet#193 (open questions) | Q2/Q7/Q10/Q11 all need this data as baseline |
+| `scripts/backfill-events.py` | One-shot migration from legacy JSONL |
 
 ## Versioning
 
-The event log has no explicit version field. The `event_type`
-discriminator and additive-only schema (new fields are backward
-compatible for JSONL consumers that ignore unknown keys) serve as
-the compatibility contract. Breaking changes would require a new
-event type or a new log file path.
+The `event_type` discriminator and additive-only schema (new fields are
+backward compatible for consumers that ignore unknown keys) serve as
+the compatibility contract. Breaking changes require a new event type.
+
+The `payload` column stores the canonical JSON record for forward
+compatibility — new event types (e.g. tms#56 \`staleness\`) can add fields
+without ALTER TABLE.

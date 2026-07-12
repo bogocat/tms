@@ -92,11 +92,12 @@ title only when the session is on a main checkout.
 
 ## Event log (dispatch metrics)
 
-Fleet-wide dispatch metrics are stored in an append-only JSONL event log:
+Fleet-wide dispatch metrics are stored in postgres (migrated from JSONL, tms#65):
 
 ```
-~/.local/state/tmq/events.jsonl    append-only event records (one JSON object/line)
+tms_review.events                 dispatch/transition/failed events (postgres)
 /tmp/tmq-last-status-cache.json    transition detector state (ephemeral)
+~/.local/state/tmq/events.jsonl.bak.YYYY-MM-DD  legacy JSONL (migrated 2026-07-12)
 ```
 
 Event types: `dispatch` (tmq spawn), `dispatch_failed` (spawn failure),
