@@ -1,101 +1,60 @@
 """Tests for lib/tms/events.py — dispatch event logging, transition
-detection, and stats computation (issue #53).
+detection, and stats computation (issue #53, migrated to postgres #65).
+
+Database isolation: tests use the conftest.py test_db fixture which
+monkeypatches _get_conn() to return a sqlite3 in-memory connection.
+All data written by append_event() etc. lands in sqlite3, not postgres.
 """
 
 import json
-import multiprocessing
 import os
 import time
 from unittest.mock import patch
 
 import pytest
 
-# ── Phase 1: dispatch event appending ─────────────────────────────
+
+# ── Postgres migration tests (issue #65) ──────────────────────────
 
 
-def test_append_event_creates_file_and_writes_valid_jsonl(tmp_path, monkeypatch):
-    """append_event() must create the events file if it doesn't exist
-    and write a single valid JSONL record.
-    """
+def test_append_event_inserts_into_db(test_db):
+    """append_event() must INSERT into the events table, not write JSONL."""
     from tms.events import append_event
 
-    events_path = tmp_path / "events.jsonl"
-    monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
-
-    record = {"event_type": "dispatch", "repo": "tms", "issue": 53}
+    record = {"event_type": "dispatch", "repo": "tms", "issue": 65}
     append_event(record)
 
-    assert events_path.exists()
-    lines = events_path.read_text().strip().split("\n")
-    assert len(lines) == 1
-    parsed = json.loads(lines[0])
-    assert parsed["event_type"] == "dispatch"
-    assert parsed["repo"] == "tms"
-    assert parsed["issue"] == 53
+    conn = test_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT event_type, repo, issue, payload FROM events")
+        rows = cur.fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "dispatch"
+    assert rows[0][1] == "tms"
+    assert rows[0][2] == 65
+    # payload must be valid JSON
+    payload = json.loads(rows[0][3])
+    assert payload["event_type"] == "dispatch"
+    assert payload["repo"] == "tms"
 
 
-def test_append_event_appends_not_replaces(tmp_path, monkeypatch):
-    """Multiple append_event() calls must append lines, not replace."""
+def test_append_event_inserts_multiple_records(test_db):
+    """Multiple append_event() calls must INSERT multiple rows."""
     from tms.events import append_event
 
-    events_path = tmp_path / "events.jsonl"
-    monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
+    append_event({"event_type": "dispatch", "repo": "a"})
+    append_event({"event_type": "dispatch", "repo": "b"})
+    append_event({"event_type": "transition", "from_status": "WORKING"})
 
-    append_event({"n": 1})
-    append_event({"n": 2})
-    append_event({"n": 3})
-
-    lines = events_path.read_text().strip().split("\n")
-    assert len(lines) == 3
-    assert json.loads(lines[0]) == {"n": 1}
-    assert json.loads(lines[1]) == {"n": 2}
-    assert json.loads(lines[2]) == {"n": 3}
+    conn = test_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM events")
+        assert cur.fetchone()[0] == 3
 
 
-def test_append_event_concurrent_writers_no_torn_lines(tmp_path, monkeypatch):
-    """N concurrent append_event calls must produce exactly N valid JSON
-    records with no torn/partial lines. Uses O_APPEND which POSIX
-    guarantees atomic for writes ≤ PIPE_BUF (~4KB). A single JSONL
-    record is <1KB, so this test asserts correctness under fleet load.
-    """
-    from tms.events import append_event
-
-    events_path = tmp_path / "events.jsonl"
-    monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
-
-    N = 30
-
-    def writer(i):
-        append_event({"writer": i, "data": "x" * 200})
-
-    procs = [
-        multiprocessing.Process(target=writer, args=(i,))
-        for i in range(N)
-    ]
-    for p in procs:
-        p.start()
-    for p in procs:
-        p.join()
-        assert p.exitcode == 0
-
-    # Read all lines — every one must be valid JSON
-    content = events_path.read_text()
-    lines = [l for l in content.strip().split("\n") if l.strip()]
-    assert len(lines) == N, f"expected {N} records, got {len(lines)}"
-
-    for i, line in enumerate(lines):
-        try:
-            parsed = json.loads(line)
-            assert "writer" in parsed
-        except json.JSONDecodeError as e:
-            pytest.fail(f"line {i} is not valid JSON: {e}\nline: {line[:80]!r}")
-
-
-def test_log_dispatch_event_writes_all_fields(tmp_path, monkeypatch):
+def test_log_dispatch_event_writes_all_fields(test_db):
     """log_dispatch_event() must write a record with all required fields."""
-    from tms.events import log_dispatch_event, EVENTS_PATH
-
-    monkeypatch.setattr("tms.events.EVENTS_PATH", str(tmp_path / "events.jsonl"))
+    from tms.events import log_dispatch_event
 
     log_dispatch_event(
         repo="tms",
@@ -109,32 +68,33 @@ def test_log_dispatch_event_writes_all_fields(tmp_path, monkeypatch):
         aoe_id_prefix="abc12345",
     )
 
-    events_path = tmp_path / "events.jsonl"
-    record = json.loads(events_path.read_text().strip().split("\n")[0])
+    conn = test_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT event_type, repo, issue, agent, provider, model,
+                      dispatch_type, worktree, session, aoe_id_prefix, payload
+               FROM events"""
+        )
+        row = cur.fetchone()
+    assert row[0] == "dispatch"
+    assert row[1] == "tms"
+    assert row[2] == 53
+    assert row[3] == "pi"
+    assert row[4] == "minimax"
+    assert row[5] == "MiniMax-M3"
+    assert row[6] == "feature"
+    assert row[7] == "/root/wt-tms-53"
+    assert row[8] == "feat-tms#53"
+    assert row[9] == "abc12345"
+    # payload must be valid JSON with all fields
+    payload = json.loads(row[10])
+    assert payload["repo"] == "tms"
+    assert "timestamp" in payload  # ISO 8601
 
-    assert record["event_type"] == "dispatch"
-    assert record["repo"] == "tms"
-    assert record["issue"] == 53
-    assert record["agent"] == "pi"
-    assert record["provider"] == "minimax"
-    assert record["model"] == "MiniMax-M3"
-    assert record["dispatch_type"] == "feature"
-    assert record["worktree"] == "/root/wt-tms-53"
-    assert record["session"] == "feat-tms#53"
-    assert record["aoe_id_prefix"] == "abc12345"
-    assert "timestamp" in record
-    # timestamp must be ISO 8601
-    assert "T" in record["timestamp"]
 
-
-def test_log_dispatch_event_has_event_type_discriminator(tmp_path, monkeypatch):
-    """Every dispatch record must carry event_type="dispatch" from day 1
-    so tms#56 (stale-marker watchdog) can extend the same log without
-    a schema migration. See proposal-review finding from reviewer-claude.
-    """
+def test_log_dispatch_event_has_event_type_discriminator(test_db):
+    """Every dispatch record must carry event_type='dispatch'."""
     from tms.events import log_dispatch_event
-
-    monkeypatch.setattr("tms.events.EVENTS_PATH", str(tmp_path / "events.jsonl"))
 
     log_dispatch_event(
         repo="tms", issue=1, agent="pi", provider="", model="",
@@ -142,25 +102,16 @@ def test_log_dispatch_event_has_event_type_discriminator(tmp_path, monkeypatch):
         aoe_id_prefix="",
     )
 
-    record = json.loads(
-        (tmp_path / "events.jsonl").read_text().strip().split("\n")[0]
-    )
-    assert record["event_type"] == "dispatch"
+    conn = test_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT event_type FROM events")
+        assert cur.fetchone()[0] == "dispatch"
 
 
-def test_log_dispatch_event_resolves_default_model(tmp_path, monkeypatch):
-    """When provider/model are empty strings (default pi dispatch without
-    --provider/--model flags), log_dispatch_event should resolve the
-    actually-served model from pi's settings. Empty provider/model
-    makes per-model stats useless — we need the real value.
-    """
+def test_log_dispatch_event_resolves_default_model(test_db):
+    """When provider/model are empty, resolve from pi settings."""
     from tms.events import log_dispatch_event
 
-    events_path = tmp_path / "events.jsonl"
-    monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
-
-    # Mock the settings file with a known model
-    fake_settings = {"defaultModel": "deepseek-v4-pro"}
     with patch("tms.events._resolve_default_model", return_value=("deepseek", "deepseek-v4-pro")):
         log_dispatch_event(
             repo="tms", issue=1, agent="pi", provider="", model="",
@@ -168,19 +119,17 @@ def test_log_dispatch_event_resolves_default_model(tmp_path, monkeypatch):
             aoe_id_prefix="abc12345",
         )
 
-    record = json.loads(events_path.read_text().strip().split("\n")[0])
-    assert record["provider"] == "deepseek"
-    assert record["model"] == "deepseek-v4-pro"
+    conn = test_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT provider, model FROM events")
+        row = cur.fetchone()
+    assert row[0] == "deepseek"
+    assert row[1] == "deepseek-v4-pro"
 
 
-def test_log_dispatch_event_no_override_when_explicit_model(tmp_path, monkeypatch):
-    """When provider/model are explicitly passed (not empty), they must
-    be used as-is — don't override with the resolved default.
-    """
+def test_log_dispatch_event_no_override_when_explicit_model(test_db):
+    """Explicit provider/model must be used as-is."""
     from tms.events import log_dispatch_event
-
-    events_path = tmp_path / "events.jsonl"
-    monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
 
     log_dispatch_event(
         repo="tms", issue=1, agent="pi", provider="minimax", model="MiniMax-M3",
@@ -188,19 +137,17 @@ def test_log_dispatch_event_no_override_when_explicit_model(tmp_path, monkeypatc
         aoe_id_prefix="abc12345",
     )
 
-    record = json.loads(events_path.read_text().strip().split("\n")[0])
-    assert record["provider"] == "minimax"
-    assert record["model"] == "MiniMax-M3"
+    conn = test_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT provider, model FROM events")
+        row = cur.fetchone()
+    assert row[0] == "minimax"
+    assert row[1] == "MiniMax-M3"
 
 
-def test_append_event_handles_special_characters(tmp_path, monkeypatch):
-    """JSONL records with special characters (newlines in values, unicode,
-    quotes) must be written correctly as a single JSON line.
-    """
+def test_append_event_handles_special_characters(test_db):
+    """Records with special characters must be stored correctly."""
     from tms.events import append_event
-
-    events_path = tmp_path / "events.jsonl"
-    monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
 
     record = {
         "event_type": "dispatch",
@@ -209,11 +156,33 @@ def test_append_event_handles_special_characters(tmp_path, monkeypatch):
     }
     append_event(record)
 
-    lines = events_path.read_text().strip().split("\n")
-    assert len(lines) == 1, "special chars must not produce extra lines"
-    parsed = json.loads(lines[0])
+    conn = test_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM events")
+        payload = cur.fetchone()[0]
+    parsed = json.loads(payload)
     assert parsed["title"] == record["title"]
     assert parsed["body"] == record["body"]
+
+
+def test_log_dispatch_failed_event(test_db):
+    """dispatch_failed events must INSERT with reason field."""
+    from tms.events import log_dispatch_failed_event
+
+    with patch("tms.events._resolve_default_model", return_value=("minimax", "MiniMax-M3")):
+        log_dispatch_failed_event(
+            repo="tms", issue=1, agent="cc", provider="", model="",
+            dispatch_type="feature", reason="cc dispatch refused under root",
+        )
+
+    conn = test_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT event_type, reason, repo, issue FROM events")
+        row = cur.fetchone()
+    assert row[0] == "dispatch_failed"
+    assert row[1] == "cc dispatch refused under root"
+    assert row[2] == "tms"
+    assert row[3] == 1
 
 
 # ── Phase 2: transition detection ─────────────────────────────────
@@ -228,25 +197,17 @@ def _make_aoe_list_json(sessions):
     ])
 
 
-def _make_aoe_show_json(session_id, status="running"):
-    """Build a mock aoe session show --json response."""
-    return json.dumps({"id": session_id, "status": status})
-
-
 class TestDetectTransitions:
-    """Tests for detect_transitions() — polling aoe + tmux pane capture."""
+    """Tests for detect_transitions() — polling aoe + tmux pane capture.
 
-    def test_first_run_seeds_state_no_events(self, tmp_path, monkeypatch):
-        """On first run (no last_status.json), detect_transitions must
-        seed the state file with current statuses but emit NO transition
-        events. Spurious 'unknown→running' transitions on first poll
-        would permanently corrupt the stats.
-        """
+    Uses test_db fixture so append_event() writes to sqlite3.
+    """
+
+    def test_first_run_seeds_state_no_events(self, test_db, monkeypatch, tmp_path):
+        """On first run, detect_transitions must seed state but emit no events."""
         from tms.events import detect_transitions, LAST_STATUS_PATH
 
-        events_path = tmp_path / "events.jsonl"
         last_status_path = tmp_path / "last_status.json"
-        monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
         monkeypatch.setattr("tms.events.LAST_STATUS_PATH", str(last_status_path))
 
         # Mock: one session with PANE showing WORKING state
@@ -259,9 +220,6 @@ class TestDetectTransitions:
                         {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
                          "title": "feat-tms#53", "path": "/root/wt-tms-53"},
                     ]), "")
-            if cmd[:2] == ["aoe", "session"] and cmd[2] == "show":
-                return subprocess.CompletedProcess(
-                    cmd, 0, _make_aoe_show_json("abc12345"), "")
             if cmd[0] == "tmux" and "capture-pane" in cmd:
                 return subprocess.CompletedProcess(
                     cmd, 0,
@@ -277,24 +235,21 @@ class TestDetectTransitions:
         state = json.loads(last_status_path.read_text())
         assert "abc12345" in state
         assert state["abc12345"] == "WORKING"
-        # No events written
-        assert not events_path.exists() or events_path.read_text().strip() == ""
+        # No events written to DB
+        conn = test_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM events")
+            assert cur.fetchone()[0] == 0
 
-    def test_status_change_emits_transition_event(self, tmp_path, monkeypatch):
-        """When a session's AGENT-STATE marker changes between polls,
-        detect_transitions must emit a transition event.
-        """
+    def test_status_change_emits_transition_event(self, test_db, monkeypatch, tmp_path):
+        """When a session's status changes, emit a transition event."""
         from tms.events import detect_transitions, LAST_STATUS_PATH
 
-        events_path = tmp_path / "events.jsonl"
         last_status_path = tmp_path / "last_status.json"
-        monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
         monkeypatch.setattr("tms.events.LAST_STATUS_PATH", str(last_status_path))
 
         # Pre-seed: session was WORKING
         last_status_path.write_text(json.dumps({"abc12345": "WORKING"}))
-
-        call_count = [0]
 
         def fake_run(cmd, *args, **kwargs):
             import subprocess
@@ -305,12 +260,7 @@ class TestDetectTransitions:
                         {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
                          "title": "feat-tms#53", "path": "/root/wt-tms-53"},
                     ]), "")
-            if cmd[:2] == ["aoe", "session"] and cmd[2] == "show":
-                return subprocess.CompletedProcess(
-                    cmd, 0, _make_aoe_show_json("abc12345"), "")
             if cmd[0] == "tmux" and "capture-pane" in cmd:
-                call_count[0] += 1
-                # Now the pane shows PR-REVIEW
                 return subprocess.CompletedProcess(
                     cmd, 0,
                     "...\n<<AGENT-STATE: PR-REVIEW>>\nwaiting...", "")
@@ -321,23 +271,24 @@ class TestDetectTransitions:
             n = detect_transitions()
 
         assert n == 1, f"expected 1 transition, got {n}"
-        # Verify event was written
-        lines = events_path.read_text().strip().split("\n")
-        assert len(lines) == 1
-        event = json.loads(lines[0])
-        assert event["event_type"] == "transition"
-        assert event["from_status"] == "WORKING"
-        assert event["to_status"] == "PR-REVIEW"
-        assert event["aoe_id_prefix"] == "abc12345"
-        assert event["session"] == "feat-tms#53"
+        conn = test_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT event_type, from_status, to_status, aoe_id_prefix, session "
+                "FROM events"
+            )
+            row = cur.fetchone()
+        assert row[0] == "transition"
+        assert row[1] == "WORKING"
+        assert row[2] == "PR-REVIEW"
+        assert row[3] == "abc12345"
+        assert row[4] == "feat-tms#53"
 
-    def test_no_change_emits_no_event(self, tmp_path, monkeypatch):
-        """When the status hasn't changed, detect_transitions must emit 0 events."""
+    def test_no_change_emits_no_event(self, test_db, monkeypatch, tmp_path):
+        """When status hasn't changed, emit 0 events."""
         from tms.events import detect_transitions, LAST_STATUS_PATH
 
-        events_path = tmp_path / "events.jsonl"
         last_status_path = tmp_path / "last_status.json"
-        monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
         monkeypatch.setattr("tms.events.LAST_STATUS_PATH", str(last_status_path))
 
         last_status_path.write_text(json.dumps({"abc12345": "WORKING"}))
@@ -351,9 +302,6 @@ class TestDetectTransitions:
                         {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
                          "title": "feat-tms#53", "path": "/root/wt-tms-53"},
                     ]), "")
-            if cmd[:2] == ["aoe", "session"] and cmd[2] == "show":
-                return subprocess.CompletedProcess(
-                    cmd, 0, _make_aoe_show_json("abc12345"), "")
             if cmd[0] == "tmux" and "capture-pane" in cmd:
                 return subprocess.CompletedProcess(
                     cmd, 0, "still working\n<<AGENT-STATE: WORKING>>", "")
@@ -364,22 +312,18 @@ class TestDetectTransitions:
             n = detect_transitions()
 
         assert n == 0
-        # No events file written (or empty)
-        content = events_path.read_text() if events_path.exists() else ""
-        assert content.strip() == ""
+        conn = test_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM events")
+            assert cur.fetchone()[0] == 0
 
-    def test_session_disappearance_with_done_status_emits_terminal(self, tmp_path, monkeypatch):
-        """When a session that was DONE disappears from aoe list, emit a
-        terminal event. This is the common MERGE-READY→merge→cleanup path.
-        """
+    def test_session_disappearance_with_done_status_emits_terminal(self, test_db, monkeypatch, tmp_path):
+        """When a MERGE-READY session disappears, emit terminal event."""
         from tms.events import detect_transitions, LAST_STATUS_PATH
 
-        events_path = tmp_path / "events.jsonl"
         last_status_path = tmp_path / "last_status.json"
-        monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
         monkeypatch.setattr("tms.events.LAST_STATUS_PATH", str(last_status_path))
 
-        # Pre-seed: session was MERGE-READY
         last_status_path.write_text(json.dumps({
             "abc12345": "MERGE-READY",
             "fed67890": "WORKING",
@@ -388,17 +332,12 @@ class TestDetectTransitions:
         def fake_run(cmd, *args, **kwargs):
             import subprocess
             if cmd[:3] == ["aoe", "list", "--json"]:
-                # Only the WORKING session is still alive;
-                # MERGE-READY session has been cleaned up
                 return subprocess.CompletedProcess(
                     cmd, 0,
                     _make_aoe_list_json([
                         {"id": "fed67890-1234-1234-1234-1234567890ab",
                          "title": "feat-tms#54", "path": "/root/wt-tms-54"},
                     ]), "")
-            if cmd[:2] == ["aoe", "session"] and cmd[2] == "show":
-                return subprocess.CompletedProcess(
-                    cmd, 0, _make_aoe_show_json("fed67890"), "")
             if cmd[0] == "tmux" and "capture-pane" in cmd:
                 return subprocess.CompletedProcess(
                     cmd, 0, "<<AGENT-STATE: WORKING>>", "")
@@ -408,25 +347,22 @@ class TestDetectTransitions:
         with patch("tms.events.subprocess.run", side_effect=fake_run):
             n = detect_transitions()
 
-        assert n >= 1, "should emit at least the terminal event"
-        lines = events_path.read_text().strip().split("\n")
-        terminal_events = [
-            json.loads(l) for l in lines
-            if json.loads(l).get("to_status") == "terminal"
-        ]
-        assert len(terminal_events) == 1
-        assert terminal_events[0]["from_status"] == "MERGE-READY"
-        assert terminal_events[0]["aoe_id_prefix"] == "abc12345"
+        assert n >= 1
+        conn = test_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT from_status, to_status, aoe_id_prefix FROM events "
+                "WHERE to_status = 'terminal'"
+            )
+            row = cur.fetchone()
+        assert row[0] == "MERGE-READY"
+        assert row[2] == "abc12345"
 
-    def test_session_disappearance_with_non_terminal_status_skipped(self, tmp_path, monkeypatch):
-        """When a WORKING session disappears (crash, not merge), do NOT
-        emit a terminal event — that would inflate the terminal count.
-        """
+    def test_session_disappearance_with_non_terminal_status_skipped(self, test_db, monkeypatch, tmp_path):
+        """WORKING session disappearance must NOT emit terminal."""
         from tms.events import detect_transitions, LAST_STATUS_PATH
 
-        events_path = tmp_path / "events.jsonl"
         last_status_path = tmp_path / "last_status.json"
-        monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
         monkeypatch.setattr("tms.events.LAST_STATUS_PATH", str(last_status_path))
 
         last_status_path.write_text(json.dumps({"abc12345": "WORKING"}))
@@ -441,10 +377,10 @@ class TestDetectTransitions:
         with patch("tms.events.subprocess.run", side_effect=fake_run):
             n = detect_transitions()
 
-        assert n == 0, "non-terminal disappearance must emit 0 events"
+        assert n == 0
 
     def test_parse_agent_state_from_pane(self):
-        """_parse_agent_state_from_pane must extract the most recent marker."""
+        """Parse most recent marker from pane text."""
         from tms.events import _parse_agent_state_from_pane
 
         result = _parse_agent_state_from_pane(
@@ -453,7 +389,7 @@ class TestDetectTransitions:
         assert result == ("WORKING", None)
 
     def test_parse_agent_state_blocked_with_reason(self):
-        """BLOCKED markers carry a reason after the colon."""
+        """BLOCKED markers carry a reason after colon."""
         from tms.events import _parse_agent_state_from_pane
 
         result = _parse_agent_state_from_pane(
@@ -469,18 +405,15 @@ class TestDetectTransitions:
         assert result is None
 
     def test_parse_agent_state_ansi_escapes_stripped(self):
-        """ANSI escape sequences around the marker must not prevent matching.
-        Agents often color their output; the regex must work through it.
-        """
+        """ANSI escape sequences must not prevent matching."""
         from tms.events import _parse_agent_state_from_pane
 
-        # Simulated colored output
         pane = "\x1b[32m<<AGENT-STATE: WORKING>>\x1b[0m"
         result = _parse_agent_state_from_pane(pane)
         assert result == ("WORKING", None)
 
     def test_parse_agent_state_picks_last_of_multiple(self):
-        """When multiple markers exist, the LAST one wins (most recent)."""
+        """Last marker wins (most recent)."""
         from tms.events import _parse_agent_state_from_pane
 
         pane = (
@@ -493,13 +426,11 @@ class TestDetectTransitions:
         result = _parse_agent_state_from_pane(pane)
         assert result == ("PR-REVIEW", None)
 
-    def test_corrupted_last_status_handled_gracefully(self, tmp_path, monkeypatch):
+    def test_corrupted_last_status_handled_gracefully(self, test_db, monkeypatch, tmp_path):
         """Corrupt last_status.json must not crash — treat as first run."""
         from tms.events import detect_transitions, LAST_STATUS_PATH
 
-        events_path = tmp_path / "events.jsonl"
         last_status_path = tmp_path / "last_status.json"
-        monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
         monkeypatch.setattr("tms.events.LAST_STATUS_PATH", str(last_status_path))
 
         last_status_path.write_text("not valid json {{{ ")
@@ -513,9 +444,6 @@ class TestDetectTransitions:
                         {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
                          "title": "feat-tms#53", "path": "/root/wt-tms-53"},
                     ]), "")
-            if cmd[:2] == ["aoe", "session"] and cmd[2] == "show":
-                return subprocess.CompletedProcess(
-                    cmd, 0, _make_aoe_show_json("abc12345"), "")
             if cmd[0] == "tmux" and "capture-pane" in cmd:
                 return subprocess.CompletedProcess(
                     cmd, 0, "<<AGENT-STATE: WORKING>>", "")
@@ -525,36 +453,24 @@ class TestDetectTransitions:
         with patch("tms.events.subprocess.run", side_effect=fake_run):
             n = detect_transitions()
 
-        assert n == 0, "corrupted state file must not produce spurious events"
-        # Should have re-written valid JSON
+        assert n == 0
         state = json.loads(last_status_path.read_text())
         assert "abc12345" in state
 
     def test_derived_tmux_session_name_uses_8_char_prefix(self):
-        """P0 regression guard: _derived_tmux_session_name must use
-        the 8-char UUID prefix, not the full 16-char UUID.
-        aoe's actual tmux session names use only the first 8 chars.
-        """
+        """P0 regression: must use 8-char UUID prefix."""
         from tms.events import _derived_tmux_session_name
 
-        # Real aoe UUID: 16 hex chars (e.g., 6e803f602e914761)
         name = _derived_tmux_session_name(
             "feat-tms#53", "6e803f602e914761"
         )
-        assert name == "aoe_feat-tms_53_6e803f60", (
-            f"expected 8-char prefix, got: {name}"
-        )
+        assert name == "aoe_feat-tms_53_6e803f60"
 
-    def test_capture_pane_target_uses_correct_session_name(self, tmp_path, monkeypatch):
-        """P0 regression guard: the tmux capture-pane -t argument must
-        match aoe's actual 8-char-prefix naming convention.
-        Verifies the full pipeline end-to-end with a real 16-char UUID.
-        """
+    def test_capture_pane_target_uses_correct_session_name(self, test_db, monkeypatch, tmp_path):
+        """P0 regression: tmux capture-pane target must match 8-char prefix."""
         from tms.events import detect_transitions, LAST_STATUS_PATH
 
-        events_path = tmp_path / "events.jsonl"
         last_status_path = tmp_path / "last_status.json"
-        monkeypatch.setattr("tms.events.EVENTS_PATH", str(events_path))
         monkeypatch.setattr("tms.events.LAST_STATUS_PATH", str(last_status_path))
 
         captured_targets = []
@@ -568,11 +484,7 @@ class TestDetectTransitions:
                         {"id": "6e803f602e914761",
                          "title": "feat-tms#53", "path": "/root/wt-tms-53"},
                     ]), "")
-            if cmd[:2] == ["aoe", "session"] and cmd[2] == "show":
-                return subprocess.CompletedProcess(
-                    cmd, 0, _make_aoe_show_json("6e803f60"), "")
             if cmd[0] == "tmux" and "capture-pane" in cmd:
-                # Record the -t target for validation
                 if "-t" in cmd:
                     idx = cmd.index("-t")
                     if idx + 1 < len(cmd):
@@ -585,45 +497,39 @@ class TestDetectTransitions:
         with patch("tms.events.subprocess.run", side_effect=fake_run):
             detect_transitions()
 
-        # The capture-pane -t argument must use 8-char prefix, not 16
-        assert len(captured_targets) > 0, "capture-pane was never called"
-        assert captured_targets[0] == "aoe_feat-tms_53_6e803f60", (
-            f"expected 8-char prefix target, got: {captured_targets[0]}"
-        )
+        assert len(captured_targets) > 0
+        assert captured_targets[0] == "aoe_feat-tms_53_6e803f60"
 
 
 # ── Phase 3: stats computation ───────────────────────────────────
 
 
-def _write_fixture_events(tmp_path, records):
-    """Write fixture event records to a temp events.jsonl."""
-    path = tmp_path / "events.jsonl"
-    with open(path, "w") as f:
-        for r in records:
-            f.write(json.dumps(r) + "\n")
-    return str(path)
+def _insert_fixture_events(test_db_conn, records):
+    """Insert fixture event records directly into the test DB.
+
+    Uses the same append_event path so payload/flat columns are consistent.
+    """
+    from tms.events import append_event
+
+    for r in records:
+        append_event(r)
 
 
 class TestComputeStats:
-    """Tests for compute_stats() — aggregate metrics from events.jsonl."""
+    """Tests for compute_stats() — aggregate metrics from postgres."""
 
-    def test_empty_log_returns_zeros(self, tmp_path, monkeypatch):
-        """Empty events file → all zeros, no crash."""
+    def test_empty_log_returns_zeros(self, test_db):
+        """Empty table → all zeros, no crash."""
         from tms.events import compute_stats
-
-        events_path = _write_fixture_events(tmp_path, [])
-        monkeypatch.setattr("tms.events.EVENTS_PATH", events_path)
 
         stats = compute_stats()
         assert stats["total_dispatches"] == 0
         assert stats["total_transitions"] == 0
         assert stats["per_model"] == {}
 
-    def test_counts_dispatch_and_transition_events(self, tmp_path, monkeypatch):
-        """compute_stats must distinguish dispatch/transition/failed events."""
-        from tms.events import compute_stats
-
-        events_path = _write_fixture_events(tmp_path, [
+    def test_counts_dispatch_and_transition_events(self, test_db):
+        """compute_stats must distinguish event types."""
+        _insert_fixture_events(test_db, [
             {"event_type": "dispatch", "timestamp": "2026-07-01T10:00:00+00:00",
              "repo": "tms", "issue": 1, "agent": "pi",
              "provider": "minimax", "model": "MiniMax-M3",
@@ -642,22 +548,18 @@ class TestComputeStats:
              "session": "feat-tms#1", "aoe_id_prefix": "aaa",
              "from_status": "WORKING", "to_status": "PR-REVIEW"},
         ])
-        monkeypatch.setattr("tms.events.EVENTS_PATH", events_path)
+
+        from tms.events import compute_stats
 
         stats = compute_stats()
-        assert stats["total_dispatches"] == 2  # successful only
+        assert stats["total_dispatches"] == 2
         assert stats["total_failed_dispatches"] == 1
         assert stats["total_transitions"] == 1
 
-    def test_plan_gate_fast_path_detection(self, tmp_path, monkeypatch):
-        """Fast-path: dispatch→WORKING without intervening PLAN-REVIEW.
-        Normal path: dispatch→PLAN-REVIEW→WORKING.
-        """
-        from tms.events import compute_stats
-
-        # Session aaa: fast path (fix type, no PLAN-REVIEW)
-        # Session bbb: normal path (PLAN-REVIEW→WORKING)
-        events_path = _write_fixture_events(tmp_path, [
+    def test_plan_gate_fast_path_detection(self, test_db):
+        """Fast path: no PLAN-REVIEW. Normal: has PLAN-REVIEW."""
+        _insert_fixture_events(test_db, [
+            # aaa: fast path
             {"event_type": "dispatch", "timestamp": "2026-07-01T10:00:00+00:00",
              "repo": "tms", "issue": 1, "agent": "pi",
              "provider": "deepseek", "model": "deepseek-v4-pro",
@@ -666,6 +568,7 @@ class TestComputeStats:
             {"event_type": "transition", "timestamp": "2026-07-01T10:01:00+00:00",
              "session": "fix-tms#1", "aoe_id_prefix": "aaa",
              "from_status": "WORKING", "to_status": "MERGE-READY"},
+            # bbb: normal path
             {"event_type": "dispatch", "timestamp": "2026-07-01T11:00:00+00:00",
              "repo": "tms", "issue": 2, "agent": "pi",
              "provider": "minimax", "model": "MiniMax-M3",
@@ -675,48 +578,41 @@ class TestComputeStats:
              "session": "feat-tms#2", "aoe_id_prefix": "bbb",
              "from_status": "PLAN-REVIEW", "to_status": "WORKING"},
         ])
-        monkeypatch.setattr("tms.events.EVENTS_PATH", events_path)
+
+        from tms.events import compute_stats
 
         stats = compute_stats()
-        # aaa: fix type → auto fast-path (no PLAN-REVIEW seen before WORKING)
-        # bbb: PLAN-REVIEW→WORKING → normal path
         assert stats["fast_path_count"] == 1
         assert stats["normal_path_count"] == 1
 
-    def test_review_rounds_counting(self, tmp_path, monkeypatch):
+    def test_review_rounds_counting(self, test_db):
         """PR-REVIEW→WORKING transitions count as review rounds."""
-        from tms.events import compute_stats
-
-        events_path = _write_fixture_events(tmp_path, [
+        _insert_fixture_events(test_db, [
             {"event_type": "dispatch", "timestamp": "2026-07-01T10:00:00+00:00",
              "repo": "tms", "issue": 1, "agent": "pi",
              "provider": "deepseek", "model": "deepseek-v4-pro",
              "dispatch_type": "feature", "session": "feat-tms#1",
              "aoe_id_prefix": "aaa"},
-            # Round 1
             {"event_type": "transition", "timestamp": "2026-07-01T11:00:00+00:00",
              "session": "feat-tms#1", "aoe_id_prefix": "aaa",
              "from_status": "PR-REVIEW", "to_status": "WORKING"},
-            # Round 2
             {"event_type": "transition", "timestamp": "2026-07-01T12:00:00+00:00",
              "session": "feat-tms#1", "aoe_id_prefix": "aaa",
              "from_status": "PR-REVIEW", "to_status": "WORKING"},
-            # Done
             {"event_type": "transition", "timestamp": "2026-07-01T13:00:00+00:00",
              "session": "feat-tms#1", "aoe_id_prefix": "aaa",
              "from_status": "WORKING", "to_status": "MERGE-READY"},
         ])
-        monkeypatch.setattr("tms.events.EVENTS_PATH", events_path)
+
+        from tms.events import compute_stats
 
         stats = compute_stats()
         assert stats["review_rounds_total"] == 2
-        assert stats["review_rounds_avg"] == 2.0  # 1 session, 2 rounds
+        assert stats["review_rounds_avg"] == 2.0
 
-    def test_blocked_rate(self, tmp_path, monkeypatch):
+    def test_blocked_rate(self, test_db):
         """BLOCKED transitions vs MERGE-READY transitions."""
-        from tms.events import compute_stats
-
-        events_path = _write_fixture_events(tmp_path, [
+        _insert_fixture_events(test_db, [
             {"event_type": "dispatch", "timestamp": "2026-07-01T10:00:00+00:00",
              "repo": "tms", "issue": 1, "agent": "pi",
              "provider": "deepseek", "model": "deepseek-v4-pro",
@@ -734,20 +630,18 @@ class TestComputeStats:
              "session": "feat-tms#2", "aoe_id_prefix": "bbb",
              "from_status": "WORKING", "to_status": "MERGE-READY"},
         ])
-        monkeypatch.setattr("tms.events.EVENTS_PATH", events_path)
+
+        from tms.events import compute_stats
 
         stats = compute_stats()
         assert stats["blocked_count"] == 1
         assert stats["merge_ready_count"] == 1
-        # blocked_rate = blocked / (blocked + merge_ready) = 0.5
         assert stats["blocked_rate"] == 0.5
 
-    def test_per_model_outcomes(self, tmp_path, monkeypatch):
-        """Per-model stats: dispatch counts, terminal outcomes."""
-        from tms.events import compute_stats
-
-        events_path = _write_fixture_events(tmp_path, [
-            # Minimax dispatch + merge
+    def test_per_model_outcomes(self, test_db):
+        """Per-model: dispatch counts, merged, blocked."""
+        _insert_fixture_events(test_db, [
+            # Minimax → merged
             {"event_type": "dispatch", "timestamp": "2026-07-01T10:00:00+00:00",
              "repo": "tms", "issue": 1, "agent": "pi",
              "provider": "minimax", "model": "MiniMax-M3",
@@ -759,7 +653,7 @@ class TestComputeStats:
             {"event_type": "transition", "timestamp": "2026-07-01T14:00:00+00:00",
              "session": "feat-tms#1", "aoe_id_prefix": "aaa",
              "from_status": "MERGE-READY", "to_status": "terminal"},
-            # DeepSeek dispatch + blocked
+            # DeepSeek → blocked
             {"event_type": "dispatch", "timestamp": "2026-07-02T10:00:00+00:00",
              "repo": "tms", "issue": 2, "agent": "pi",
              "provider": "deepseek", "model": "deepseek-v4-pro",
@@ -768,34 +662,29 @@ class TestComputeStats:
             {"event_type": "transition", "timestamp": "2026-07-02T11:00:00+00:00",
              "session": "feat-tms#2", "aoe_id_prefix": "bbb",
              "from_status": "WORKING", "to_status": "BLOCKED"},
-            # Another minimax dispatch (still in progress, no terminal)
+            # Another minimax (in progress)
             {"event_type": "dispatch", "timestamp": "2026-07-03T10:00:00+00:00",
              "repo": "tms", "issue": 3, "agent": "pi",
              "provider": "minimax", "model": "MiniMax-M3",
              "dispatch_type": "feature", "session": "feat-tms#3",
              "aoe_id_prefix": "ccc"},
         ])
-        monkeypatch.setattr("tms.events.EVENTS_PATH", events_path)
+
+        from tms.events import compute_stats
 
         stats = compute_stats()
         pm = stats["per_model"]
-
-        # Minimax: 2 dispatches, 1 merged, 1 in-progress
         assert "MiniMax-M3" in pm
         assert pm["MiniMax-M3"]["dispatches"] == 2
         assert pm["MiniMax-M3"]["merged"] == 1
-
-        # DeepSeek: 1 dispatch, 0 merged, 1 blocked
         assert "deepseek-v4-pro" in pm
         assert pm["deepseek-v4-pro"]["dispatches"] == 1
         assert pm["deepseek-v4-pro"]["merged"] == 0
         assert pm["deepseek-v4-pro"]["blocked"] == 1
 
-    def test_latency_computation(self, tmp_path, monkeypatch):
-        """Issue→merge latency: dispatch timestamp → terminal/DONE timestamp."""
-        from tms.events import compute_stats
-
-        events_path = _write_fixture_events(tmp_path, [
+    def test_latency_computation(self, test_db):
+        """Issue→merge latency from dispatch timestamp → terminal."""
+        _insert_fixture_events(test_db, [
             {"event_type": "dispatch", "timestamp": "2026-07-01T10:00:00+00:00",
              "repo": "tms", "issue": 1, "agent": "pi",
              "provider": "minimax", "model": "MiniMax-M3",
@@ -807,7 +696,7 @@ class TestComputeStats:
             {"event_type": "transition", "timestamp": "2026-07-01T15:00:00+00:00",
              "session": "feat-tms#1", "aoe_id_prefix": "aaa",
              "from_status": "MERGE-READY", "to_status": "terminal"},
-            # Second issue, faster
+            # Faster second issue
             {"event_type": "dispatch", "timestamp": "2026-07-02T10:00:00+00:00",
              "repo": "tms", "issue": 2, "agent": "pi",
              "provider": "deepseek", "model": "deepseek-v4-pro",
@@ -817,21 +706,18 @@ class TestComputeStats:
              "session": "fix-tms#2", "aoe_id_prefix": "bbb",
              "from_status": "WORKING", "to_status": "terminal"},
         ])
-        monkeypatch.setattr("tms.events.EVENTS_PATH", events_path)
 
-        stats = compute_stats()
-        # Issue 1: 10:00→15:00 = 5 hours = 18000 seconds
-        # Issue 2: 10:00→10:30 = 0.5 hours = 1800 seconds
-        # p50 of [1800, 18000] = (1800+18000)/2 = 9900
-        assert stats["latency_p50_seconds"] == pytest.approx(9900, abs=1)
-        # p90 of 2 values: linear interp → 16380
-        assert stats["latency_p90_seconds"] == pytest.approx(16380, abs=1)
-
-    def test_since_filter(self, tmp_path, monkeypatch):
-        """--since filter must exclude events before the cutoff date."""
         from tms.events import compute_stats
 
-        events_path = _write_fixture_events(tmp_path, [
+        stats = compute_stats()
+        # Issue 1: 5h = 18000s. Issue 2: 30m = 1800s
+        # p50 of [1800, 18000] = 9900
+        assert stats["latency_p50_seconds"] == pytest.approx(9900, abs=1)
+        assert stats["latency_p90_seconds"] == pytest.approx(16380, abs=1)
+
+    def test_since_filter(self, test_db):
+        """--since filter must exclude events before cutoff."""
+        _insert_fixture_events(test_db, [
             {"event_type": "dispatch", "timestamp": "2026-06-01T10:00:00+00:00",
              "repo": "tms", "issue": 1, "agent": "pi",
              "provider": "minimax", "model": "MiniMax-M3",
@@ -843,7 +729,8 @@ class TestComputeStats:
              "dispatch_type": "feature", "session": "new",
              "aoe_id_prefix": "new"},
         ])
-        monkeypatch.setattr("tms.events.EVENTS_PATH", events_path)
+
+        from tms.events import compute_stats
 
         stats = compute_stats(since="2026-07-01")
         assert stats["total_dispatches"] == 1
@@ -851,8 +738,8 @@ class TestComputeStats:
         assert "deepseek-v4-pro" in pm
         assert "MiniMax-M3" not in pm
 
-    def test_format_stats_report_text(self, tmp_path, monkeypatch, capsys):
-        """format_stats_report in text mode must print a readable report."""
+    def test_format_stats_report_text(self, test_db, capsys):
+        """format_stats_report text mode prints readable report."""
         from tms.events import format_stats_report
 
         stats = {
@@ -887,7 +774,7 @@ class TestComputeStats:
         assert "MiniMax-M3" in out
         assert "deepseek-v4-pro" in out
 
-    def test_format_stats_report_json(self, tmp_path, monkeypatch, capsys):
+    def test_format_stats_report_json(self, test_db, capsys):
         """format_stats_report --json must output valid JSON."""
         from tms.events import format_stats_report
 
