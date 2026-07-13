@@ -99,16 +99,30 @@ def _enclosing_if_line(lines, cmd_prefix):
     """Return the text of the `if ...` line that immediately encloses the
     first line beginning (after indent) with `cmd_prefix`.
 
-    Walks backward line-by-line from the command to the nearest line that
-    starts (after indent) with `if ` — that is the command's own gate, not
-    some earlier unrelated `if` block.
+    Walks backward line-by-line from the command, tracking `if`/`fi` nesting
+    so an intervening closed `if ... fi` block can't masquerade as the
+    enclosing gate. The first un-closed `if ` line reached (at depth 0) is
+    the command's own gate.
     """
     cmd_i = next(
-        i for i, ln in enumerate(lines) if ln.lstrip().startswith(cmd_prefix)
+        (i for i, ln in enumerate(lines) if ln.lstrip().startswith(cmd_prefix)),
+        None,
     )
+    if cmd_i is None:
+        raise AssertionError(f"no line starting with `{cmd_prefix}` found")
+
+    # Walk backward, tracking nesting: a `fi` at the start of a line means
+    # we've dipped into a *more deeply nested* block (skip past its matching
+    # `if`); an un-closed `if` is our enclosing gate.
+    depth = 0
     for j in range(cmd_i - 1, -1, -1):
-        if lines[j].lstrip().startswith("if "):
-            return lines[j]
+        stripped = lines[j].lstrip()
+        if stripped.startswith("fi"):
+            depth += 1
+        elif stripped.startswith("if "):
+            if depth == 0:
+                return lines[j]
+            depth -= 1
     raise AssertionError(f"no enclosing `if` found for `{cmd_prefix}` call")
 
 
