@@ -372,6 +372,15 @@ PROMPT
 
 # ── session spawn ────────────────────────────────────────────────
 
+# Returns 0 (true) iff opt-in auto-attach is requested via TMS_TMQ_LAUNCH=1.
+# Only the literal "1" opts in — empty/garbage/common-truthy stay out so env
+# noise can't accidentally drop the user into an agent session. Default
+# (unset) is dispatch-then-return. Extracted to its own function so the
+# pytest suite can source the script and exercise it directly. (tms#12)
+_tmq_want_auto_attach() {
+    [[ "${TMS_TMQ_LAUNCH:-}" == "1" ]]
+}
+
 spawn_agent() {
     local session_name=$1 cwd=$2 prompt=$3 agent=$4 branch=$5
     local dispatch_repo=${6:-} dispatch_issue=${7:-} dispatch_type=${8:-}
@@ -452,6 +461,18 @@ spawn_agent() {
         # session sits idle in the dashboard and the agent never runs.)
         if (( add_ok )); then
             aoe session start "$session_name" 2>&1 && start_ok=1 || true
+        fi
+
+        # TMS_TMQ_LAUNCH=1: opt-in auto-attach for direct `tmq` invocations.
+        # Switches the user's tmux client into the RUNNING session (blocks
+        # until detach, which is the whole point — drop straight in). The
+        # default (unset) preserves the tms dispatch-then-return flow: fzf
+        # returns to the issue list instead of dropping into the agent pane.
+        # `start` above already launched the agent, so attach is purely the
+        # client switch — it must not replace start (attach alone may not
+        # spawn the tmux process). (tms#12)
+        if (( start_ok )) && _tmq_want_auto_attach; then
+            aoe session attach "$session_name" 2>&1 || true
         fi
 
         if (( add_ok && start_ok )); then
@@ -905,26 +926,30 @@ main() {
 }
 
 # ── dispatch ─────────────────────────────────────────────────────
-
-case "${1:-}" in
-    list|ls)
-        if [[ "${2:-}" == "--machine" ]]; then
-            list_repos_machine
-        else
-            list_repos
-        fi
-        ;;
-    review|pr)
-        shift
-        main "${@}" --type review
-        ;;
-    -h|--help)
-        usage
-        ;;
-    *)
-        if [[ -z "${1:-}" ]]; then
+# Guarded so the script can be sourced (e.g. by the pytest suite) without
+# running the dispatch below — sourcing then exposes every function above
+# for unit testing. (tms#12)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    case "${1:-}" in
+        list|ls)
+            if [[ "${2:-}" == "--machine" ]]; then
+                list_repos_machine
+            else
+                list_repos
+            fi
+            ;;
+        review|pr)
+            shift
+            main "${@}" --type review
+            ;;
+        -h|--help)
             usage
-        fi
-        main "$@"
-        ;;
-esac
+            ;;
+        *)
+            if [[ -z "${1:-}" ]]; then
+                usage
+            fi
+            main "$@"
+            ;;
+    esac
+fi
