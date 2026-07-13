@@ -34,16 +34,19 @@ tms import           wrap a legacy c/o/p scratch session as aoe
 tms events           fleet dispatch metrics (issue #53)
 ```
 
-### tms events — fleet dispatch metrics
+### tms events — fleet dispatch metrics + review poller
 
 ```
 tms events transitions    poll aoe + tmux panes, emit state-transition events
 tms events stats           compute and print aggregate metrics report
 tms events stats --json    machine-readable JSON output
 tms events stats --since YYYY-MM-DD   filter from date
+tms events scan-reviews    list open PRs lacking reviewer verdicts (#57)
+tms events scan-reviews --dispatch    spawn tmq review for never-reviewed PRs
 ```
 
-Every `tmq` dispatch appends a JSONL event record. `tms events transitions`
+Every `tmq` dispatch appends an event record to `tms_review.events`
+(postgres). `tms events transitions`
 polls running sessions and emits transition events when `<<AGENT-STATE>>`
 markers change. `tms events stats` reads the event log and computes:
 - Issue→merge latency (p50/p90)

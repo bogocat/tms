@@ -145,6 +145,41 @@ def test_log_dispatch_event_no_override_when_explicit_model(test_db):
     assert row[1] == "MiniMax-M3"
 
 
+def test_log_dispatch_event_default_source_is_author(test_db):
+    """Default source must be 'author' (tms#57: author self-trigger)."""
+    from tms.events import log_dispatch_event
+
+    log_dispatch_event(
+        repo="tms", issue=1, agent="pi", provider="", model="",
+        dispatch_type="feature", worktree="/tmp/wt", session="feat-tms#1",
+        aoe_id_prefix="",
+    )
+    conn = test_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM events")
+        payload = json.loads(cur.fetchone()[0])
+    assert payload.get("source") == "author"
+
+
+def test_log_dispatch_event_source_poller(test_db):
+    """source='poller' marks a poller-triggered dispatch (tms#57)."""
+    from tms.events import log_dispatch_event
+
+    log_dispatch_event(
+        repo="tms", issue=53, agent="pi", provider="", model="",
+        dispatch_type="review", worktree="", session="",
+        aoe_id_prefix="", source="poller",
+    )
+    conn = test_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM events")
+        payload = json.loads(cur.fetchone()[0])
+    assert payload.get("source") == "poller"
+    assert payload["dispatch_type"] == "review"
+    assert payload["repo"] == "tms"
+    assert payload["issue"] == 53
+
+
 def test_append_event_handles_special_characters(test_db):
     """Records with special characters must be stored correctly."""
     from tms.events import append_event

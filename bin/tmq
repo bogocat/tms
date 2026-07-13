@@ -460,7 +460,10 @@ spawn_agent() {
             echo "Monitor:  aoe status"
             echo "Attach:   aoe session attach $session_name   # when ready"
             # Log dispatch event (tms#53). Resolve aoe id prefix for stable join key.
-            if [[ -n "$dispatch_repo" ]]; then
+            # TMQ_NO_LOG (tms#57): the independent-review poller logs its own
+            # dispatch event with source='poller', so it suppresses tmq's
+            # default log to avoid a double event.
+            if [[ -n "$dispatch_repo" && -z "${TMQ_NO_LOG:-}" ]]; then
                 local aoe_id
                 aoe_id=$(aoe session show "$session_name" --json 2>/dev/null | \
                     python3 -c 'import json,sys;print(json.load(sys.stdin)["id"][:8])' 2>/dev/null || echo "")
@@ -469,7 +472,7 @@ spawn_agent() {
                     "$dispatch_repo" "$dispatch_issue" "$agent" \
                     "$dispatch_provider" "$dispatch_model" \
                     "$dispatch_type" "$cwd" "$session_name" \
-                    "$aoe_id" 2>/dev/null || true
+                    "$aoe_id" "${TMQ_DISPATCH_SOURCE:-author}" 2>/dev/null || true
             fi
         else
             # Honest failure. Clean up the half-registered session so it
@@ -520,14 +523,15 @@ spawn_agent() {
         echo "Spawned: $session_name ($agent in $cwd)"
         echo "Prompt:   $prompt_file"
         echo "Attach:   tmux a -t $session_name"
-        # Log dispatch event (tms#53) — no aoe id prefix in fallback mode
-        if [[ -n "$dispatch_repo" ]]; then
+        # Log dispatch event (tms#53) — no aoe id prefix in fallback mode.
+        # TMQ_NO_LOG (tms#57): poller suppresses to avoid a double event.
+        if [[ -n "$dispatch_repo" && -z "${TMQ_NO_LOG:-}" ]]; then
             PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" \
                 python3 -m tms.events dispatch \
                 "$dispatch_repo" "$dispatch_issue" "$agent" \
                 "$dispatch_provider" "$dispatch_model" \
                 "$dispatch_type" "$cwd" "$session_name" "" \
-                2>/dev/null || true
+                "${TMQ_DISPATCH_SOURCE:-author}" 2>/dev/null || true
         fi
     fi
 }

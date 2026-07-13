@@ -185,12 +185,18 @@ def log_dispatch_event(
     worktree: str,
     session: str,
     aoe_id_prefix: str = "",
+    source: str = "author",
 ) -> None:
     """Write a dispatch event record. Called by bin/tmq after spawn.
 
     If provider/model are empty (default pi dispatch), resolves the
     actually-served model from ~/.pi/agent/settings.json so per-model
     stats are meaningful from day 1.
+
+    ``source`` (tms#57) records who triggered the dispatch — ``'author'``
+    (an agent self-triggering, the default) or ``'poller'`` (the
+    independent review poller). It rides the payload column (no schema
+    change) so #53 stats can split self- vs poller-triggered reviews.
     """
     if not provider or not model:
         resolved_provider, resolved_model = _resolve_default_model()
@@ -210,6 +216,7 @@ def log_dispatch_event(
         "worktree": worktree,
         "session": session,
         "aoe_id_prefix": aoe_id_prefix,
+        "source": source,
     }
     append_event(record)
 
@@ -751,7 +758,7 @@ def main():
         if len(sys.argv) < 10:
             print("usage: python3 -m tms.events dispatch <repo> <issue> "
                   "<agent> <provider> <model> <type> <worktree> <session> "
-                  "[aoe_id_prefix]", file=sys.stderr)
+                  "[aoe_id_prefix] [source]", file=sys.stderr)
             sys.exit(1)
         repo = sys.argv[2]
         issue = int(sys.argv[3])
@@ -762,11 +769,16 @@ def main():
         worktree = sys.argv[8]
         session = sys.argv[9]
         aoe_id_prefix = sys.argv[10] if len(sys.argv) > 10 else ""
+        # Optional source (tms#57): 'author' (default) or 'poller'.
+        # tmq reads TMQ_DISPATCH_SOURCE so poller-triggered dispatches are
+        # distinguishable in #53 stats.
+        source = sys.argv[11] if len(sys.argv) > 11 else "author"
         log_dispatch_event(
             repo=repo, issue=issue, agent=agent,
             provider=provider, model=model,
             dispatch_type=dispatch_type, worktree=worktree,
             session=session, aoe_id_prefix=aoe_id_prefix,
+            source=source,
         )
 
     elif subcmd == "dispatch-failed":
