@@ -18,6 +18,9 @@
 - Session naming: `feat-<repo>#<num>`, `fix-<repo>#<num>`, `review-<repo>#<num>`
 - Scratch sessions: `c<n>` (claude), `o<n>` (opencode), `p<n>` (pi)
 - Worktrees at `/root/wt-<repo>-<num>` (managed by tmq)
+- `TMS_TMQ_LAUNCH=1` opts in to auto-attach: direct `tmq` calls switch your
+  tmux client into the spawned session. Default (unset) preserves the tms
+  fzf dispatch-then-return flow. Only the literal `1` opts in.
 - Issue registry mirrors tmq's REPO_GH: `distillery`, `home-portal`, `tower-fleet`, `scripts`, `palimpsest`, `rms`
 
 ## Git
