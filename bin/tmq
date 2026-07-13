@@ -472,7 +472,12 @@ spawn_agent() {
         # client switch — it must not replace start (attach alone may not
         # spawn the tmux process). (tms#12)
         if (( start_ok )) && _tmq_want_auto_attach; then
-            aoe session attach "$session_name" 2>&1 || true
+            # `||` with a warning instead of bare `|| true`: a failed attach
+            # is cosmetic (the agent already launched via `start` above), but
+            # the user opted in to dropping straight in, so tell them it
+            # didn't happen rather than falling through silently. (tms#12)
+            aoe session attach "$session_name" 2>&1 \
+                || echo "WARNING: auto-attach failed; run 'aoe session attach $session_name' to drop in" >&2
         fi
 
         if (( add_ok && start_ok )); then

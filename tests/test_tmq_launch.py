@@ -84,3 +84,60 @@ def test_non_one_does_not_auto_attach(noise):
     accidental auto-attach from env noise — only the explicit "1" is a
     deliberate opt-in."""
     assert _auto_attach(noise) == "no"
+
+
+# ── AC4 (structural): attach is additive, never replaces start ────
+#
+# These are static source-grep assertions, not behavioral tests. They lock in
+# the load-bearing invariant that `aoe session start` always launches the
+# agent and `aoe session attach` only runs AFTER start succeeds — so the
+# opt-in path can never regress to the earlier 59cf300 design that swapped
+# start->attach (where attach-alone might not spawn the tmux process).
+
+
+def _enclosing_if_line(lines, cmd_prefix):
+    """Return the text of the `if ...` line that immediately encloses the
+    first line beginning (after indent) with `cmd_prefix`.
+
+    Walks backward line-by-line from the command to the nearest line that
+    starts (after indent) with `if ` — that is the command's own gate, not
+    some earlier unrelated `if` block.
+    """
+    cmd_i = next(
+        i for i, ln in enumerate(lines) if ln.lstrip().startswith(cmd_prefix)
+    )
+    for j in range(cmd_i - 1, -1, -1):
+        if lines[j].lstrip().startswith("if "):
+            return lines[j]
+    raise AssertionError(f"no enclosing `if` found for `{cmd_prefix}` call")
+
+
+def test_ac4_start_is_unconditional():
+    """`aoe session start` must run whenever add_ok, independent of the
+    auto-attach flag. Asserts the start call's own gate references only
+    add_ok (not the auto-attach flag), so start can never become opt-in."""
+    gate = _enclosing_if_line(TMQ.read_text().splitlines(), "aoe session start")
+    assert "add_ok" in gate, (
+        f"start must be gated on add_ok; gate was {gate!r}"
+    )
+    assert "_tmq_want_auto_attach" not in gate, (
+        "start must NOT be gated on the auto-attach flag (that would make "
+        f"launching the agent opt-in); gate was {gate!r}"
+    )
+
+
+def test_ac4_attach_is_gated_on_start_ok():
+    """`aoe session attach` must only run when start_ok AND the env flag is
+    set — proving attach is strictly additive (after start), never a
+    replacement for start. Guards against the 59cf300 regression where
+    attach replaced start in opt-in mode."""
+    gate = _enclosing_if_line(TMQ.read_text().splitlines(), "aoe session attach")
+    assert "start_ok" in gate, (
+        "attach must be gated on start_ok (additive ordering — start always "
+        f"runs first); gate was {gate!r}"
+    )
+    assert "_tmq_want_auto_attach" in gate, (
+        "attach must be gated on _tmq_want_auto_attach (opt-in); "
+        f"gate was {gate!r}"
+    )
+
