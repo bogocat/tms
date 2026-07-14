@@ -39,10 +39,16 @@ can safely skip unknown types without a schema migration.
 | `event_type`        | Writer        | When                                   |
 |---------------------|---------------|----------------------------------------|
 | `dispatch`          | `bin/tmq`     | Agent spawned successfully             |
+| `dispatch`          | `tms events scan-reviews --dispatch` | Poller-triggered review (source=poller, tms#57) |
 | `dispatch_failed`   | `bin/tmq`     | Agent spawn failed (cc-root-refusal, aoe error) |
 | `transition`        | `tms events transitions` | AGENT-STATE marker change detected |
 
 Reserved for future extension: `staleness` (tms#56).
+
+Dispatch events are distinguishable by the `source` field in the payload
+(tms#57): `author` (default, an agent self-triggering), `poller` (the
+independent review poller, `tms events scan-reviews --dispatch`), or
+`manual` (operator running `tmq review` from a terminal).
 
 ## Field specifications
 
@@ -58,6 +64,7 @@ Reserved for future extension: `staleness` (tms#56).
 | `provider`       | string  | yes      | Provider name (`minimax`, `deepseek`, `anthropic`, …). Empty if unresolved. |
 | `model`          | string  | yes      | Model ID (`MiniMax-M3`, `deepseek-v4-pro`, …). Resolved from `~/.pi/agent/settings.json` default when tmq flags are empty. |
 | `dispatch_type`  | string  | yes      | `feature`, `fix`, `chore`, or `review` |
+| `source`         | string  | no       | Who triggered the dispatch (tms#57): `author` (default), `poller`, or `manual`. Rides the payload column only — no flat-column schema change. |
 | `worktree`       | string  | yes      | Absolute path to working tree |
 | `session`        | string  | yes      | Session name (`feat-tms#53`, `fix-distillery#245-cc`, …) |
 | `aoe_id_prefix`  | string  | no       | First 8 chars of the aoe session UUID (stable join key). Empty for direct-tmux fallback. |
