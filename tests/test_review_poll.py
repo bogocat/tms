@@ -452,3 +452,77 @@ class TestScanRepos:
         )
         results = review_poll.scan_repos(dispatch=True, max_dispatch=0)
         assert results[0]["status"] == "would_dispatch"
+
+    def test_gh_error_skips_comment_fetch_failure(self, monkeypatch):
+        # gh error must not be treated as affirmative no-verdict evidence.
+        self._setup_single_repo(monkeypatch,
+            prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False}],
+            comments_by_pr={},
+        )
+        monkeypatch.setattr(review_poll, "_pr_comment_bodies",
+                            lambda gh, num: ([], False))
+        results = review_poll.scan_repos(dispatch=False)
+        assert results[0]["status"] == "skip_gh_error"
+
+    def test_dispatch_failure_reported_not_counted(self, monkeypatch, test_db):
+        # A failed dispatch must not be counted as dispatched (P0.2).
+        monkeypatch.setattr(review_poll, "_dispatch_review",
+                            lambda repo, pr: False)
+        self._setup_single_repo(monkeypatch,
+            prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False}],
+            comments_by_pr={57: []},
+        )
+        results = review_poll.scan_repos(dispatch=True, max_dispatch=2)
+        assert results[0]["status"] == "skip_dispatch_failed"
+        conn = test_db()
+        rows = conn.cursor().execute(
+            "SELECT count(*) FROM events"
+        ).fetchall()
+        assert rows[0][0] == 0  # no event logged on failure
+
+    def test_live_session_recheck_after_snapshot(self, monkeypatch, test_db):
+        # P0.3: a review session starting after the initial snapshot
+        # must be caught by the pre-dispatch re-check.
+        calls = []
+        monkeypatch.setattr(review_poll, "_dispatch_review",
+                            lambda repo, pr: True)
+        monkeypatch.setattr(review_poll, "_log_poller_dispatch",
+                            lambda repo, issue: None)
+        self._setup_single_repo(monkeypatch,
+            prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False}],
+            comments_by_pr={57: []},
+        )
+        def multi_phase_live():
+            calls.append(1)
+            return {"tms#57"} if len(calls) >= 2 else set()
+        monkeypatch.setattr(review_poll, "live_review_sessions", multi_phase_live)
+        results = review_poll.scan_repos(dispatch=True)
+        assert results[0]["status"] == "skip_live_session"
+        assert len(calls) >= 2  # re-check fired
+
+    def test_source_poller_in_payload(self, monkeypatch, test_db):
+        # Dispatch events from the poller must carry source='poller' (AC5).
+        import json
+        monkeypatch.setattr(review_poll, "_dispatch_review",
+                            lambda repo, pr: True)
+        self._setup_single_repo(monkeypatch,
+            prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False}],
+            comments_by_pr={57: []},
+        )
+        review_poll.scan_repos(dispatch=True)
+        conn = test_db()
+        rows = conn.cursor().execute(
+            "SELECT payload FROM events"
+        ).fetchall()
+        payload = json.loads(rows[0][0])
+        assert payload.get("source") == "poller"
+
+    def test_stale_pass_skip_in_scan(self, monkeypatch):
+        # A stale PASS (sha != head) must be classified as skip_stale_pass.
+        stale = "<<REVIEW-VERDICT: PASS sha=deadbeefdeadbeef rounds=1 panel=x>>"
+        self._setup_single_repo(monkeypatch,
+            prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False}],
+            comments_by_pr={57: [stale]},
+        )
+        results = review_poll.scan_repos(dispatch=False)
+        assert results[0]["status"] == "skip_stale_pass"

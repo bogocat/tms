@@ -189,7 +189,7 @@ def _repo_registry(repo_filter=None):
             continue
         if repo_filter and short != repo_filter:
             continue
-        wt_flag = int(wt or '0')
+        wt_flag = int(wt) if (wt or '').isdigit() else 0
         candidates.setdefault(gh, []).append((short, wt_flag))
 
     rows = []
