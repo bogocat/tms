@@ -176,7 +176,11 @@ def _resolve_default_model():
 
 
 def _resolve_dispatch_model(provider: str, model: str):
-    """Resolve event provenance from invocation flags before defaults."""
+    """Resolve event provenance from explicit flags, then pi defaults.
+
+    An explicit model determines its missing provider from the fleet map.
+    Defaults are consulted only when the invocation supplies no model.
+    """
     if model:
         return (provider or MODEL_TO_PROVIDER.get(model, "unknown"), model)
 

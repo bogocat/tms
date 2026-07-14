@@ -164,7 +164,8 @@ def test_log_dispatch_event_no_override_when_explicit_model(test_db):
     from tms.events import log_dispatch_event
 
     log_dispatch_event(
-        repo="tms", issue=1, agent="pi", provider="minimax", model="MiniMax-M3",
+        repo="tms", issue=1, agent="pi",
+        provider="custom-provider", model="custom-model",
         dispatch_type="feature", worktree="/tmp/wt", session="feat-tms#1",
         aoe_id_prefix="abc12345",
     )
@@ -173,8 +174,7 @@ def test_log_dispatch_event_no_override_when_explicit_model(test_db):
     with conn.cursor() as cur:
         cur.execute("SELECT provider, model FROM events")
         row = cur.fetchone()
-    assert row[0] == "minimax"
-    assert row[1] == "MiniMax-M3"
+    assert row == ("custom-provider", "custom-model")
 
 
 def test_append_event_handles_special_characters(test_db):
@@ -195,6 +195,26 @@ def test_append_event_handles_special_characters(test_db):
     parsed = json.loads(payload)
     assert parsed["title"] == record["title"]
     assert parsed["body"] == record["body"]
+
+
+def test_log_dispatch_failed_event_resolves_explicit_model_provider(test_db):
+    """Failed dispatch provenance follows --model without reading defaults."""
+    from tms.events import log_dispatch_failed_event
+
+    with patch(
+        "tms.events._resolve_default_model",
+        side_effect=AssertionError("explicit model must bypass defaults"),
+    ):
+        log_dispatch_failed_event(
+            repo="tms", issue=67, agent="pi", provider="", model="MiniMax-M3",
+            dispatch_type="feature", reason="aoe add failed",
+        )
+
+    conn = test_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT event_type, provider, model FROM events")
+        row = cur.fetchone()
+    assert row == ("dispatch_failed", "minimax", "MiniMax-M3")
 
 
 def test_log_dispatch_failed_event(test_db):
