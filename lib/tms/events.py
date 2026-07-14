@@ -142,6 +142,16 @@ def append_event(record: dict) -> None:
 
 # ── Model resolution ──────────────────────────────────────────────
 
+# Map model → provider from the known fleet configuration.
+# See institutional memory: data-driven-model-selection.md.
+MODEL_TO_PROVIDER = {
+    "deepseek-v4-pro": "deepseek",
+    "MiniMax-M3": "minimax",
+    "MiniMax-M3.5": "minimax",
+    "glm-5.2": "zai",
+}
+
+
 def _resolve_default_model():
     """Resolve the actually-served model from pi's settings file.
 
@@ -161,16 +171,21 @@ def _resolve_default_model():
     if not model:
         return ("", "")
 
-    # Map model → provider from the known fleet configuration.
-    # See institutional memory: data-driven-model-selection.md.
-    MODEL_TO_PROVIDER = {
-        "deepseek-v4-pro": "deepseek",
-        "MiniMax-M3": "minimax",
-        "MiniMax-M3.5": "minimax",
-        "glm-5.2": "zai",
-    }
     provider = MODEL_TO_PROVIDER.get(model, "unknown")
     return (provider, model)
+
+
+def _resolve_dispatch_model(provider: str, model: str):
+    """Resolve event provenance from explicit flags, then pi defaults.
+
+    An explicit model determines its missing provider from the fleet map.
+    Defaults are consulted only when the invocation supplies no model.
+    """
+    if model:
+        return (provider or MODEL_TO_PROVIDER.get(model, "unknown"), model)
+
+    resolved_provider, resolved_model = _resolve_default_model()
+    return (provider or resolved_provider, resolved_model)
 
 
 # ── Dispatch events ───────────────────────────────────────────────
@@ -198,11 +213,7 @@ def log_dispatch_event(
     independent review poller). It rides the payload column (no schema
     change) so #53 stats can split self- vs poller-triggered reviews.
     """
-    if not provider or not model:
-        resolved_provider, resolved_model = _resolve_default_model()
-        if resolved_model:
-            provider = provider or resolved_provider
-            model = model or resolved_model
+    provider, model = _resolve_dispatch_model(provider, model)
 
     record = {
         "event_type": "dispatch",
@@ -237,11 +248,7 @@ def log_dispatch_failed_event(
     See proposal-review finding: "dispatch_failed events for tmq
     spawn failures."
     """
-    if not provider or not model:
-        resolved_provider, resolved_model = _resolve_default_model()
-        if resolved_model:
-            provider = provider or resolved_provider
-            model = model or resolved_model
+    provider, model = _resolve_dispatch_model(provider, model)
 
     record = {
         "event_type": "dispatch_failed",
