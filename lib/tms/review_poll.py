@@ -459,6 +459,20 @@ def main():
         print(f"unknown subcommand: {subcmd}", file=sys.stderr)
         sys.exit(1)
 
+    # Check for --help/-h anywhere in the remaining args (not just position 0)
+    if '--help' in args or '-h' in args:
+        print("usage: tms events scan-reviews "
+              "[--dispatch] [--repo <short>] [--max-dispatch <n>]")
+        print()
+        print("  Scan open PRs across the repo registry for those lacking a")
+        print("  reviewer verdict (tms#57). Dry run by default; --dispatch")
+        print("  spawns tmq review for never-reviewed PRs.")
+        print()
+        print("  --dispatch        Spawn tmq review for PRs needing review")
+        print("  --max-dispatch N  Cap dispatches per run (default 3; 0 = scan-only)")
+        print("  --repo SHORT       Restrict scan to one registered repo")
+        sys.exit(0)
+
     dispatch = '--dispatch' in args
     repo_filter = None
     max_dispatch = 3
