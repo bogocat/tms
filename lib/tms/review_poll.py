@@ -38,6 +38,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import traceback
 
 
 # ── Verdict-line parser (consumes the pi-dotfiles contract) ───────
@@ -52,7 +54,7 @@ REVIEW_VERDICT_RE = re.compile(
 )
 _SHA_RE = re.compile(r'sha=([0-9a-fA-F]+)')
 _INT_RE_TEMPLATE = r'%s=(\d+)'
-_PANEL_RE = re.compile(r'panel=(\S+)')
+_PANEL_RE = re.compile(r'panel=(.+?)(?=\s+\w+=|$)')
 
 
 def _search1(pattern, text):
@@ -171,23 +173,30 @@ def _repo_registry(repo_filter=None):
     """Parse ``tmq list --machine`` into ``[(short, gh_repo), ...]``.
 
     Dedupes by gh_repo (``deploy`` and ``distillery`` both map to
-    ``bogocat/distillery`` — keep the first occurrence). Optionally
-    filters to a single short name.
+    ``bogocat/distillery``). Prefers entries with ``needs_worktree=1``
+    (isolated worktree) so the poller's live-session key matches the
+    author agent's session name — if the poller used ``deploy#547`` as
+    the key, it wouldn't detect a ``distillery#547`` review session.
+    Optionally filters to a single short name.
     """
-    rows = []
-    seen = set()
+    candidates = {}  # gh_repo -> list of (short, wt_flag)
     for line in (_run_tmq_list_machine() or '').splitlines():
         parts = line.split('\t')
-        if len(parts) < 3:
+        if len(parts) < 4:
             continue
-        short, _path, gh = parts[0], parts[1], parts[2]
+        short, _path, gh, wt = parts[0], parts[1], parts[2], parts[3]
         if not short or not gh:
             continue
         if repo_filter and short != repo_filter:
             continue
-        if gh in seen:
-            continue
-        seen.add(gh)
+        wt_flag = int(wt or '0')
+        candidates.setdefault(gh, []).append((short, wt_flag))
+
+    rows = []
+    for gh, entries in candidates.items():
+        # Prefer worktree=1 entry (isolated), else first.
+        entries.sort(key=lambda e: (e[1] != 1, 0))
+        short = entries[0][0]
         rows.append((short, gh))
     return rows
 
@@ -220,14 +229,19 @@ def list_open_prs(gh_repo):
 
 
 def _pr_comment_bodies(gh_repo, number):
-    """Return PR comment bodies (chronological, oldest first)."""
+    """Return PR comment bodies (chronological, oldest first).
+
+    Returns ``(bodies, ok)`` so the caller can distinguish \"no comments\"
+    from \"failed to fetch comments\" — a gh error must not be treated as
+    affirmative evidence of no-verdict (review P0).
+    """
     data = _gh_json([
         'pr', 'view', str(number), '--repo', gh_repo,
         '--json', 'comments',
     ])
     if not isinstance(data, dict):
-        return []
-    return [c.get('body', '') for c in data.get('comments', [])]
+        return [], False
+    return [c.get('body', '') for c in data.get('comments', [])], True
 
 
 def _pr_still_open(gh_repo, number):
@@ -307,21 +321,34 @@ def _dispatch_review(repo, pr):
     Sets ``TMQ_NO_LOG=1`` so tmq does not log its own dispatch event — the
     poller logs the dispatch itself (with ``source='poller'``) so #53 stats
     can split author-self-triggered from poller-triggered reviews.
+
+    Returns ``True`` if tmq launched successfully (exit 0), ``False`` on
+    failure (review P0: failed dispatches must not be counted as successful).
     """
     env = dict(os.environ)
     env['TMQ_NO_LOG'] = '1'
     try:
-        subprocess.run(
+        r = subprocess.run(
             ['tmq', 'review', repo, str(pr)],
             env=env, timeout=60,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-    except (subprocess.TimeoutExpired, OSError):
-        pass
+        return r.returncode == 0
+    except subprocess.TimeoutExpired:
+        print(f'WARNING: tmq review {repo}#{pr} timed out after 60s',
+              file=sys.stderr)
+        return False
+    except OSError as e:
+        print(f'WARNING: tmq review {repo}#{pr} spawn failed: {e}',
+              file=sys.stderr)
+        return False
 
 
 def _result(repo, gh_repo, pr, status, head=None):
-    return {'repo': repo, 'gh_repo': gh_repo, 'pr': pr, 'status': status, 'head': head}
+    return {
+        'repo': repo, 'gh_repo': gh_repo, 'pr': pr,
+        'status': status, 'head': head,
+    }
 
 
 def scan_repos(dispatch=False, repo_filter=None, max_dispatch=3):
@@ -341,7 +368,8 @@ def scan_repos(dispatch=False, repo_filter=None, max_dispatch=3):
     Returns a list of result dicts: ``{repo, gh_repo, pr, status, head}``
     where status is one of: ``would_dispatch``, ``dispatched``,
     ``skip_draft``, ``skip_current_pass``, ``skip_fail``, ``skip_stale_pass``,
-    ``skip_live_session``, ``skip_closed``.
+    ``skip_live_session``, ``skip_closed``, ``skip_gh_error``,
+    ``skip_dispatch_failed``, ``skip_verdict``.
     """
     live = live_review_sessions()
     results = []
@@ -358,12 +386,15 @@ def scan_repos(dispatch=False, repo_filter=None, max_dispatch=3):
                 results.append(_result(short, gh_repo, number, 'skip_draft', head))
                 continue
 
-            comments = _pr_comment_bodies(gh_repo, number)
+            comments, ok = _pr_comment_bodies(gh_repo, number)
+            if not ok:
+                results.append(_result(short, gh_repo, number, 'skip_gh_error', head))
+                continue
 
             # V1: skip any PR that already has a verdict (author owns the
             # FAIL/stale-sha re-review loop; poller is for never-reviewed PRs).
-            skip = _classify_skip(comments, head)
-            if skip is not None:
+            if not needs_poller_review(comments, head):
+                skip = _classify_skip(comments, head) or 'skip_verdict'
                 results.append(_result(short, gh_repo, number, skip, head))
                 continue
 
@@ -380,15 +411,25 @@ def scan_repos(dispatch=False, repo_filter=None, max_dispatch=3):
                 results.append(_result(short, gh_repo, number, 'would_dispatch', head))
                 continue
 
+            # Re-check live sessions immediately before dispatch
+            # (review P0: the snapshot at scan start is stale by the time we
+            # reach a candidate — another cron or author may have started a
+            # review in the meantime).
+            if f'{short}#{number}' in live_review_sessions():
+                results.append(_result(short, gh_repo, number, 'skip_live_session', head))
+                continue
+
             # Orphan guard: PR may have closed between scan and dispatch.
             if not _pr_still_open(gh_repo, number):
                 results.append(_result(short, gh_repo, number, 'skip_closed', head))
                 continue
 
-            _dispatch_review(short, number)
-            _log_poller_dispatch(short, number)
-            dispatched_count += 1
-            results.append(_result(short, gh_repo, number, 'dispatched', head))
+            if _dispatch_review(short, number):
+                _log_poller_dispatch(short, number)
+                dispatched_count += 1
+                results.append(_result(short, gh_repo, number, 'dispatched', head))
+            else:
+                results.append(_result(short, gh_repo, number, 'skip_dispatch_failed', head))
 
     return results
 
@@ -407,8 +448,11 @@ def _log_poller_dispatch(repo, issue):
             aoe_id_prefix='', source='poller',
         )
     except Exception:
-        # Event logging must never break a dispatch loop.
-        pass
+        # Event logging must never break a dispatch loop, but it must
+        # not silently swallow persistent failures either (review P1).
+        print('WARNING: poller dispatch event logging failed:',
+              file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
 
 
 # ── CLI ───────────────────────────────────────────────────────────
@@ -428,8 +472,11 @@ def _format_report(results):
         by_status.setdefault(r['status'], []).append(r)
 
     # Show dispatch candidates first, then skips.
-    order = ['dispatched', 'would_dispatch', 'skip_live_session', 'skip_closed',
-             'skip_draft', 'skip_fail', 'skip_stale_pass', 'skip_current_pass']
+    order = ['dispatched', 'would_dispatch',
+             'skip_live_session', 'skip_closed',
+             'skip_gh_error', 'skip_dispatch_failed',
+             'skip_draft', 'skip_fail', 'skip_stale_pass',
+             'skip_current_pass', 'skip_verdict']
     for status in order:
         rows = by_status.get(status, [])
         if not rows:

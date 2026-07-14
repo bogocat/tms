@@ -195,7 +195,9 @@ class TestNeedsPollerReview:
 
 class TestRepoRegistryDedupe:
     def test_dedupe_by_gh_repo(self, monkeypatch):
-        # `deploy` and `distillery` both map to bogocat/distillery.
+        # deploy and distillery both map to bogocat/distillery.
+        # The poller now prefers the worktree=1 entry (distillery) over
+        # deploy (worktree=0) so live-session keys match correctly.
         monkeypatch.setattr(
             review_poll, "_run_tmq_list_machine",
             lambda: "deploy\t/root/deploy/distillery\tbogocat/distillery\t0\n"
@@ -206,6 +208,10 @@ class TestRepoRegistryDedupe:
         gh_repos = [gh for (_short, gh) in repos]
         assert gh_repos.count("bogocat/distillery") == 1
         assert "bogocat/tms" in gh_repos
+        # The retained entry for distillery must be 'distillery' (worktree=1),
+        # not 'deploy'.
+        short_names = {short for (short, gh) in repos if gh == "bogocat/distillery"}
+        assert short_names == {"distillery"}
 
     def test_filter_by_short_name(self, monkeypatch):
         monkeypatch.setattr(
@@ -295,7 +301,7 @@ class TestScanRepos:
             lambda: "tms\t/root/tms\tbogocat/tms\t1\n",
         )
         monkeypatch.setattr(review_poll, "list_open_prs", lambda gh: prs)
-        monkeypatch.setattr(review_poll, "_pr_comment_bodies", lambda gh, num: comments_by_pr.get(num, []))
+        monkeypatch.setattr(review_poll, "_pr_comment_bodies", lambda gh, num: (comments_by_pr.get(num, []), True))
         monkeypatch.setattr(review_poll, "live_review_sessions", lambda: set(live or []))
         # Default: PRs are still open. The orphan-guard test overrides this.
         monkeypatch.setattr(review_poll, "_pr_still_open", lambda gh, num: True)
@@ -347,7 +353,8 @@ class TestScanRepos:
 
     def test_dispatch_calls_tmq_review_and_logs_event(self, monkeypatch, test_db):
         dispatched = []
-        monkeypatch.setattr(review_poll, "_dispatch_review", lambda repo, pr: dispatched.append((repo, pr)))
+        monkeypatch.setattr(review_poll, "_dispatch_review",
+                            lambda repo, pr: dispatched.append((repo, pr)) or True)
         self._setup_single_repo(monkeypatch,
             prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False}],
             comments_by_pr={57: []},
@@ -366,7 +373,8 @@ class TestScanRepos:
     def test_dispatch_skipped_when_live_session(self, monkeypatch, test_db):
         # Even in dispatch mode, a live review session prevents dispatch.
         dispatched = []
-        monkeypatch.setattr(review_poll, "_dispatch_review", lambda repo, pr: dispatched.append((repo, pr)))
+        monkeypatch.setattr(review_poll, "_dispatch_review",
+                            lambda repo, pr: dispatched.append((repo, pr)) or True)
         self._setup_single_repo(monkeypatch,
             prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False}],
             comments_by_pr={57: []},
@@ -380,7 +388,8 @@ class TestScanRepos:
         # PR was open at scan time but closed between scan and dispatch.
         # _pr_still_open returns False → no dispatch, status skip_closed.
         dispatched = []
-        monkeypatch.setattr(review_poll, "_dispatch_review", lambda repo, pr: dispatched.append((repo, pr)))
+        monkeypatch.setattr(review_poll, "_dispatch_review",
+                            lambda repo, pr: dispatched.append((repo, pr)) or True)
         self._setup_single_repo(monkeypatch,
             prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False}],
             comments_by_pr={57: []},
@@ -414,7 +423,7 @@ class TestScanRepos:
         # number of dispatches per scan; the rest stay would_dispatch.
         dispatched = []
         monkeypatch.setattr(review_poll, "_dispatch_review",
-                            lambda repo, pr: dispatched.append((repo, pr)))
+                            lambda repo, pr: dispatched.append((repo, pr)) or True)
         self._setup_single_repo(monkeypatch,
             prs=[
                 {"number": 10, "headRefOid": "aaa", "isDraft": False},
