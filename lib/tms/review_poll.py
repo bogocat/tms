@@ -34,6 +34,7 @@ All external calls (gh, tmq, aoe, tmux) go through thin wrappers so tests
 can monkeypatch them without touching the network.
 """
 
+import datetime
 import json
 import os
 import re
@@ -315,6 +316,18 @@ def live_review_sessions():
 
 # ── Dispatch ──────────────────────────────────────────────────────
 
+# Per-run dispatch-failure tracking to break retry loops (#77).
+# If a PR fails to dispatch in the current cron run, skip it for the
+# rest of the run — the poller will retry on the next 5-min cycle.
+_DISPATCH_FAILED_THIS_RUN = set()
+# Per-day dispatch-failure counter (keyed by "repo#pr"). After
+# MAX_FAILURES_PER_DAY consecutive failures, the poller stops retrying
+# until the next calendar day. Prevents the 195-event storm seen on
+# 2026-07-14 where 3 PRs were retried 36x/hour for 5 hours.
+_DISPATCH_FAILURES_TODAY = {}
+_MAX_FAILURES_PER_DAY = 6  # ~30 min of 5-min cycles
+
+
 def _dispatch_review(repo, pr):
     """Spawn ``tmq review <repo> <pr>`` for a PR needing review.
 
@@ -325,22 +338,53 @@ def _dispatch_review(repo, pr):
     Returns ``True`` if tmq launched successfully (exit 0), ``False`` on
     failure (review P0: failed dispatches must not be counted as successful).
     """
+    key = f'{repo}#{pr}'
+
+    # Circuit breaker: don't retry a PR that's already failed this run
+    # or has exceeded the daily failure budget (#77).
+    if key in _DISPATCH_FAILED_THIS_RUN:
+        return False
+    today = datetime.date.today().isoformat()
+    fail_key = f'{today}:{key}'
+    if _DISPATCH_FAILURES_TODAY.get(fail_key, 0) >= _MAX_FAILURES_PER_DAY:
+        return False
+
     env = dict(os.environ)
     env['TMQ_NO_LOG'] = '1'
     try:
         r = subprocess.run(
             ['tmq', 'review', repo, str(pr)],
             env=env, timeout=60,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            capture_output=True, text=True,
         )
-        return r.returncode == 0
-    except subprocess.TimeoutExpired:
-        print(f'WARNING: tmq review {repo}#{pr} timed out after 60s',
+        if r.returncode == 0:
+            return True
+        # Capture failure reason from stderr for diagnostics (#77)
+        fail_reason = 'tmq exit ' + str(r.returncode)
+        stderr_tail = (r.stderr or '').strip()
+        if stderr_tail:
+            # Take last 3 non-empty lines of stderr
+            lines = [l for l in stderr_tail.splitlines() if l.strip()]
+            fail_reason += ': ' + '; '.join(lines[-3:])
+        print(f'WARNING: tmq review {key} failed: {fail_reason}',
               file=sys.stderr)
+        _DISPATCH_FAILED_THIS_RUN.add(key)
+        _DISPATCH_FAILURES_TODAY[fail_key] = \
+            _DISPATCH_FAILURES_TODAY.get(fail_key, 0) + 1
+        return False
+    except subprocess.TimeoutExpired:
+        print(f'WARNING: tmq review {key} timed out after 60s',
+              file=sys.stderr)
+        _DISPATCH_FAILED_THIS_RUN.add(key)
+        _DISPATCH_FAILURES_TODAY[fail_key] = \
+            _DISPATCH_FAILURES_TODAY.get(fail_key, 0) + 1
         return False
     except OSError as e:
-        print(f'WARNING: tmq review {repo}#{pr} spawn failed: {e}',
+        print(f'WARNING: tmq review {key} spawn failed: {e}',
               file=sys.stderr)
+        _DISPATCH_FAILED_THIS_RUN.add(key)
+        _DISPATCH_FAILURES_TODAY[fail_key] = \
+            _DISPATCH_FAILURES_TODAY.get(fail_key, 0) + 1
         return False
 
 

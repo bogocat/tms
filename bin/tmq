@@ -511,8 +511,9 @@ spawn_agent() {
                 echo "ERROR: aoe add failed (see output above)" >&2
                 echo "  (likely duplicate title, missing worktree, or invalid tool)" >&2
             fi
-            # Log dispatch_failed event (tms#53) before returning
-            if [[ -n "$dispatch_repo" ]]; then
+            # Log dispatch_failed event (tms#53) before returning.
+            # TMQ_NO_LOG (tms#57): poller suppresses to avoid double event.
+            if [[ -n "$dispatch_repo" && -z "${TMQ_NO_LOG:-}" ]]; then
                 local reason
                 if (( add_ok && ! start_ok )); then
                     reason="aoe session start failed"
@@ -932,6 +933,11 @@ main() {
             "$repo" "$number" "$agent" "$PI_PROVIDER" "$PI_MODEL" \
             "$type" "cc dispatch refused under root" 2>/dev/null || true
     fi
+
+    # Propagate spawn failure to tmq's exit code so the caller (poller,
+    # user's shell) can detect the failure. (#77: previously main() always
+    # exited 0, making every aoe-add failure invisible to the poller.)
+    return $spawn_rc
 }
 
 # ── dispatch ─────────────────────────────────────────────────────
@@ -950,6 +956,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         review|pr)
             shift
             main "${@}" --type review
+            exit $?
             ;;
         -h|--help)
             usage
@@ -959,6 +966,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 usage
             fi
             main "$@"
+            exit $?
             ;;
     esac
 fi
