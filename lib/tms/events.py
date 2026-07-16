@@ -579,6 +579,9 @@ def compute_stats(since=None):
         area = d.get("area") or "unlabeled"
         point = d.get("point_estimate") or "unlabeled"
         for label in labels:
+            # Skip structural labels — those have their own dimensions.
+            if label.startswith("area:") or label.startswith("point:"):
+                continue
             if label not in per_label:
                 per_label[label] = {
                     "dispatches": 0, "merged": 0, "blocked": 0,
@@ -861,7 +864,8 @@ def format_stats_report(stats, as_json=False, by_label=False,
             continue
         print()
         print(f"  Per-{dim_name.lower()} breakdown:")
-        header = f"  {'=':<30} {'Disp':>5} {'Merged':>7} {'Blocked':>8} {'Avg Lat':>8}"
+        col_hdr = dim_name[:30]
+        header = f"  {col_hdr:<30} {'Disp':>5} {'Merged':>7} {'Blocked':>8} {'Avg Lat':>8}"
         print(header)
         for key, mstats in sorted(dim_data.items()):
             n = mstats.get("dispatches", 0)
