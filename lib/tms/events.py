@@ -112,9 +112,12 @@ def append_event(record: dict) -> None:
                     repo, issue, agent, provider, model,
                     dispatch_type, worktree, session,
                     aoe_id_prefix, reason, from_status, to_status,
+                    issue_labels, point_estimate, area,
                     payload)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
-                           %s, %s, %s, %s, %s, %s, %s, %s)
+                           %s, %s, %s, %s, %s, %s, %s,
+                           %s, %s, %s,
+                           %s)
                    ON CONFLICT (event_type, aoe_id_prefix, event_timestamp)
                    DO NOTHING""",
                 (
@@ -134,6 +137,9 @@ def append_event(record: dict) -> None:
                     record.get("reason"),
                     record.get("from_status"),
                     record.get("to_status"),
+                    json.dumps(record.get("issue_labels")) if record.get("issue_labels") else None,
+                    record.get("point_estimate"),
+                    record.get("area"),
                     payload,
                 ),
             )
@@ -150,6 +156,34 @@ MODEL_TO_PROVIDER = {
     "MiniMax-M3.5": "minimax",
     "glm-5.2": "zai",
 }
+
+
+_POINT_RE = re.compile(r'^point:(\d+)$')
+_AREA_RE = re.compile(r'^area:(\S+)$')
+
+
+def _extract_issue_metadata(labels: list[str] | None):
+    """Extract point_estimate and area from a list of GitHub labels.
+
+    point_estimate: the first 'point:N' label (e.g. 'point:5' → '5').
+    area: the first 'area:*' label (e.g. 'area:ui' → 'ui').
+    Returns (point_estimate, area) tuple — both may be None.
+    """
+    point = None
+    area = None
+    if labels:
+        for label in labels:
+            if point is None:
+                m = _POINT_RE.match(label)
+                if m:
+                    point = m.group(1)
+            if area is None:
+                m = _AREA_RE.match(label)
+                if m:
+                    area = m.group(1)
+            if point and area:
+                break
+    return (point, area)
 
 
 def _resolve_default_model():
@@ -201,6 +235,7 @@ def log_dispatch_event(
     session: str,
     aoe_id_prefix: str = "",
     source: str = "author",
+    issue_labels: list[str] | None = None,
 ) -> None:
     """Write a dispatch event record. Called by bin/tmq after spawn.
 
@@ -210,10 +245,14 @@ def log_dispatch_event(
 
     ``source`` (tms#57) records who triggered the dispatch — ``'author'``
     (an agent self-triggering, the default) or ``'poller'`` (the
-    independent review poller). It rides the payload column (no schema
-    change) so #53 stats can split self- vs poller-triggered reviews.
+    independent review poller).
+
+    ``issue_labels`` (tms#76): GitHub labels from the issue, forwarded
+    from the already-fetched gh issue view JSON in tmq. Extracted into
+    point_estimate and area columns at write time.
     """
     provider, model = _resolve_dispatch_model(provider, model)
+    point_estimate, area = _extract_issue_metadata(issue_labels)
 
     record = {
         "event_type": "dispatch",
@@ -228,6 +267,9 @@ def log_dispatch_event(
         "session": session,
         "aoe_id_prefix": aoe_id_prefix,
         "source": source,
+        "issue_labels": issue_labels,
+        "point_estimate": point_estimate,
+        "area": area,
     }
     append_event(record)
 
@@ -336,6 +378,7 @@ def detect_transitions():
 
     # 3. Build current status map: aoe_id_prefix[:8] → agent_state
     current_status = {}
+    current_reasons = {}  # aoe_id_prefix → BLOCKED reason (ephemeral per-run)
     session_titles = {}  # aoe_id_prefix → session title (for event logging)
     for s in aoe_sessions:
         sid = s.get("id", "")
@@ -361,6 +404,7 @@ def detect_transitions():
         parsed = _parse_agent_state_from_pane(pane_text)
         if parsed is not None:
             current_status[id_prefix] = parsed[0]
+            current_reasons[id_prefix] = parsed[1]  # captured but ephemeral
 
     # 4. Compare and emit transition events
     emitted = 0
@@ -369,7 +413,9 @@ def detect_transitions():
     for id_prefix, new_state in current_status.items():
         old_state = last_status.get(id_prefix)
         if old_state is not None and old_state != new_state:
-            # State changed — emit transition
+            # State changed — emit transition.
+            # Forward the BLOCKED reason captured from the pane marker (#76).
+            reason = current_reasons.get(id_prefix)
             record = {
                 "event_type": "transition",
                 "timestamp": now,
@@ -377,6 +423,7 @@ def detect_transitions():
                 "aoe_id_prefix": id_prefix,
                 "from_status": old_state,
                 "to_status": new_state,
+                "reason": reason,
             }
             append_event(record)
             emitted += 1
@@ -777,15 +824,21 @@ def main():
         session = sys.argv[9]
         aoe_id_prefix = sys.argv[10] if len(sys.argv) > 10 else ""
         # Optional source (tms#57): 'author' (default) or 'poller'.
-        # tmq reads TMQ_DISPATCH_SOURCE so poller-triggered dispatches are
-        # distinguishable in #53 stats.
         source = sys.argv[11] if len(sys.argv) > 11 else "author"
+        # Optional labels JSON array (tms#76): ["enhancement", "point:5", ...]
+        labels_raw = sys.argv[12] if len(sys.argv) > 12 else ""
+        issue_labels = None
+        if labels_raw:
+            try:
+                issue_labels = json.loads(labels_raw)
+            except (json.JSONDecodeError, ValueError):
+                pass
         log_dispatch_event(
             repo=repo, issue=issue, agent=agent,
             provider=provider, model=model,
             dispatch_type=dispatch_type, worktree=worktree,
             session=session, aoe_id_prefix=aoe_id_prefix,
-            source=source,
+            source=source, issue_labels=issue_labels,
         )
 
     elif subcmd == "dispatch-failed":
