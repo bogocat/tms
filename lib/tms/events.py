@@ -569,6 +569,38 @@ def compute_stats(since=None):
             }
         per_model[model]["dispatches"] += 1
 
+    # Per-class breakdowns (#76 PR B): label, area, point_estimate.
+    # Same shape as per_model but sliced by issue characteristics.
+    per_label = {}
+    per_area = {}
+    per_point = {}
+    for d in dispatches:
+        labels = d.get("issue_labels") or []
+        area = d.get("area") or "unlabeled"
+        point = d.get("point_estimate") or "unlabeled"
+        for label in labels:
+            # Skip structural labels — those have their own dimensions.
+            if label.startswith("area:") or label.startswith("point:"):
+                continue
+            if label not in per_label:
+                per_label[label] = {
+                    "dispatches": 0, "merged": 0, "blocked": 0,
+                    "avg_latency_seconds": 0,
+                }
+            per_label[label]["dispatches"] += 1
+        if area not in per_area:
+            per_area[area] = {
+                "dispatches": 0, "merged": 0, "blocked": 0,
+                "avg_latency_seconds": 0,
+            }
+        per_area[area]["dispatches"] += 1
+        if point not in per_point:
+            per_point[point] = {
+                "dispatches": 0, "merged": 0, "blocked": 0,
+                "avg_latency_seconds": 0,
+            }
+        per_point[point]["dispatches"] += 1
+
     # Group transitions by aoe_id_prefix
     transitions_by_session = {}
     for t in transitions:
@@ -615,6 +647,20 @@ def compute_stats(since=None):
                 if model and model in per_model:
                     per_model[model]["blocked"] = \
                         per_model[model].get("blocked", 0) + 1
+                # Per-class BLOCKED tracking (#76 PR B)
+                labels = disp.get("issue_labels") or []
+                area = disp.get("area") or "unlabeled"
+                point = disp.get("point_estimate") or "unlabeled"
+                for label in labels:
+                    if label in per_label:
+                        per_label[label]["blocked"] = \
+                            per_label[label].get("blocked", 0) + 1
+                if area in per_area:
+                    per_area[area]["blocked"] = \
+                        per_area[area].get("blocked", 0) + 1
+                if point in per_point:
+                    per_point[point]["blocked"] = \
+                        per_point[point].get("blocked", 0) + 1
             if t.get("to_status") == "MERGE-READY":
                 merge_ready_count += 1
 
@@ -670,6 +716,24 @@ def compute_stats(since=None):
                                 (old_avg * n + latency) / (n + 1)
                             )
                             pm["merged"] = n + 1
+                        # Per-class merged/latency tracking (#76 PR B)
+                        labels = disp.get("issue_labels") or []
+                        area = disp.get("area") or "unlabeled"
+                        point = disp.get("point_estimate") or "unlabeled"
+                        for dim, key in [
+                            (per_label, labels),
+                            (per_area, [area]),
+                            (per_point, [point]),
+                        ]:
+                            for k in key:
+                                if k in dim:
+                                    pm2 = dim[k]
+                                    n2 = pm2.get("merged", 0)
+                                    oa = pm2.get("avg_latency_seconds", 0)
+                                    pm2["avg_latency_seconds"] = (
+                                        (oa * n2 + latency) / (n2 + 1)
+                                    )
+                                    pm2["merged"] = n2 + 1
                 except (ValueError, OverflowError):
                     pass
 
@@ -708,6 +772,9 @@ def compute_stats(since=None):
         "latency_p90_seconds": latency_p90,
         "completed_sessions": completed_sessions,
         "per_model": per_model,
+        "per_label": per_label,
+        "per_area": per_area,
+        "per_point": per_point,
     }
 
 
@@ -730,10 +797,13 @@ def _percentile(sorted_values, pct):
     return sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
 
 
-def format_stats_report(stats, as_json=False):
+def format_stats_report(stats, as_json=False, by_label=False,
+                        by_area=False, by_point=False):
     """Pretty-print the stats report.
 
     If as_json=True, output as JSON for machine consumption.
+    Per-class breakdowns (--by-label/--by-area/--by-point) are shown
+    when requested. Cells with n<5 are suppressed (low-N warning).
     """
     if as_json:
         print(json.dumps(stats, indent=2, default=str))
@@ -783,6 +853,32 @@ def format_stats_report(stats, as_json=False):
                 f"{mstats.get('blocked', 0):>8} "
                 f"{_hms(mstats.get('avg_latency_seconds', 0)):>8}"
             )
+
+    # Per-class breakdowns (#76 PR B). Suppress cells with n<5.
+    for dim_name, dim_flag, dim_data in [
+        ("Label", by_label, stats.get("per_label", {})),
+        ("Area", by_area, stats.get("per_area", {})),
+        ("Point", by_point, stats.get("per_point", {})),
+    ]:
+        if not dim_flag or not dim_data:
+            continue
+        print()
+        print(f"  Per-{dim_name.lower()} breakdown:")
+        col_hdr = dim_name[:30]
+        header = f"  {col_hdr:<30} {'Disp':>5} {'Merged':>7} {'Blocked':>8} {'Avg Lat':>8}"
+        print(header)
+        for key, mstats in sorted(dim_data.items()):
+            n = mstats.get("dispatches", 0)
+            if n < 5:
+                print(f"  {key:<30} {n:>5}  (low N — suppressed)")
+            else:
+                print(
+                    f"  {key:<30} "
+                    f"{n:>5} "
+                    f"{mstats.get('merged', 0):>7} "
+                    f"{mstats.get('blocked', 0):>8} "
+                    f"{_hms(mstats.get('avg_latency_seconds', 0)):>8}"
+                )
 
 
 # ── CLI entry point ───────────────────────────────────────────────
@@ -866,6 +962,9 @@ def main():
     elif subcmd == "stats":
         since = None
         as_json = False
+        by_label = False
+        by_area = False
+        by_point = False
         args = sys.argv[2:]
         i = 0
         while i < len(args):
@@ -875,10 +974,22 @@ def main():
             elif args[i] == "--json":
                 as_json = True
                 i += 1
+            elif args[i] == "--by-label":
+                by_label = True
+                i += 1
+            elif args[i] == "--by-area":
+                by_area = True
+                i += 1
+            elif args[i] == "--by-point":
+                by_point = True
+                i += 1
             else:
                 i += 1
         stats = compute_stats(since=since)
-        format_stats_report(stats, as_json=as_json)
+        format_stats_report(
+            stats, as_json=as_json,
+            by_label=by_label, by_area=by_area, by_point=by_point,
+        )
 
     else:
         print(f"unknown subcommand: {subcmd}", file=sys.stderr)
