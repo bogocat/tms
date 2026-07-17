@@ -93,16 +93,28 @@ independent review poller, `tms events scan-reviews --dispatch`), or
 | `aoe_id_prefix`  | string  | yes      | First 8 chars of aoe session UUID — primary join key |
 | `from_status`    | string  | yes      | Previous AGENT-STATE marker value |
 | `to_status`      | string  | yes      | New AGENT-STATE marker value |
+| `reason`         | string  | no       | BLOCKED marker reason text (tms#76 PR A) |
+| `blocked_class`  | string  | no       | BLOCKED taxonomy class (tms#76 follow-up, migration 005) |
 
 AGENT-STATE values: `PLAN-REVIEW`, `WORKING`, `PR-REVIEW`,
 `MERGE-READY`, `BLOCKED`, `DONE`. Additional value: `terminal`
 (emitted when a DONE/MERGE-READY session disappears from the aoe list).
 
-BLOCKED states may carry a reason in the marker text
-(`BLOCKED: review not converging`). The `from_status`/`to_status`
-fields store only the state name; the reason is not captured in
-the event schema (it's ephemeral diagnostic text, not an aggregate
-dimension).
+BLOCKED states carry the marker's reason text
+(`BLOCKED: review not converging`) in the `reason` field, and a
+machine-sliceable taxonomy class in `blocked_class` (derived by
+`classify_blocked_reason()` at transition time):
+
+| `blocked_class` | Meaning |
+|-----------------|---------|
+| `mechanical`    | Tool/spawn/environment failure (e.g. aoe start failed, rate limit) |
+| `ambiguous-ac`  | Issue unclear — agent stopped for human clarification |
+| `capacity`      | Model couldn't handle the task |
+| `scope-creep`   | Issue too large for one dispatch |
+| `other`         | Anything else (including legacy events with no class) |
+
+Query with `tms events stats --by-blocked-class`, or in SQL via the
+`blocked_class` flat column (migration 005).
 
 ## Transition detection guarantees and limitations
 

@@ -1459,6 +1459,10 @@ Usage:
 Stats options:
   --since YYYY-MM-DD         filter events from this date onward
   --json                     output as JSON (machine-readable)
+  --by-label                 per-label breakdown (merge/block rates, latency)
+  --by-area                  per-area breakdown (from area:* labels)
+  --by-point                 per-point-estimate breakdown (from point:N labels)
+  --by-blocked-class         BLOCKED events by taxonomy class (#76)
 
 Scan-reviews options (tms#57):
   --dispatch                 spawn `tmq review` for PRs needing review
