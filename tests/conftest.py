@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS events (
     issue_labels    TEXT,
     point_estimate  TEXT,
     area            TEXT,
+    blocked_class   TEXT,
     payload         TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_unique

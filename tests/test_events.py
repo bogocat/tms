@@ -909,3 +909,216 @@ class TestComputeStats:
         out = capsys.readouterr().out
         parsed = json.loads(out)
         assert parsed["total_dispatches"] == 1
+
+
+# ── BLOCKED reason taxonomy (#76 follow-up) ───────────────────────
+
+
+class TestClassifyBlockedReason:
+    """classify_blocked_reason: BLOCKED marker text → taxonomy value."""
+
+    @pytest.mark.parametrize("text,expected", [
+        ("tool crash: tmux spawn failed with ENOENT", "mechanical"),
+        ("aoe session start failed", "mechanical"),
+        ("rate limited by provider", "mechanical"),
+        ("AC is ambiguous — needs human clarification", "ambiguous-ac"),
+        ("unclear acceptance criteria", "ambiguous-ac"),
+        ("issue contradicts itself", "ambiguous-ac"),
+        ("scope too large — should be split into smaller issues", "scope-creep"),
+        ("this is too big for one PR", "scope-creep"),
+        ("too complex for me to complete", "capacity"),
+        ("cannot handle the migration", "capacity"),
+        ("unable to resolve the type errors", "capacity"),
+        ("waiting on the operator to decide", "other"),
+        ("", "other"),
+        (None, "other"),
+    ])
+    def test_taxonomy(self, text, expected):
+        from tms.events import classify_blocked_reason
+        assert classify_blocked_reason(text) == expected
+
+
+class TestBlockedTransitionTaxonomy:
+    """detect_transitions must classify BLOCKED transitions (#76 follow-up)."""
+
+    def test_blocked_transition_records_blocked_class(
+            self, test_db, monkeypatch, tmp_path):
+        from tms.events import detect_transitions
+
+        last_status_path = tmp_path / "last_status.json"
+        monkeypatch.setattr(
+            "tms.events.LAST_STATUS_PATH", str(last_status_path))
+        last_status_path.write_text(json.dumps({"abc12345": "WORKING"}))
+
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    _make_aoe_list_json([
+                        {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
+                         "title": "feat-tms#76", "path": "/root/wt-tms-76"},
+                    ]), "")
+            if cmd[0] == "tmux" and "capture-pane" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    "...\n<<AGENT-STATE: BLOCKED: AC is ambiguous — "
+                    "which table?>>\nwaiting...", "")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            n = detect_transitions()
+
+        assert n == 1
+        conn = test_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT to_status, reason, blocked_class, payload FROM events"
+            )
+            row = cur.fetchone()
+        assert row[0] == "BLOCKED"
+        assert row[1] == "AC is ambiguous — which table?"
+        assert row[2] == "ambiguous-ac"
+        payload = json.loads(row[3])
+        assert payload["blocked_class"] == "ambiguous-ac"
+
+    def test_non_blocked_transition_has_no_blocked_class(
+            self, test_db, monkeypatch, tmp_path):
+        from tms.events import detect_transitions
+
+        last_status_path = tmp_path / "last_status.json"
+        monkeypatch.setattr(
+            "tms.events.LAST_STATUS_PATH", str(last_status_path))
+        last_status_path.write_text(json.dumps({"abc12345": "WORKING"}))
+
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    _make_aoe_list_json([
+                        {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
+                         "title": "feat-tms#76", "path": "/root/wt-tms-76"},
+                    ]), "")
+            if cmd[0] == "tmux" and "capture-pane" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0, "<<AGENT-STATE: PR-REVIEW>>", "")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            detect_transitions()
+
+        conn = test_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT blocked_class FROM events")
+            row = cur.fetchone()
+        assert row[0] is None
+        # payload must not carry the key at all
+        with conn.cursor() as cur:
+            cur.execute("SELECT payload FROM events")
+            payload = json.loads(cur.fetchone()[0])
+        assert "blocked_class" not in payload
+
+
+def _seed_blocked_class_events(test_db):
+    """BLOCKED transitions carrying blocked_class payload values."""
+    _insert_fixture_events(test_db, [
+        {"event_type": "dispatch", "timestamp": "2026-07-01T10:00:00+00:00",
+         "repo": "tms", "issue": 1, "agent": "pi",
+         "provider": "minimax", "model": "MiniMax-M3",
+         "dispatch_type": "feature", "session": "feat-tms#1",
+         "aoe_id_prefix": "aaa"},
+        {"event_type": "transition", "timestamp": "2026-07-01T11:00:00+00:00",
+         "session": "feat-tms#1", "aoe_id_prefix": "aaa",
+         "from_status": "WORKING", "to_status": "BLOCKED",
+         "reason": "AC is ambiguous", "blocked_class": "ambiguous-ac"},
+        {"event_type": "transition", "timestamp": "2026-07-01T12:00:00+00:00",
+         "session": "feat-tms#1", "aoe_id_prefix": "aaa",
+         "from_status": "BLOCKED", "to_status": "WORKING"},
+        {"event_type": "transition", "timestamp": "2026-07-01T13:00:00+00:00",
+         "session": "feat-tms#1", "aoe_id_prefix": "aaa",
+         "from_status": "WORKING", "to_status": "BLOCKED",
+         "reason": "aoe session start failed",
+         "blocked_class": "mechanical"},
+        # Legacy BLOCKED transition with no class → bucketed as other
+        {"event_type": "transition", "timestamp": "2026-07-02T10:00:00+00:00",
+         "session": "feat-tms#9", "aoe_id_prefix": "zzz",
+         "from_status": "WORKING", "to_status": "BLOCKED"},
+    ])
+
+
+def test_per_blocked_class_in_stats(test_db):
+    """compute_stats exposes per_blocked_class counts (#76 follow-up)."""
+    _seed_blocked_class_events(test_db)
+    from tms.events import compute_stats
+
+    stats = compute_stats()
+    pbc = stats["per_blocked_class"]
+    assert pbc["ambiguous-ac"] == 1
+    assert pbc["mechanical"] == 1
+    assert pbc["other"] == 1  # legacy unclassified BLOCKED
+    assert sum(pbc.values()) == 3
+
+
+def test_per_blocked_class_empty(test_db):
+    from tms.events import compute_stats
+
+    stats = compute_stats()
+    assert stats["per_blocked_class"] == {}
+
+
+def test_default_report_hides_blocked_class_section(capsys):
+    """Default report unchanged: no taxonomy section without the flag."""
+    from tms.events import format_stats_report
+
+    stats = {
+        "total_dispatches": 1, "total_failed_dispatches": 0,
+        "total_transitions": 1, "fast_path_count": 1,
+        "normal_path_count": 0, "fast_path_rate": 1.0,
+        "review_rounds_total": 0, "review_rounds_avg": 0.0,
+        "blocked_count": 1, "merge_ready_count": 0, "blocked_rate": 1.0,
+        "latency_p50_seconds": 0, "latency_p90_seconds": 0,
+        "completed_sessions": 0, "per_model": {},
+        "per_label": {}, "per_area": {}, "per_point": {},
+        "per_blocked_class": {"ambiguous-ac": 1},
+    }
+    format_stats_report(stats)
+    out = capsys.readouterr().out
+    assert "BLOCKED by class" not in out
+
+
+def test_by_blocked_class_report_section(capsys):
+    from tms.events import format_stats_report
+
+    stats = {
+        "total_dispatches": 1, "total_failed_dispatches": 0,
+        "total_transitions": 1, "fast_path_count": 1,
+        "normal_path_count": 0, "fast_path_rate": 1.0,
+        "review_rounds_total": 0, "review_rounds_avg": 0.0,
+        "blocked_count": 1, "merge_ready_count": 0, "blocked_rate": 1.0,
+        "latency_p50_seconds": 0, "latency_p90_seconds": 0,
+        "completed_sessions": 0, "per_model": {},
+        "per_label": {}, "per_area": {}, "per_point": {},
+        "per_blocked_class": {"ambiguous-ac": 2, "mechanical": 1},
+    }
+    format_stats_report(stats, by_blocked_class=True)
+    out = capsys.readouterr().out
+    assert "BLOCKED by class" in out
+    assert "ambiguous-ac" in out
+    assert "mechanical" in out
+
+
+def test_main_stats_by_blocked_class_flag(test_db, monkeypatch, capsys):
+    """`python3 -m tms.events stats --by-blocked-class` prints the section."""
+    import sys
+    from tms import events
+
+    _seed_blocked_class_events(test_db)
+    monkeypatch.setattr(
+        sys, "argv", ["tms.events", "stats", "--by-blocked-class"])
+    events.main()
+    out = capsys.readouterr().out
+    assert "BLOCKED by class" in out
+    assert "ambiguous-ac" in out

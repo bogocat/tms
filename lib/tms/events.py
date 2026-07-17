@@ -113,10 +113,12 @@ def append_event(record: dict) -> None:
                     dispatch_type, worktree, session,
                     aoe_id_prefix, reason, from_status, to_status,
                     issue_labels, point_estimate, area,
+                    blocked_class,
                     payload)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
                            %s, %s, %s, %s, %s, %s, %s,
                            %s, %s, %s,
+                           %s,
                            %s)
                    ON CONFLICT (event_type, aoe_id_prefix, event_timestamp)
                    DO NOTHING""",
@@ -140,6 +142,7 @@ def append_event(record: dict) -> None:
                     json.dumps(record.get("issue_labels")) if record.get("issue_labels") else None,
                     record.get("point_estimate"),
                     record.get("area"),
+                    record.get("blocked_class"),
                     payload,
                 ),
             )
@@ -306,6 +309,55 @@ def log_dispatch_failed_event(
     append_event(record)
 
 
+# ── BLOCKED reason taxonomy (#76 follow-up) ──────────────────────
+
+# Keyword table, checked in order — first class with a hit wins.
+# Order encodes specificity: mechanical (environment broke) before
+# ambiguous-ac (issue unclear) before scope-creep (too big) before
+# capacity (model couldn't) — a reason mentioning both "AC" and
+# "cannot" is an ambiguity block, not a capacity block.
+_BLOCKED_TAXONOMY = [
+    ("mechanical", [
+        "spawn", "crash", "enoent", "permission denied",
+        "command not found", "rate limit", "rate-limit", "ratelimit",
+        "tool ", "tool:", "traceback", "start failed", "mechanical",
+    ]),
+    ("ambiguous-ac", [
+        "ambiguous", "unclear", "clarif", "acceptance criteria",
+        "contradict",
+    ]),
+    ("scope-creep", [
+        "scope", "too large", "too big", "too much", "split",
+        "break up", "break it", "break this", "smaller issue",
+        "smaller chunk",
+    ]),
+    ("capacity", [
+        "cannot", "can't", "couldn't", "unable", "too complex",
+        "too hard", "too difficult", "beyond my", "out of my depth",
+        "context limit", "context window",
+    ]),
+]
+
+_BLOCKED_AC_RE = re.compile(r"\bac\b", re.IGNORECASE)
+
+
+def classify_blocked_reason(reason):
+    """Classify BLOCKED marker text into the #76 taxonomy.
+
+    Returns one of: mechanical | ambiguous-ac | capacity | scope-creep
+    | other. Keyword match on the lowercased reason; empty/None → other.
+    """
+    if not reason:
+        return "other"
+    text = reason.lower()
+    for cls, keywords in _BLOCKED_TAXONOMY:
+        if any(kw in text for kw in keywords):
+            return cls
+    if _BLOCKED_AC_RE.search(text):
+        return "ambiguous-ac"
+    return "other"
+
+
 # ── Transition detection ──────────────────────────────────────────
 # Phase 2: poll aoe + tmux pane capture, detect state transitions.
 # These are stubs until Phase 2 implementation.
@@ -425,6 +477,11 @@ def detect_transitions():
                 "to_status": new_state,
                 "reason": reason,
             }
+            # #76 follow-up: taxonomy class for BLOCKED transitions so
+            # blocked analysis is sliceable (mechanical / ambiguous-ac /
+            # capacity / scope-creep / other).
+            if new_state == "BLOCKED":
+                record["blocked_class"] = classify_blocked_reason(reason)
             append_event(record)
             emitted += 1
 
@@ -737,6 +794,14 @@ def compute_stats(since=None):
                 except (ValueError, OverflowError):
                     pass
 
+    # BLOCKED taxonomy counts (#76 follow-up): BLOCKED transitions by
+    # class. Legacy BLOCKED events without a class bucket as 'other'.
+    per_blocked_class = {}
+    for t in transitions:
+        if t.get("to_status") == "BLOCKED":
+            cls = t.get("blocked_class") or "other"
+            per_blocked_class[cls] = per_blocked_class.get(cls, 0) + 1
+
     # Compute aggregate stats
     review_rounds_avg = (
         review_rounds_total / sessions_with_reviews
@@ -775,6 +840,7 @@ def compute_stats(since=None):
         "per_label": per_label,
         "per_area": per_area,
         "per_point": per_point,
+        "per_blocked_class": per_blocked_class,
     }
 
 
@@ -798,7 +864,8 @@ def _percentile(sorted_values, pct):
 
 
 def format_stats_report(stats, as_json=False, by_label=False,
-                        by_area=False, by_point=False):
+                        by_area=False, by_point=False,
+                        by_blocked_class=False):
     """Pretty-print the stats report.
 
     If as_json=True, output as JSON for machine consumption.
@@ -879,6 +946,18 @@ def format_stats_report(stats, as_json=False, by_label=False,
                     f"{mstats.get('blocked', 0):>8} "
                     f"{_hms(mstats.get('avg_latency_seconds', 0)):>8}"
                 )
+
+    # BLOCKED taxonomy (#76 follow-up): why sessions blocked, by class.
+    if by_blocked_class:
+        pbc = stats.get("per_blocked_class", {})
+        if pbc:
+            print()
+            print("  BLOCKED by class:")
+            print(f"  {'Class':<24} {'Count':>6}")
+            print(f"  {'─'*24} {'─'*6}")
+            for cls, count in sorted(
+                    pbc.items(), key=lambda kv: (-kv[1], kv[0])):
+                print(f"  {cls:<24} {count:>6}")
 
 
 # ── CLI entry point ───────────────────────────────────────────────
@@ -965,6 +1044,7 @@ def main():
         by_label = False
         by_area = False
         by_point = False
+        by_blocked_class = False
         args = sys.argv[2:]
         i = 0
         while i < len(args):
@@ -983,12 +1063,16 @@ def main():
             elif args[i] == "--by-point":
                 by_point = True
                 i += 1
+            elif args[i] == "--by-blocked-class":
+                by_blocked_class = True
+                i += 1
             else:
                 i += 1
         stats = compute_stats(since=since)
         format_stats_report(
             stats, as_json=as_json,
             by_label=by_label, by_area=by_area, by_point=by_point,
+            by_blocked_class=by_blocked_class,
         )
 
     else:
