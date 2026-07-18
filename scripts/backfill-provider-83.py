@@ -25,14 +25,13 @@ Verification query (after --apply):
     FROM tms_review.events
     WHERE event_type='dispatch' AND provider=''
     GROUP BY 1 ORDER BY 1;
-    -- Expected: 0 recovered rows from Jul 14 via sibling,
-    --           26 unrecoverable rows on Jul 15-16 remain.
+    -- Expected: 1 recovered row (Jul 14 sibling), 26 unrecoverable
+    --           rows remain (1 on Jul 14, 19 on Jul 15, 5 on Jul 16).
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 
 
@@ -71,7 +70,11 @@ def analyze():
 
             prefixes = [row[1] for row in empty_rows]
 
-            # Find siblings with provider/model for these prefixes
+            # Find siblings with provider/model for these prefixes.
+            # Assumes one provider per aoe session (first sibling by
+            # created_at wins). Correct for the Jul 14-16 window where
+            # the tms writer (post-#73 fix) and tmq writer (pre-fix)
+            # fired for the same session.
             cur.execute(
                 """SELECT aoe_id_prefix, provider, model
                    FROM tms_review.events
@@ -119,13 +122,16 @@ def apply(recoverable_rows):
                 )
                 print(f"  Updated {row_id} ({prefix}): "
                       f"provider={provider}, model={model}")
-        conn.commit()
+        conn.commit()  # explicit commit after successful cursor iteration
         print(f"\nApplied {len(recoverable_rows)} row(s).")
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
     finally:
         conn.close()
+
+
+# After this PR lands in main, this script is archived; DO NOT re-run.
 
 
 def print_report(recoverable, unrecoverable):
