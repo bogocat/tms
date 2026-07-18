@@ -1491,7 +1491,7 @@ EOF
         case "${2:-}" in
             scan-wraps)
                 shift 2
-                PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")/../lib")" \
+                PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../lib \
                     python3 -m tms.wrap_on_terminal scan-wraps "$@"
                 ;;
             -h|--help)

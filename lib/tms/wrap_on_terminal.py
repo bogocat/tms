@@ -310,6 +310,7 @@ def _fetch_llm_call_count(repo, issue):
     also counts sibling sessions on the same worktree).
     """
     cwd_pattern = f"--root-wt-{repo}-{issue}--"
+    conn = None
     try:
         from tms.events import _read_db_config
         import psycopg2
@@ -334,6 +335,12 @@ def _fetch_llm_call_count(repo, issue):
                     return int(row[0])
     except Exception:
         pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
     return 0
 
 
@@ -350,10 +357,10 @@ REPO_TO_GH = {
     "tower-fleet": "bogocat/tower-fleet",
     "pi-dotfiles": "bogocat/pi-dotfiles",
     "tmq": "bogocat/tmq",
-    "rms": "bogocat/rms",
+    "rms": "bogocat/openrms",
     "tcg": "bogocat/tcg",
     "brainlearn": "bogocat/brainlearn",
-    "subtitleai": "bogocat/subtitleai",
+    "subtitleai": "bogocat/subtitlesv2",
     "music-control": "bogocat/music-control",
     "notes-app": "bogocat/notes-app",
     "replyflow": "bogocat/replyflow",
@@ -366,7 +373,7 @@ REPO_TO_GH = {
 }
 
 
-def _makdown_escape(text):
+def _markdown_escape(text):
     """Escape pipe characters for markdown tables."""
     return (text or "").replace("|", "\\|")
 
@@ -411,7 +418,7 @@ def synthesize_wrap_content(repo, issue, transitions, gh_prs, llm_call_count):
     pr_lines = []
     for pr in (gh_prs or []):
         num = pr.get("number", "?")
-        pr_title = _makdown_escape(pr.get("title", ""))
+        pr_title = _markdown_escape(pr.get("title", ""))
         state = pr.get("state", "?")
         merged = "merged" if pr.get("mergedAt") else state
         pr_lines.append(f"- PR #{num} ({merged}) — {pr_title}")
@@ -520,12 +527,12 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
     if not terminals:
         return results
 
-    # Track the latest terminal_ts across all processed transitions.
-    # We advance the watermark to the max of all processed terminal_ts
-    # at the end, so a partial run (crash mid-loop) re-processes anything
-    # that wasn't successfully wrapped.
-    max_ts = watermark
+    # Track the latest terminal_ts that was successfully processed
+    # (or already exists). We only advance the watermark past transitions
+    # that are definitively handled — failures re-process on next run.
+    wrapped_ts = watermark
     seen_issues = set()  # dedupe within a single scan run
+    newly_wrapped_this_run = set()  # (repo, issue) that got a wrap this run
 
     for term in terminals:
         repo = term["repo"]
@@ -537,23 +544,24 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
         # terminal transitions (re-dispatch after FAIL).
         issue_key = (repo, issue)
         if issue_key in seen_issues:
-            if ts > (max_ts or ""):
-                max_ts = ts
+            # If we wrapped this issue already this run, advance watermark
+            if issue_key in newly_wrapped_this_run and ts > (wrapped_ts or ""):
+                wrapped_ts = ts
             continue
         seen_issues.add(issue_key)
 
         # Idempotency: skip if a wrap already exists
         if wrap_exists(mem, repo, issue):
             results.append(_result(repo, issue, "skip_exists"))
-            if ts > (max_ts or ""):
-                max_ts = ts
+            if ts > (wrapped_ts or ""):
+                wrapped_ts = ts
             continue
 
         if not dispatch:
             results.append(_result(repo, issue, "would_wrap",
                                    {"terminal_ts": ts}))
-            if ts > (max_ts or ""):
-                max_ts = ts
+            if ts > (wrapped_ts or ""):
+                wrapped_ts = ts
             continue
 
         # Collect data
@@ -567,23 +575,21 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
             repo, issue, transitions, gh_prs, llm_count,
         )
 
-        # Frontmatter validation guard
+        # Frontmatter validation guard — don't advance watermark on
+        # validation failure (code bug, needs human fix)
         errors = validate_frontmatter(content)
         if errors:
             results.append(_result(repo, issue, "skip_frontmatter_invalid",
                                    {"errors": errors}))
-            if ts > (max_ts or ""):
-                max_ts = ts
             continue
 
         if dry_run:
             results.append(_result(repo, issue, "dry_run",
                                    {"content_len": len(content)}))
-            if ts > (max_ts or ""):
-                max_ts = ts
             continue
 
-        # Write memory file
+        # Write memory file — don't advance watermark on write failure
+        # (transient error, retry next run)
         try:
             os.makedirs(mem, exist_ok=True)
             filename = f"issue-wrap-{repo}#{issue}.md"
@@ -593,8 +599,6 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
         except OSError as e:
             results.append(_result(repo, issue, "skip_write_error",
                                    {"error": str(e)}))
-            if ts > (max_ts or ""):
-                max_ts = ts
             continue
 
         # Post issue comment
@@ -606,12 +610,14 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
             {"terminal_ts": ts, "comment_ok": comment_ok},
         ))
 
-        if ts > (max_ts or ""):
-            max_ts = ts
+        newly_wrapped_this_run.add(issue_key)
+        if ts > (wrapped_ts or ""):
+            wrapped_ts = ts
 
-    # Advance watermark
-    if dispatch and not dry_run and max_ts and max_ts != watermark:
-        write_watermark(wp, max_ts)
+    # Advance watermark only past successfully processed transitions.
+    # Failures (frontmatter validation, write errors) retry next run.
+    if dispatch and not dry_run and wrapped_ts and wrapped_ts != watermark:
+        write_watermark(wp, wrapped_ts)
 
     return results
 
@@ -622,7 +628,6 @@ def _post_issue_comment(gh_repo, issue, wrap_filename, transitions,
 
     Returns True on success, False on failure.
     """
-    mem_path = os.path.join(MEMORY_DIR, wrap_filename)
     pr_list = ", ".join(
         f"#{p['number']}" for p in (gh_prs or [])
     ) or "none"
@@ -653,11 +658,11 @@ def _post_issue_comment(gh_repo, issue, wrap_filename, transitions,
         "### Evidence queries",
         "```sql",
         "-- Terminal transition",
-        f"-- SELECT * FROM tms_review.events WHERE to_status='terminal'",
+        "-- SELECT * FROM tms_review.events WHERE to_status='terminal'",
         "",
         "-- LLM calls from this worktree",
-        f"-- SELECT COUNT(*) FROM bogocat.llm_call_log",
-        f"-- WHERE meta->>'encoded_cwd' = '--root-wt-<repo>-<issue>--'",
+        "-- SELECT COUNT(*) FROM bogocat.llm_call_log",
+        "-- WHERE meta->>'encoded_cwd' = '--root-wt-<repo>-<issue>--'",
         "```",
         "",
         "---",
