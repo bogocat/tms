@@ -1425,10 +1425,12 @@ case "${1:-}" in
         ;;
     events)
         # tms events — fleet dispatch metrics (issue #53) + independent
-        # review poller (issue #57). Subcommands:
-        #   transitions  poll aoe + tmux for state changes
-        #   stats        compute and print aggregate report
-        #   scan-reviews poll open PRs lacking a reviewer verdict (#57)
+        # review poller (issue #57) + dispatch_failed SLO monitor (#84).
+        # Subcommands:
+        #   transitions       poll aoe + tmux for state changes
+        #   stats             compute and print aggregate report
+        #   scan-reviews      poll open PRs lacking a reviewer verdict (#57)
+        #   dispatch-monitor  check dispatch_failed rate against SLO (#84)
         case "${2:-}" in
             transitions)
                 PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" \
@@ -1447,6 +1449,13 @@ case "${1:-}" in
                 PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" \
                     python3 -m tms.review_poll scan-reviews "$@"
                 ;;
+            dispatch-monitor)
+                # Dispatch-failure SLO monitor (tms#84). Default is dry run;
+                # omit --dry-run to send a real Telegram alert.
+                shift 2
+                PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" \
+                    python3 -m tms.dispatch_monitor check "$@"
+                ;;
             -h|--help)
                 cat <<'EOF'
 tms events — fleet dispatch metrics (issue #53) + review poller (#57)
@@ -1454,7 +1463,8 @@ tms events — fleet dispatch metrics (issue #53) + review poller (#57)
 Usage:
   tms events transitions     poll aoe + tmux panes, emit transition events
   tms events stats            compute and print aggregate metrics report
-  tms events scan-reviews     list open PRs lacking a reviewer verdict (#57)
+  tms events scan-reviews       list open PRs lacking a reviewer verdict (#57)
+  tms events dispatch-monitor   check dispatch_failed rate against SLO (#84)
 
 Stats options:
   --since YYYY-MM-DD         filter events from this date onward
@@ -1463,6 +1473,10 @@ Stats options:
   --by-area                  per-area breakdown (from area:* labels)
   --by-point                 per-point-estimate breakdown (from point:N labels)
   --by-blocked-class         BLOCKED events by taxonomy class (#76)
+
+Dispatch-monitor options (tms#84):
+  --dry-run                  log the alert to stdout instead of sending to
+                             Telegram (default: alert is sent if threshold exceeded)
 
 Scan-reviews options (tms#57):
   --dispatch                 spawn `tmq review` for PRs needing review
@@ -1475,7 +1489,7 @@ EOF
                 ;;
             *)
                 echo "tms events: unknown subcommand '${2:-}'" >&2
-                echo "Usage: tms events <transitions|stats|scan-reviews>" >&2
+                echo "Usage: tms events <transitions|stats|scan-reviews|dispatch-monitor>" >&2
                 exit 1
                 ;;
         esac
