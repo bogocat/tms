@@ -44,6 +44,20 @@ WATERMARK_PATH = os.path.expanduser("~/.local/state/tmq/wrap-watermark.json")
 # ── Watermark persistence ─────────────────────────────────────────
 
 
+def _to_iso_string(ts):
+    """Normalize a timestamp to an ISO-8601 string.
+
+    psycopg2 returns TIMESTAMPTZ columns as datetime objects;
+    sqlite3 (test shim) returns TEXT. This helper normalizes both
+    to a sortable ISO string so watermark comparisons work in production.
+    """
+    if ts is None:
+        return None
+    if hasattr(ts, "isoformat"):
+        return ts.isoformat()
+    return str(ts)
+
+
 def read_watermark(path=None):
     """Read the watermark timestamp from a JSON file.
 
@@ -68,10 +82,11 @@ def write_watermark(path, ts):
 
     p = path or WATERMARK_PATH
     os.makedirs(os.path.dirname(p), exist_ok=True)
+    ts_str = _to_iso_string(ts)
     fd, tmp_path = _tmp.mkstemp(dir=os.path.dirname(p), suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump({"last_terminal_ts": ts}, f)
+            json.dump({"last_terminal_ts": ts_str}, f)
         os.replace(tmp_path, p)
     except Exception:
         try:
@@ -532,7 +547,7 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
         repo = term["repo"]
         issue = term["issue"]
         aoe_prefix = term["aoe_id_prefix"]
-        ts = term["terminal_ts"]
+        ts = _to_iso_string(term["terminal_ts"])
 
         # Deduplicate within run: same issue may appear from multiple
         # terminal transitions (re-dispatch after FAIL).
