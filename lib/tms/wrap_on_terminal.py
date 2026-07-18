@@ -393,12 +393,6 @@ def synthesize_wrap_content(repo, issue, transitions, gh_prs, llm_call_count):
     today = datetime.date.today().isoformat()
     title = f"issue-wrap-{repo}#{issue}"
 
-    # Count states
-    states_seen = set()
-    for t in transitions:
-        states_seen.add(t.get("from_status", ""))
-        states_seen.add(t.get("to_status", ""))
-
     blocked_reasons = [
         t.get("reason") for t in transitions
         if t.get("to_status") == "BLOCKED" and t.get("reason")
@@ -527,12 +521,12 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
     if not terminals:
         return results
 
-    # Track the latest terminal_ts that was successfully processed
-    # (or already exists). We only advance the watermark past transitions
-    # that are definitively handled — failures re-process on next run.
+    # Watermark discipline: advance only through a contiguous prefix of
+    # successfully-handled transitions. On any failure, stop processing
+    # the batch — the watermark stays at the last successful position,
+    # so the failed transition is re-queried next run.
     wrapped_ts = watermark
     seen_issues = set()  # dedupe within a single scan run
-    newly_wrapped_this_run = set()  # (repo, issue) that got a wrap this run
 
     for term in terminals:
         repo = term["repo"]
@@ -544,9 +538,6 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
         # terminal transitions (re-dispatch after FAIL).
         issue_key = (repo, issue)
         if issue_key in seen_issues:
-            # If we wrapped this issue already this run, advance watermark
-            if issue_key in newly_wrapped_this_run and ts > (wrapped_ts or ""):
-                wrapped_ts = ts
             continue
         seen_issues.add(issue_key)
 
@@ -557,7 +548,10 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
                 wrapped_ts = ts
             continue
 
-        if not dispatch:
+        # Dry-run and non-dispatch both collect data and synthesize
+        # content, but neither writes files or posts comments.
+        collect = dispatch or dry_run
+        if not collect:
             results.append(_result(repo, issue, "would_wrap",
                                    {"terminal_ts": ts}))
             if ts > (wrapped_ts or ""):
@@ -575,33 +569,49 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
             repo, issue, transitions, gh_prs, llm_count,
         )
 
-        # Frontmatter validation guard — don't advance watermark on
-        # validation failure (code bug, needs human fix)
+        # Frontmatter validation guard — failure stops the batch.
+        # This is a code bug (generated content is invalid), not
+        # a transient error — retrying won't help.
         errors = validate_frontmatter(content)
         if errors:
             results.append(_result(repo, issue, "skip_frontmatter_invalid",
                                    {"errors": errors}))
-            continue
+            break
 
         if dry_run:
             results.append(_result(repo, issue, "dry_run",
                                    {"content_len": len(content)}))
             continue
 
-        # Write memory file — don't advance watermark on write failure
-        # (transient error, retry next run)
+        # Write memory file atomically (tmp + os.replace) so a
+        # partial write cannot masquerade as a successful wrap.
+        import tempfile as _tmp2
         try:
             os.makedirs(mem, exist_ok=True)
             filename = f"issue-wrap-{repo}#{issue}.md"
             filepath = os.path.join(mem, filename)
-            with open(filepath, "w") as f:
-                f.write(content)
+            fd2, tmp_path2 = _tmp2.mkstemp(
+                dir=mem, prefix=f".tmp-issue-wrap-{repo}#{issue}-",
+                suffix=".md",
+            )
+            try:
+                with os.fdopen(fd2, "w") as f:
+                    f.write(content)
+                os.replace(tmp_path2, filepath)
+            except Exception:
+                try:
+                    os.unlink(tmp_path2)
+                except OSError:
+                    pass
+                raise
         except OSError as e:
             results.append(_result(repo, issue, "skip_write_error",
                                    {"error": str(e)}))
-            continue
+            break
 
-        # Post issue comment
+        # Post issue comment. If the comment fails, record the failure
+        # but still count this as wrapped (the memory file is the durable
+        # artifact). The comment can be posted manually.
         comment_ok = _post_issue_comment(gh_repo, issue, filename, transitions,
                                          gh_prs, llm_count)
 
@@ -610,12 +620,13 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
             {"terminal_ts": ts, "comment_ok": comment_ok},
         ))
 
-        newly_wrapped_this_run.add(issue_key)
         if ts > (wrapped_ts or ""):
             wrapped_ts = ts
 
-    # Advance watermark only past successfully processed transitions.
-    # Failures (frontmatter validation, write errors) retry next run.
+    # Advance watermark past the contiguous block of successfully
+    # handled transitions. Any break (validation error, write error)
+    # leaves the watermark at the last success, so the failed row
+    # is re-queried next run.
     if dispatch and not dry_run and wrapped_ts and wrapped_ts != watermark:
         write_watermark(wp, wrapped_ts)
 
