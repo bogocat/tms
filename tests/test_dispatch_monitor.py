@@ -168,7 +168,7 @@ class TestWatermark:
 
     def test_should_alert_false_when_recently_alerted(self, tmp_path, monkeypatch):
         """If the same storm_key was alerted < TTL ago, don't re-alert."""
-        from tms.dispatch_monitor import should_alert, _WATERMARK_TTL_HOURS
+        from tms.dispatch_monitor import should_alert
 
         wm_path = tmp_path / "watermark.json"
         monkeypatch.setattr("tms.dispatch_monitor.WATERMARK_PATH", str(wm_path))
@@ -184,14 +184,14 @@ class TestWatermark:
 
     def test_should_alert_true_after_ttl_expiry(self, tmp_path, monkeypatch):
         """After TTL expires, re-alert is allowed."""
-        from tms.dispatch_monitor import should_alert, _WATERMARK_TTL_HOURS
+        from tms.dispatch_monitor import should_alert
 
         wm_path = tmp_path / "watermark.json"
         monkeypatch.setattr("tms.dispatch_monitor.WATERMARK_PATH", str(wm_path))
 
         # Seed a watermark from TTL+1 hour ago
         old = (dt.datetime.now(dt.timezone.utc) -
-               dt.timedelta(hours=_WATERMARK_TTL_HOURS + 1)).isoformat()
+               dt.timedelta(hours=5)).isoformat()
         wm_path.write_text(json.dumps({
             "hp#306": old,
         }))
@@ -209,7 +209,7 @@ class TestWatermark:
 
     def test_record_alert_writes_watermark(self, tmp_path, monkeypatch):
         """record_alert must write a watermark entry."""
-        from tms.dispatch_monitor import record_alert, _WATERMARK_TTL_HOURS
+        from tms.dispatch_monitor import record_alert
 
         wm_path = tmp_path / "watermark.json"
         monkeypatch.setattr("tms.dispatch_monitor.WATERMARK_PATH", str(wm_path))
@@ -225,7 +225,7 @@ class TestWatermark:
 
     def test_watermark_merges_existing_entries(self, tmp_path, monkeypatch):
         """record_alert must preserve existing entries for other keys."""
-        from tms.dispatch_monitor import record_alert, _WATERMARK_TTL_HOURS
+        from tms.dispatch_monitor import record_alert
 
         wm_path = tmp_path / "watermark.json"
         monkeypatch.setattr("tms.dispatch_monitor.WATERMARK_PATH", str(wm_path))

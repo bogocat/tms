@@ -22,13 +22,14 @@ Watermark: /tmp/tmq-dispatch-monitor-watermark.json (ephemeral per-boot).
 import datetime
 import json
 import os
-import subprocess
 import sys
 from collections import Counter
 
 import psycopg2
 import requests
 import yaml
+
+from tms.events import _read_db_config
 
 
 # ── Paths ─────────────────────────────────────────────────────────
@@ -59,21 +60,6 @@ _TELEGRAM_ENV_PATH = os.path.expanduser("~/.claude/channels/telegram/.env")
 _MAX_REASON_LEN = 80
 
 # ── Database connection (shared with events.py pattern) ───────────
-
-_DB_CONF_PATH = os.path.expanduser("~/.config/bogocat/db.conf")
-
-
-def _read_db_config():
-    """Parse db.conf into a dict {host, dbname, user, password}."""
-    with open(_DB_CONF_PATH) as f:
-        raw = f.read().strip()
-    config = {}
-    for token in raw.split():
-        if "=" in token:
-            key, val = token.split("=", 1)
-            config[key.strip()] = val.strip()
-    return config
-
 
 def _get_conn():
     """Return a psycopg2 connection. Monkeypatched in tests."""
@@ -302,8 +288,14 @@ def _read_telegram_token():
 def _get_telegram_chat_id():
     """Return the chat ID to send alerts to.
 
-    Uses the access.json allowlist to find the configured chat.
-    Falls back to the sender's user ID from access.json.
+    Reads the access.json allowlist for the configured operator.
+    Uses the first allowed sender ID as the chat target (Telegram
+    Bot API: for a direct message, chat_id == user_id).
+
+    Fragility note: if an additional user is ever added to the
+    allowlist before the operator's ID, alerts would misroute.
+    The access.json is single-operator by design (claude-telegram
+    channel setup) — this is not a multi-user bot.
 
     Returns None if not resolvable.
     """
@@ -405,7 +397,7 @@ def check_failure_rate(reference_time=None, dry_run=False):
     storm_key = ",".join(issue_keys)
     result["storm_key"] = storm_key
 
-    if not should_alert(total_count, storm_key):
+    if not should_alert(total_count, storm_key, threshold=threshold):
         return result
 
     message = build_alert_message(failures, threshold, total_count)
