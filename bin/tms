@@ -12,6 +12,10 @@
 #          --all      show all repos
 #          --force    skip cache (5-min TTL, /tmp/tms-issues-cache/)
 #          --clear-cache  wipe cached issue data
+#   tms events transitions  poll aoe + tmux panes, emit transition events
+#   tms events stats [opts]  compute and print aggregate metrics report
+#   tms events scan-reviews   list open PRs lacking reviewer verdict (#57)
+#   tms wraps scan-wraps     scan terminal transitions, dispatch objective wraps (#82)
 #
 # Keybindings in fzf:
 #   enter     attach to session (switch client)
@@ -1490,6 +1494,42 @@ EOF
             *)
                 echo "tms events: unknown subcommand '${2:-}'" >&2
                 echo "Usage: tms events <transitions|stats|scan-reviews|dispatch-monitor>" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    wraps)
+        # tms wraps — wrap-on-terminal hook (issue #82).
+        # Subcommand:
+        #   scan-wraps  poll for new terminal transitions, dispatch objective wraps
+        case "${2:-}" in
+            scan-wraps)
+                shift 2
+                PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../lib \
+                    python3 -m tms.wrap_on_terminal scan-wraps "$@"
+                ;;
+            -h|--help)
+                cat <<'EOF'
+tms wraps — wrap-on-terminal hook (issue #82)
+
+Usage:
+  tms wraps scan-wraps     scan for new terminal transitions, dispatch wraps
+
+Options:
+  --dispatch               write memory files + post issue comments
+                           (default: dry run, no side effects)
+  --dry-run                synthesize wraps without writing (for testing)
+
+Objective wrap: when an agent session reaches terminal state,
+synthesize a session wrap from objective sources only (events, gh,
+llm_call_log) — no conversation data. Output is a memory file at
+~/.claude/projects/-root/memory/issue-wrap-<repo>#<issue>.md and a
+closing comment on the GitHub issue.
+EOF
+                ;;
+            *)
+                echo "tms wraps: unknown subcommand '${2:-}'" >&2
+                echo "Usage: tms wraps scan-wraps" >&2
                 exit 1
                 ;;
         esac

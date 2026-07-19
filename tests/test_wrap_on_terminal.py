@@ -1,0 +1,403 @@
+"""Tests for wrap-on-terminal hook (issue #82).
+
+Covers:
+  - Watermark management (read/write/advance)
+  - Idempotency (re-run over same terminal transition = no-op)
+  - Objective-mode synthesis from fixture events
+  - Frontmatter validation guard
+"""
+
+import json
+import os
+import tempfile
+from unittest.mock import patch
+
+import pytest
+
+
+# ── Watermark tests ──────────────────────────────────────────────
+
+
+class TestWatermark:
+    """Watermark persistence: read, write, advance, and first-run behavior."""
+
+    def test_read_watermark_returns_none_on_missing_file(self):
+        """If no watermark file exists, read returns None (first run)."""
+        from tms.wrap_on_terminal import read_watermark
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "nonexistent.json")
+            assert read_watermark(path) is None
+
+    def test_read_watermark_returns_timestamp(self):
+        """Read returns the stored ISO timestamp."""
+        from tms.wrap_on_terminal import read_watermark, write_watermark
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "watermark.json")
+            ts = "2026-07-17T12:00:00+00:00"
+            write_watermark(path, ts)
+            assert read_watermark(path) == ts
+
+    def test_write_watermark_overwrites(self):
+        """Write overwrites an existing watermark."""
+        from tms.wrap_on_terminal import read_watermark, write_watermark
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "watermark.json")
+            write_watermark(path, "2026-07-17T10:00:00+00:00")
+            write_watermark(path, "2026-07-17T14:00:00+00:00")
+            assert read_watermark(path) == "2026-07-17T14:00:00+00:00"
+
+    def test_watermark_compare_skip_when_terminal_before_watermark(self):
+        """A terminal transition with timestamp <= watermark should be skipped."""
+        from tms.wrap_on_terminal import is_new_terminal
+
+        watermark = "2026-07-17T12:00:00+00:00"
+        # Terminal timestamp is before watermark → not new
+        terminal_ts = "2026-07-17T10:00:00+00:00"
+        assert not is_new_terminal(watermark, terminal_ts)
+
+    def test_watermark_compare_process_when_terminal_after_watermark(self):
+        """A terminal transition with timestamp > watermark should be processed."""
+        from tms.wrap_on_terminal import is_new_terminal
+
+        watermark = "2026-07-17T12:00:00+00:00"
+        terminal_ts = "2026-07-17T14:00:00+00:00"
+        assert is_new_terminal(watermark, terminal_ts)
+
+    def test_watermark_compare_process_when_no_watermark(self):
+        """First run (no watermark) should process all terminal transitions."""
+        from tms.wrap_on_terminal import is_new_terminal
+
+        assert is_new_terminal(None, "2026-07-17T12:00:00+00:00")
+
+
+# ── Idempotency tests ────────────────────────────────────────────
+
+
+class TestIdempotency:
+    """Re-running over the same terminal transition must be a no-op."""
+
+    def test_wrap_exists_for_issue_returns_true(self):
+        """wrap_exists returns True when memory file already exists."""
+        from tms.wrap_on_terminal import wrap_exists
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mem_dir = os.path.join(tmp, "memory")
+            os.makedirs(mem_dir)
+            path = os.path.join(mem_dir, "issue-wrap-tms#99.md")
+            with open(path, "w") as f:
+                f.write("---\nname: issue-wrap-tms#99\n---\n")
+            assert wrap_exists(mem_dir, "tms", 99)
+
+    def test_wrap_exists_returns_false_when_no_file(self):
+        """wrap_exists returns False when no wrap file exists."""
+        from tms.wrap_on_terminal import wrap_exists
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mem_dir = os.path.join(tmp, "memory")
+            os.makedirs(mem_dir)
+            assert not wrap_exists(mem_dir, "tms", 99)
+
+
+# ── Frontmatter validation tests ─────────────────────────────────
+
+
+class TestFrontmatterValidation:
+    """Frontmatter validation guard — refuse to write memory files
+    missing name: / description: / metadata:."""
+
+    def test_valid_frontmatter_passes(self):
+        """A well-formed frontmatter block passes validation."""
+        from tms.wrap_on_terminal import validate_frontmatter
+
+        content = """---
+name: issue-wrap-distillery#558
+description: "Wrap for distillery#558 — objective mode"
+metadata:
+  node_type: memory
+  type: project
+---
+
+## Summary
+"""
+        errors = validate_frontmatter(content)
+        assert errors == []
+
+    def test_missing_name_fails(self):
+        """Frontmatter missing 'name:' is rejected."""
+        from tms.wrap_on_terminal import validate_frontmatter
+
+        content = """---
+description: "Wrap for distillery#558"
+metadata:
+  node_type: memory
+---
+
+## Summary
+"""
+        errors = validate_frontmatter(content)
+        assert len(errors) == 1
+        assert "name" in errors[0].lower()
+
+    def test_missing_description_fails(self):
+        """Frontmatter missing 'description:' is rejected."""
+        from tms.wrap_on_terminal import validate_frontmatter
+
+        content = """---
+name: issue-wrap-distillery#558
+metadata:
+  node_type: memory
+---
+
+## Summary
+"""
+        errors = validate_frontmatter(content)
+        assert len(errors) == 1
+        assert "description" in errors[0].lower()
+
+    def test_missing_metadata_fails(self):
+        """Frontmatter missing 'metadata:' is rejected."""
+        from tms.wrap_on_terminal import validate_frontmatter
+
+        content = """---
+name: issue-wrap-distillery#558
+description: "Wrap for distillery#558"
+---
+
+## Summary
+"""
+        errors = validate_frontmatter(content)
+        assert len(errors) == 1
+        assert "metadata" in errors[0].lower()
+
+    def test_no_frontmatter_at_all_fails(self):
+        """Content with no YAML frontmatter at all is rejected."""
+        from tms.wrap_on_terminal import validate_frontmatter
+
+        content = "## Summary\n\nJust text, no frontmatter."
+        errors = validate_frontmatter(content)
+        assert len(errors) >= 1
+
+    def test_multiple_missing_fields_reports_all(self):
+        """When multiple required fields are missing, all are reported."""
+        from tms.wrap_on_terminal import validate_frontmatter
+
+        content = """---
+---
+
+## Summary
+"""
+        errors = validate_frontmatter(content)
+        # Empty frontmatter (just --- delimiters) means yaml.safe_load
+        # returns None, which is not a dict → single error.
+        # A frontmatter with only non-required keys should pass.
+        # This test verifies that ALL three required fields are checked
+        # when we have a dict with some but not all.
+        content2 = """---
+name: test
+---
+
+## Summary
+"""
+        errors2 = validate_frontmatter(content2)
+        # name present, description + metadata missing
+        assert len(errors2) == 2
+
+
+# ── Objective-mode synthesis from fixture events ──────────────────
+
+
+class TestObjectiveSynthesis:
+    """Build a wrap from objective sources only (no conversation)."""
+
+    def test_find_terminal_transitions_since(self, test_db):
+        """find_terminal_transitions_since returns terminal events
+        with event_timestamp > watermark, each with repo/issue resolved."""
+        from tms.wrap_on_terminal import find_terminal_transitions_since
+        from tms.events import append_event
+
+        # Seed: a dispatch event + matching terminal transition
+        append_event({
+            "event_type": "dispatch",
+            "timestamp": "2026-07-17T10:00:00+00:00",
+            "repo": "distillery",
+            "issue": 558,
+            "aoe_id_prefix": "abc12345",
+        })
+        append_event({
+            "event_type": "transition",
+            "timestamp": "2026-07-17T12:00:00+00:00",
+            "aoe_id_prefix": "abc12345",
+            "from_status": "DONE",
+            "to_status": "terminal",
+        })
+        # Another terminal without a dispatch (should be skipped)
+        append_event({
+            "event_type": "transition",
+            "timestamp": "2026-07-17T13:00:00+00:00",
+            "aoe_id_prefix": "orphan99",
+            "from_status": "DONE",
+            "to_status": "terminal",
+        })
+
+        results = find_terminal_transitions_since(None)
+        assert len(results) == 1
+        r = results[0]
+        assert r["repo"] == "distillery"
+        assert r["issue"] == 558
+        assert r["aoe_id_prefix"] == "abc12345"
+
+    def test_find_terminal_transitions_since_respects_watermark(self, test_db):
+        """Transitions with timestamp <= watermark are excluded."""
+        from tms.wrap_on_terminal import find_terminal_transitions_since
+        from tms.events import append_event
+
+        append_event({
+            "event_type": "dispatch",
+            "timestamp": "2026-07-17T08:00:00+00:00",
+            "repo": "tms",
+            "issue": 82,
+            "aoe_id_prefix": "def67890",
+        })
+        append_event({
+            "event_type": "transition",
+            "timestamp": "2026-07-17T09:00:00+00:00",
+            "aoe_id_prefix": "def67890",
+            "from_status": "DONE",
+            "to_status": "terminal",
+        })
+
+        # Watermark after the transition → excluded
+        results = find_terminal_transitions_since("2026-07-17T10:00:00+00:00")
+        assert len(results) == 0
+
+        # Watermark before the transition → included
+        results = find_terminal_transitions_since("2026-07-17T08:30:00+00:00")
+        assert len(results) == 1
+
+    def test_collect_event_history(self, test_db):
+        """collect_event_history returns all transitions for a given aoe_id_prefix."""
+        from tms.wrap_on_terminal import collect_event_history
+        from tms.events import append_event
+
+        prefix = "hist1234"
+        append_event({
+            "event_type": "dispatch",
+            "timestamp": "2026-07-17T08:00:00+00:00",
+            "repo": "tms",
+            "issue": 82,
+            "aoe_id_prefix": prefix,
+        })
+        append_event({
+            "event_type": "transition",
+            "timestamp": "2026-07-17T08:30:00+00:00",
+            "aoe_id_prefix": prefix,
+            "from_status": "PLAN-REVIEW",
+            "to_status": "WORKING",
+        })
+        append_event({
+            "event_type": "transition",
+            "timestamp": "2026-07-17T09:00:00+00:00",
+            "aoe_id_prefix": prefix,
+            "from_status": "WORKING",
+            "to_status": "PR-REVIEW",
+        })
+        append_event({
+            "event_type": "transition",
+            "timestamp": "2026-07-17T10:00:00+00:00",
+            "aoe_id_prefix": prefix,
+            "from_status": "MERGE-READY",
+            "to_status": "terminal",
+        })
+        # Another session's transition (should be excluded)
+        append_event({
+            "event_type": "transition",
+            "timestamp": "2026-07-17T09:30:00+00:00",
+            "aoe_id_prefix": "other99",
+            "from_status": "WORKING",
+            "to_status": "BLOCKED",
+        })
+
+        history = collect_event_history(prefix)
+        assert len(history) == 3  # 3 transitions for this prefix
+        statuses = [(h["from_status"], h["to_status"]) for h in history]
+        assert ("PLAN-REVIEW", "WORKING") in statuses
+        assert ("WORKING", "PR-REVIEW") in statuses
+        assert ("MERGE-READY", "terminal") in statuses
+
+    def test_synthesize_wrap_content(self):
+        """synthesize_wrap_content produces valid markdown with frontmatter."""
+        from tms.wrap_on_terminal import synthesize_wrap_content
+
+        transitions = [
+            {"from_status": "PLAN-REVIEW", "to_status": "WORKING",
+             "timestamp": "2026-07-17T08:30:00+00:00"},
+            {"from_status": "WORKING", "to_status": "PR-REVIEW",
+             "timestamp": "2026-07-17T09:00:00+00:00"},
+            {"from_status": "MERGE-READY", "to_status": "terminal",
+             "timestamp": "2026-07-17T10:00:00+00:00"},
+        ]
+
+        content = synthesize_wrap_content(
+            repo="tms",
+            issue=82,
+            transitions=transitions,
+            gh_prs=[{"number": 83, "title": "feat: wrap-on-terminal hook"}],
+            llm_call_count=42,
+        )
+
+        # Must start with valid YAML frontmatter
+        assert content.startswith("---\n")
+        # Must contain required fields
+        assert "name: issue-wrap-tms#82" in content
+        assert "description:" in content
+        assert "metadata:" in content
+        # Must contain the PR reference
+        assert "#83" in content
+        # Must pass validation
+        from tms.wrap_on_terminal import validate_frontmatter
+        assert validate_frontmatter(content) == []
+
+
+# ── REPO_TO_GH registry sync test ────────────────────────────────
+
+
+def test_repo_to_gh_matches_tmq_registry():
+    """REPO_TO_GH must match the live tmq registry.
+
+    The map is hardcoded for performance (avoids subprocess on every
+    poller tick), but this test keeps it honest — any drift between
+    the hardcoded map and tmq list --machine fails fast in CI.
+    """
+    from tms.wrap_on_terminal import REPO_TO_GH
+    from tms.review_poll import _repo_registry
+
+    live = dict(_repo_registry())
+    hardcoded = dict(REPO_TO_GH)
+
+    # Every entry in the hardcoded map that IS in the live registry
+    # must match. Entries only in hardcoded (not tmq-registered) and
+    # entries only in live (new repos not yet in hardcoded) are warnings.
+    mismatches = []
+    for short, expected_gh in sorted(hardcoded.items()):
+        live_gh = live.get(short)
+        if live_gh is None:
+            continue  # not in tmq registry — covered by missing-warning below
+        if live_gh != expected_gh:
+            mismatches.append(f"{short}: hardcoded={expected_gh}, live={live_gh}")
+
+    if mismatches:
+        msg = "REPO_TO_GH out of sync with tmq registry:\n" + "\n".join(mismatches)
+        msg += "\n\nUpdate REPO_TO_GH in lib/tms/wrap_on_terminal.py to match."
+        pytest.fail(msg)
+
+    # Optional: warn about repos in live but not in hardcoded map
+    missing = set(live) - set(hardcoded)
+    if missing:
+        import warnings
+        warnings.warn(
+            f"REPO_TO_GH missing repos from tmq registry: {sorted(missing)}. "
+            f"Wraps for these repos will fall back to bogocat/<short-name>."
+        )
