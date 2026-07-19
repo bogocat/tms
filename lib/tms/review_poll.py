@@ -19,6 +19,11 @@ verdict comments. FAIL / stale-PASS PRs are skipped — the author owns that
 loop. Widen later by editing :func:`needs_poller_review` once #53 metrics
 show the poller is stable.
 
+Staleness filter (tms#91, 2026-07-19): PRs whose ``updatedAt`` is older
+than 14 days are skipped as ``skip_stale``. This prevents the 3/run cap
+from burning dispatches on dead PRs that will never reach MERGE-READY.
+PRs with the ``keep-warm`` label are exempt from the staleness filter.
+
 Public API:
   - REVIEW_VERDICT_RE            regex for the verdict line
   - parse_verdict_line(text)     -> dict | None
@@ -26,6 +31,7 @@ Public API:
   - sha_matches(verdict_sha, head_oid) -> bool
   - has_current_pass(comments, head_oid) -> bool
   - needs_poller_review(comments, head_oid) -> bool   (V1 policy)
+  - is_pr_stale(updated_at, days=14) -> bool   (tms#91)
   - list_open_prs(gh_repo)       -> list[dict]
   - live_review_sessions()       -> set[str] of "repo#pr" keys
   - scan_repos(dispatch=False, repo_filter=None) -> list[dict]
@@ -142,6 +148,45 @@ def needs_poller_review(comments, head_oid):
     return latest_verdict(comments) is None
 
 
+def is_pr_stale(updated_at, days=14):
+    """True if ``updated_at`` is older than ``days`` days.
+
+    ``updated_at`` is an ISO 8601 timestamp string (e.g. from
+    ``gh pr list --json updatedAt``). Returns False (fail-open) if
+    ``updated_at`` is None, empty, or unparseable — a missing
+    timestamp must not block a legitimate dispatch.
+
+    The comparison uses timezone-aware datetimes. The threshold is
+    exclusive: exactly ``days`` days ago is NOT stale.
+    """
+    if not updated_at:
+        return False
+    try:
+        ts = datetime.datetime.fromisoformat(
+            str(updated_at).replace('Z', '+00:00')
+        )
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+        # Compare on date boundaries for an exclusive threshold:
+        # exactly ``days`` days ago (same calendar date) is NOT stale.
+        return ts.date() < cutoff.date()
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+_KEEP_WARM_LABEL = 'keep-warm'
+
+
+def _has_keep_warm_label(labels):
+    """True if the PR's labels include ``keep-warm`` (case-insensitive)."""
+    if not labels:
+        return False
+    return any(
+        (l.get('name', '') if isinstance(l, dict) else str(l)).lower()
+        == _KEEP_WARM_LABEL
+        for l in labels
+    )
+
+
 def _classify_skip(comments, head_oid):
     """Human-readable skip reason for a PR that has a verdict (V1)."""
     v = latest_verdict(comments)
@@ -219,10 +264,13 @@ def list_open_prs(gh_repo):
     Uses ``--state open`` so closed/merged PRs are excluded by construction
     (AC4 first half). Drafts are returned here (with ``isDraft=True``) and
     filtered by the caller, so the scan can report them as ``skip_draft``.
+
+    Also fetches ``updatedAt`` (for staleness filter, tms#91) and ``labels``
+    (for keep-warm exemption).
     """
     data = _gh_json([
         'pr', 'list', '--repo', gh_repo, '--state', 'open',
-        '--json', 'number,headRefOid,isDraft', '--limit', '100',
+        '--json', 'number,headRefOid,isDraft,updatedAt,labels', '--limit', '100',
     ])
     if not isinstance(data, list):
         return []
@@ -398,10 +446,13 @@ def _result(repo, gh_repo, pr, status, head=None):
 def scan_repos(dispatch=False, repo_filter=None, max_dispatch=3):
     """Scan the repo registry for PRs needing an independent review.
 
-    For each open, non-draft PR with no verdict at all (V1) and no live
-    review session: record a candidate. When ``dispatch`` is True, spawn
+    For each open, non-draft PR with no verdict at all (V1), no live
+    review session, and updated within the last 14 days (tms#91 staleness
+    filter): record a candidate. When ``dispatch`` is True, spawn
     ``tmq review`` for it (after an orphan re-check) and log a dispatch
     event (``source='poller'``) to the #53 event log.
+
+    PRs labelled ``keep-warm`` are exempt from the staleness filter.
 
     ``max_dispatch`` caps dispatches per run so a large backlog (e.g. the
     first run against old PRs) does not spawn an unbounded burst of review
@@ -411,9 +462,9 @@ def scan_repos(dispatch=False, repo_filter=None, max_dispatch=3):
 
     Returns a list of result dicts: ``{repo, gh_repo, pr, status, head}``
     where status is one of: ``would_dispatch``, ``dispatched``,
-    ``skip_draft``, ``skip_current_pass``, ``skip_fail``, ``skip_stale_pass``,
-    ``skip_live_session``, ``skip_closed``, ``skip_gh_error``,
-    ``skip_dispatch_failed``, ``skip_verdict``.
+    ``skip_draft``, ``skip_stale``, ``skip_current_pass``, ``skip_fail``,
+    ``skip_stale_pass``, ``skip_live_session``, ``skip_closed``,
+    ``skip_gh_error``, ``skip_dispatch_failed``, ``skip_verdict``.
     """
     live = live_review_sessions()
     results = []
@@ -428,6 +479,15 @@ def scan_repos(dispatch=False, repo_filter=None, max_dispatch=3):
 
             if pr.get('isDraft'):
                 results.append(_result(short, gh_repo, number, 'skip_draft', head))
+                continue
+
+            # Staleness filter (tms#91): skip PRs with no activity in >14 days
+            # unless labelled keep-warm. Checked before verdict/comment fetch
+            # so stale PRs don't waste a gh API call for fetching comments.
+            if is_pr_stale(pr.get('updatedAt')) and not _has_keep_warm_label(
+                pr.get('labels', [])
+            ):
+                results.append(_result(short, gh_repo, number, 'skip_stale', head))
                 continue
 
             comments, ok = _pr_comment_bodies(gh_repo, number)
@@ -518,6 +578,7 @@ def _format_report(results):
     # Show dispatch candidates first, then skips.
     order = ['dispatched', 'would_dispatch',
              'skip_live_session', 'skip_closed',
+             'skip_stale',
              'skip_gh_error', 'skip_dispatch_failed',
              'skip_draft', 'skip_fail', 'skip_stale_pass',
              'skip_current_pass', 'skip_verdict']

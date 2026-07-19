@@ -526,3 +526,141 @@ class TestScanRepos:
         )
         results = review_poll.scan_repos(dispatch=False)
         assert results[0]["status"] == "skip_stale_pass"
+
+
+# ── is_pr_stale (staleness filter, tms#91) ───────────────────────
+
+class TestIsPrStale:
+    def test_recent_pr_not_stale(self):
+        # A PR updated 1 hour ago is not stale.
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        recent = (now - datetime.timedelta(hours=1)).isoformat()
+        assert not review_poll.is_pr_stale(recent, days=14)
+
+    def test_old_pr_is_stale(self):
+        # A PR updated 15 days ago IS stale at 14-day threshold.
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        old = (now - datetime.timedelta(days=15)).isoformat()
+        assert review_poll.is_pr_stale(old, days=14)
+
+    def test_exactly_at_threshold_not_stale(self):
+        # A PR updated exactly 14 days ago is NOT stale (threshold is >14).
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        at_threshold = (now - datetime.timedelta(days=14)).isoformat()
+        assert not review_poll.is_pr_stale(at_threshold, days=14)
+
+    def test_none_or_empty_updated_at(self):
+        # Missing updatedAt is treated as not stale (fail-open).
+        assert not review_poll.is_pr_stale(None, days=14)
+        assert not review_poll.is_pr_stale("", days=14)
+
+    def test_custom_threshold(self):
+        # The days parameter is configurable.
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        old_7 = (now - datetime.timedelta(days=8)).isoformat()
+        assert review_poll.is_pr_stale(old_7, days=7)
+        assert not review_poll.is_pr_stale(old_7, days=14)
+
+
+# ── scan_repos staleness skip (tms#91) ────────────────────────────
+
+class TestScanReposStaleness:
+    HEAD = "16e3ead7bb5b2303157e01817f2816004d5ae11a"
+
+    def _setup(self, monkeypatch, prs, comments_by_pr, live=None):
+        monkeypatch.setattr(
+            review_poll, "_run_tmq_list_machine",
+            lambda: "tms\t/root/tms\tbogocat/tms\t1\n",
+        )
+        monkeypatch.setattr(review_poll, "list_open_prs", lambda gh: prs)
+        monkeypatch.setattr(review_poll, "_pr_comment_bodies",
+                            lambda gh, num: (comments_by_pr.get(num, []), True))
+        monkeypatch.setattr(review_poll, "live_review_sessions",
+                            lambda: set(live or []))
+        monkeypatch.setattr(review_poll, "_pr_still_open",
+                            lambda gh, num: True)
+
+    def test_skip_stale_pr_no_verdict(self, monkeypatch):
+        # A PR with no verdict but updated >14 days ago → skip_stale.
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stale_date = (now - datetime.timedelta(days=20)).isoformat()
+        self._setup(monkeypatch,
+            prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False,
+                   "updatedAt": stale_date}],
+            comments_by_pr={57: []},
+        )
+        results = review_poll.scan_repos(dispatch=False)
+        assert results[0]["status"] == "skip_stale"
+
+    def test_fresh_pr_not_skipped(self, monkeypatch):
+        # A PR with no verdict updated recently → would_dispatch (not stale).
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        fresh_date = (now - datetime.timedelta(hours=2)).isoformat()
+        self._setup(monkeypatch,
+            prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False,
+                   "updatedAt": fresh_date}],
+            comments_by_pr={57: []},
+        )
+        results = review_poll.scan_repos(dispatch=False)
+        assert results[0]["status"] == "would_dispatch"
+
+    def test_stale_checked_before_verdict(self, monkeypatch):
+        # Staleness check runs BEFORE verdict check — a stale PR is
+        # skip_stale even if it also has a verdict.
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stale_date = (now - datetime.timedelta(days=30)).isoformat()
+        self._setup(monkeypatch,
+            prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False,
+                   "updatedAt": stale_date}],
+            comments_by_pr={57: [
+                "<<REVIEW-VERDICT: FAIL sha=abc p0=2 rounds=1 panel=x>>"
+            ]},
+        )
+        results = review_poll.scan_repos(dispatch=False)
+        assert results[0]["status"] == "skip_stale"
+
+    def test_missing_updated_at_fail_open(self, monkeypatch):
+        # A PR without updatedAt in the JSON is treated as NOT stale
+        # (fail-open: don't starve new PRs because of a gh API quirk).
+        self._setup(monkeypatch,
+            prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False,
+                   "updatedAt": None}],
+            comments_by_pr={57: []},
+        )
+        results = review_poll.scan_repos(dispatch=False)
+        assert results[0]["status"] == "would_dispatch"
+
+    def test_keep_warm_label_exempts_from_staleness(self, monkeypatch):
+        # A stale PR labelled keep-warm is NOT skipped — exemption.
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stale_date = (now - datetime.timedelta(days=30)).isoformat()
+        self._setup(monkeypatch,
+            prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False,
+                   "updatedAt": stale_date,
+                   "labels": [{"name": "keep-warm"}]}],
+            comments_by_pr={57: []},
+        )
+        results = review_poll.scan_repos(dispatch=False)
+        assert results[0]["status"] == "would_dispatch"
+
+    def test_keep_warm_case_insensitive(self, monkeypatch):
+        # Label matching is case-insensitive.
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stale_date = (now - datetime.timedelta(days=30)).isoformat()
+        self._setup(monkeypatch,
+            prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False,
+                   "updatedAt": stale_date,
+                   "labels": [{"name": "KEEP-WARM"}]}],
+            comments_by_pr={57: []},
+        )
+        results = review_poll.scan_repos(dispatch=False)
+        assert results[0]["status"] == "would_dispatch"
