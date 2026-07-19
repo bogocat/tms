@@ -59,6 +59,9 @@ add_repo garmin-doctor       /root/projects/garmin-doctor       bogocat/garmin-d
 # this repo, so an in-place branch switch instantly changes live skill content for
 # every running agent. Always isolate in a worktree.
 add_repo pi-dotfiles         /root/pi-dotfiles                  bogocat/pi-dotfiles         1
+# worktree=1: active foreman development; daemon runs from the uv-installed
+# package (not this tree), but main gets concurrent feature work (22 PRs 07-16).
+add_repo openagent           /root/projects/openagent           bogocat/openagent           1
 
 # ── defaults ─────────────────────────────────────────────────────
 
