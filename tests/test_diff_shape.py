@@ -72,6 +72,34 @@ class TestSecuritySignal:
         result = classify_diff(diff)
         assert "security" in result
 
+    def test_compound_identifiers_authToken(self):
+        diff = """diff --git a/src/api.ts b/src/api.ts
++  const authToken = await refreshToken(req.sessionId);
+"""
+        result = classify_diff(diff)
+        assert "security" in result
+
+    def test_compound_identifiers_passwordHash(self):
+        diff = """diff --git a/src/user.ts b/src/user.ts
++  const hash = await bcrypt.hash(passwordHash, 10);
+"""
+        result = classify_diff(diff)
+        assert "security" in result
+
+    def test_compound_identifiers_permissions_set(self):
+        diff = """diff --git a/src/guard.ts b/src/guard.ts
++  if (!permissions.has('admin')) throw new ForbiddenError();
+"""
+        result = classify_diff(diff)
+        assert "security" in result
+
+    def test_compound_identifiers_oauth_token(self):
+        diff = """diff --git a/src/provider.ts b/src/provider.ts
++  const oauthToken = await exchangeCode(code);
+"""
+        result = classify_diff(diff)
+        assert "security" in result
+
 
 # ── Schema signal ─────────────────────────────────────────────────
 
@@ -259,7 +287,7 @@ class TestMultiSignal:
         assert "schema" in result
         assert "duplication" in result
 
-    def test_security_and_editorial_mutually_exclusive_by_design(self):
+    def test_security_and_editorial_can_coexist(self):
         # Security file path triggers security, but all changed files
         # are docs → editorial only gets triggered if all files are docs.
         # This diff has an auth file, so editorial won't fire even

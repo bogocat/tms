@@ -915,6 +915,10 @@ def compute_review_stats():
         )
 
     # --- Per-specialist stats (#94) ---
+    # NOTE: p0/p1/p2 counts and wall_time_ms are NOT additive across
+    # specialists. A run with ["security", "schema"] contributes its
+    # full findings and wall time to BOTH buckets — these are overlapping
+    # populations. Summing across specialists will overcount.
     per_specialist = {}
     for rr in reviewer_runs:
         composition = rr.get("specialist_composition", [])

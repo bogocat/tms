@@ -387,6 +387,9 @@ def _fetch_pr_diff(gh_repo, pr_number):
     """
     out = _run(['gh', 'pr', 'diff', str(pr_number), '--repo', gh_repo],
                timeout=30)
+    if not out:
+        print(f'WARNING: gh pr diff {gh_repo}#{pr_number} returned empty '
+              f'(timeout, auth error, or rate limit)', file=sys.stderr)
     return out if out else ''
 
 
@@ -588,7 +591,8 @@ def scan_repos(dispatch=False, repo_filter=None, max_dispatch=3):
                 results.append(_result(short, gh_repo, number, 'dispatched', head,
                                        specialists=specialists))
             else:
-                results.append(_result(short, gh_repo, number, 'skip_dispatch_failed', head))
+                results.append(_result(short, gh_repo, number, 'skip_dispatch_failed', head,
+                                       specialists=specialists))
 
     return results
 

@@ -30,19 +30,20 @@ SPECIALIST_SIGNALS = frozenset([
 
 _SECURITY_KEYWORDS = re.compile(
     r'^\+\s*.*\b(?:'
-    r'auth(?:enticate|orize?|n|entication|orization)?'
+    r'auth(?:enticate|oriz|entication|orization|n)?'
     r'|crypto(?:graphic|\.subtle)?'
-    r'|session'
-    r'|token'
-    r'|password'
-    r'|secret'
-    r'|permission'
-    r'|policy'
-    r'|csrf'
-    r'|xss'
-    r'|jwt'
-    r'|oauth'
-    r')\b',
+    r'|session(?:s|Id|Token|Key)?'
+    r'|token(?:s|Id|Hash|Secret)?'
+    r'|password(?:s|Hash)?'
+    r'|secret(?:s|Key|Id)?'
+    r'|permission(?:s|Check|Set|Denied)?'
+    r'|polic(?:y|ies)'
+    r'|csrf(?:Token|Protect)?'
+    r'|xss(?:Protect|Escape)?'
+    r'|jwt(?:Verify|Sign|Decode)?'
+    r'|oauth(?:Token|Client|Callback)?'
+    r')'
+    r'(?:\b|[A-Z_])',
     re.IGNORECASE,
 )
 
