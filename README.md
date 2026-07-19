@@ -28,7 +28,7 @@ that determine which specialist personas join the review panel.
 
 | Signal | Detection | Specialist persona |
 |--------|-----------|-------------------|
-| `security` | Diff contains auth/crypto/session/token/password/permission/policy keywords in added lines, or file paths matching `auth*`, `*secret*`, `*crypto*`, `*permission*`, `*policy*` | `reviewer-security` |
+| `security` | Diff contains auth/crypto/session/token/password/permission/policy keywords in added lines, or file paths containing `auth`, `secret`, `crypto`, `permission`, `policy` anywhere in the path (e.g. `authenticator.py`, `crypto_helper.py`, `my-secrets.yaml`) | `reviewer-security` |
 | `schema` | Diff touches migration/SQL/schema/alembic files, or contains DDL keywords (`CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `ADD COLUMN`, `CREATE INDEX`) in added lines | `reviewer-schema` |
 | `duplication` | >40% of changed lines are deletions, or duplicated added-line blocks | *(future — persona TBD)* |
 | `editorial` | ALL changed files are documentation (`*.md`, `*.rst`, `*.txt`, `docs/`, `README*`, `CHANGELOG*`, `LICENSE*`) | *(fast-path — generalist still runs)* |

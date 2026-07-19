@@ -49,8 +49,12 @@ _SECURITY_KEYWORDS = re.compile(
 
 _SECURITY_PATH_RE = re.compile(
     r'diff --git a/(?:.*/)?(?:'
-    r'auth|secrets?|crypto|permission|policy'
-    r')(?:/|\.)',
+    r'[^/]*auth[^/]*'
+    r'|[^/]*secret[^/]*'
+    r'|[^/]*crypto[^/]*'
+    r'|[^/]*permission[^/]*'
+    r'|[^/]*polic[^/]*'
+    r')',
     re.IGNORECASE,
 )
 

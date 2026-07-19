@@ -42,6 +42,20 @@ class TestSecuritySignal:
         result = classify_diff(diff)
         assert "security" in result
 
+    def test_compound_path_authenticator_triggers_signal(self):
+        diff = """diff --git a/src/authenticator.py b/src/authenticator.py
++  # updated
+"""
+        result = classify_diff(diff)
+        assert "security" in result
+
+    def test_compound_path_crypto_helper_triggers_signal(self):
+        diff = """diff --git a/utils/crypto_helper.py b/utils/crypto_helper.py
++  # updated
+"""
+        result = classify_diff(diff)
+        assert "security" in result
+
     def test_secret_file_triggers_signal(self):
         diff = """diff --git a/k8s/secrets.yaml b/k8s/secrets.yaml
 +  apiKey: xyz
