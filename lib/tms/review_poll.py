@@ -156,8 +156,16 @@ def is_pr_stale(updated_at, days=14):
     ``updated_at`` is None, empty, or unparseable — a missing
     timestamp must not block a legitimate dispatch.
 
-    The comparison uses timezone-aware datetimes. The threshold is
-    exclusive: exactly ``days`` days ago is NOT stale.
+    The comparison uses calendar dates (``.date()``) for an exclusive
+    threshold: PRs last touched on the same calendar date as the cutoff
+    are NOT stale. This intentionally gives ~24h of threshold fuzz
+    rather than a strict N×24h wall clock.
+
+    Note: ``updatedAt`` updates on any activity (pushes, comments, labels,
+    bot actions) — not just code pushes. This is deliberate: a PR receiving
+    comments or bot attention is not truly abandoned. For a tighter
+    "code-only" staleness signal, ``pushedAt`` is available from the same
+    ``gh pr list`` JSON response.
     """
     if not updated_at:
         return False
@@ -177,11 +185,16 @@ _KEEP_WARM_LABEL = 'keep-warm'
 
 
 def _has_keep_warm_label(labels):
-    """True if the PR's labels include ``keep-warm`` (case-insensitive)."""
+    """True if the PR's labels include ``keep-warm`` (case-insensitive).
+
+    Defensive against ``name: null`` in label dicts — ``dict.get(key, default)``
+    returns the default only when the key is *missing*, not when the key is
+    present with a ``None`` value. Using ``or ''`` after ``get`` handles both.
+    """
     if not labels:
         return False
     return any(
-        (l.get('name', '') if isinstance(l, dict) else str(l)).lower()
+        (str(l.get('name') or '') if isinstance(l, dict) else str(l or '')).lower()
         == _KEEP_WARM_LABEL
         for l in labels
     )

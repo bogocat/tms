@@ -557,6 +557,11 @@ class TestIsPrStale:
         assert not review_poll.is_pr_stale(None, days=14)
         assert not review_poll.is_pr_stale("", days=14)
 
+    def test_unparseable_timestamp_fail_open(self):
+        # Malformed timestamps are treated as not stale (fail-open).
+        assert not review_poll.is_pr_stale("not-a-date", days=14)
+        assert not review_poll.is_pr_stale("2026-13-99T99:99:99Z", days=14)
+
     def test_custom_threshold(self):
         # The days parameter is configurable.
         import datetime
