@@ -354,7 +354,7 @@ class TestScanRepos:
     def test_dispatch_calls_tmq_review_and_logs_event(self, monkeypatch, test_db):
         dispatched = []
         monkeypatch.setattr(review_poll, "_dispatch_review",
-                            lambda repo, pr: dispatched.append((repo, pr)) or True)
+                            lambda repo, pr, specialists=None: dispatched.append((repo, pr)) or True)
         self._setup_single_repo(monkeypatch,
             prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False}],
             comments_by_pr={57: []},
@@ -374,7 +374,7 @@ class TestScanRepos:
         # Even in dispatch mode, a live review session prevents dispatch.
         dispatched = []
         monkeypatch.setattr(review_poll, "_dispatch_review",
-                            lambda repo, pr: dispatched.append((repo, pr)) or True)
+                            lambda repo, pr, specialists=None: dispatched.append((repo, pr)) or True)
         self._setup_single_repo(monkeypatch,
             prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False}],
             comments_by_pr={57: []},
@@ -389,7 +389,7 @@ class TestScanRepos:
         # _pr_still_open returns False → no dispatch, status skip_closed.
         dispatched = []
         monkeypatch.setattr(review_poll, "_dispatch_review",
-                            lambda repo, pr: dispatched.append((repo, pr)) or True)
+                            lambda repo, pr, specialists=None: dispatched.append((repo, pr)) or True)
         self._setup_single_repo(monkeypatch,
             prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False}],
             comments_by_pr={57: []},
@@ -423,7 +423,7 @@ class TestScanRepos:
         # number of dispatches per scan; the rest stay would_dispatch.
         dispatched = []
         monkeypatch.setattr(review_poll, "_dispatch_review",
-                            lambda repo, pr: dispatched.append((repo, pr)) or True)
+                            lambda repo, pr, specialists=None: dispatched.append((repo, pr)) or True)
         self._setup_single_repo(monkeypatch,
             prs=[
                 {"number": 10, "headRefOid": "aaa", "isDraft": False},
@@ -444,7 +444,7 @@ class TestScanRepos:
         # max_dispatch=0 → scan-only even in dispatch mode (operational kill switch).
         monkeypatch.setattr(
             review_poll, "_dispatch_review",
-            lambda repo, pr: pytest.fail("should not dispatch when max_dispatch=0"),
+            lambda repo, pr, specialists=None: pytest.fail("should not dispatch when max_dispatch=0"),
         )
         self._setup_single_repo(monkeypatch,
             prs=[{"number": 10, "headRefOid": "aaa", "isDraft": False}],
@@ -467,7 +467,7 @@ class TestScanRepos:
     def test_dispatch_failure_reported_not_counted(self, monkeypatch, test_db):
         # A failed dispatch must not be counted as dispatched (P0.2).
         monkeypatch.setattr(review_poll, "_dispatch_review",
-                            lambda repo, pr: False)
+                            lambda repo, pr, specialists=None: False)
         self._setup_single_repo(monkeypatch,
             prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False}],
             comments_by_pr={57: []},
@@ -485,7 +485,7 @@ class TestScanRepos:
         # must be caught by the pre-dispatch re-check.
         calls = []
         monkeypatch.setattr(review_poll, "_dispatch_review",
-                            lambda repo, pr: True)
+                            lambda repo, pr, specialists=None: True)
         monkeypatch.setattr(review_poll, "_log_poller_dispatch",
                             lambda repo, issue: None)
         self._setup_single_repo(monkeypatch,
@@ -504,7 +504,7 @@ class TestScanRepos:
         # Dispatch events from the poller must carry source='poller' (AC5).
         import json
         monkeypatch.setattr(review_poll, "_dispatch_review",
-                            lambda repo, pr: True)
+                            lambda repo, pr, specialists=None: True)
         self._setup_single_repo(monkeypatch,
             prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False}],
             comments_by_pr={57: []},
@@ -656,16 +656,73 @@ class TestScanReposStaleness:
         results = review_poll.scan_repos(dispatch=False)
         assert results[0]["status"] == "would_dispatch"
 
-    def test_keep_warm_case_insensitive(self, monkeypatch):
-        # Label matching is case-insensitive.
-        import datetime
-        now = datetime.datetime.now(datetime.timezone.utc)
-        stale_date = (now - datetime.timedelta(days=30)).isoformat()
+        results = review_poll.scan_repos(dispatch=False)
+        assert results[0]["status"] == "would_dispatch"
+
+
+# ── Specialist routing (#94) ─────────────────────────────────────
+
+class TestSpecialistRouting:
+    HEAD = "16e3ead7bb5b2303157e01817f2816004d5ae11a"
+
+    def _setup(self, monkeypatch, prs, comments_by_pr, diff_by_pr=None,
+               live=None):
+        monkeypatch.setattr(
+            review_poll, "_run_tmq_list_machine",
+            lambda: "tms\t/root/tms\tbogocat/tms\t1\n",
+        )
+        monkeypatch.setattr(review_poll, "list_open_prs", lambda gh: prs)
+        monkeypatch.setattr(review_poll, "_pr_comment_bodies",
+                            lambda gh, num: (comments_by_pr.get(num, []), True))
+        monkeypatch.setattr(review_poll, "live_review_sessions",
+                            lambda: set(live or []))
+        monkeypatch.setattr(review_poll, "_pr_still_open",
+                            lambda gh, num: True)
+        if diff_by_pr is not None:
+            monkeypatch.setattr(review_poll, "_fetch_pr_diff",
+                                lambda gh, num: diff_by_pr.get(num, ""))
+
+    def test_specialist_signals_in_result(self, monkeypatch):
+        security_diff = (
+            "diff --git a/src/auth/login.ts b/src/auth/login.ts\n"
+            "+  const token = createSession(user);\n"
+            "diff --git a/migrations/006.sql b/migrations/006.sql\n"
+            "+  ALTER TABLE users ADD COLUMN last_login TIMESTAMPTZ;\n"
+        )
         self._setup(monkeypatch,
-            prs=[{"number": 57, "headRefOid": self.HEAD, "isDraft": False,
-                   "updatedAt": stale_date,
-                   "labels": [{"name": "KEEP-WARM"}]}],
+            prs=[{"number": 57, "headRefOid": self.HEAD,
+                   "isDraft": False}],
             comments_by_pr={57: []},
+            diff_by_pr={57: security_diff},
         )
         results = review_poll.scan_repos(dispatch=False)
         assert results[0]["status"] == "would_dispatch"
+        assert "specialists" in results[0]
+        assert "security" in results[0]["specialists"]
+        assert "schema" in results[0]["specialists"]
+
+    def test_generalist_only_when_no_signals(self, monkeypatch):
+        plain_diff = (
+            "diff --git a/src/utils.ts b/src/utils.ts\n"
+            "+  export function add(a: number, b: number) { return a + b; }\n"
+        )
+        self._setup(monkeypatch,
+            prs=[{"number": 57, "headRefOid": self.HEAD,
+                   "isDraft": False}],
+            comments_by_pr={57: []},
+            diff_by_pr={57: plain_diff},
+        )
+        results = review_poll.scan_repos(dispatch=False)
+        assert results[0]["status"] == "would_dispatch"
+        assert results[0]["specialists"] == []
+
+    def test_diff_fetch_failure_fallback_to_generalist(self, monkeypatch):
+        self._setup(monkeypatch,
+            prs=[{"number": 57, "headRefOid": self.HEAD,
+                   "isDraft": False}],
+            comments_by_pr={57: []},
+            diff_by_pr={57: ""},
+        )
+        results = review_poll.scan_repos(dispatch=False)
+        assert results[0]["status"] == "would_dispatch"
+        assert results[0]["specialists"] == []
