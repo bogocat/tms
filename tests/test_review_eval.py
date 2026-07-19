@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS reviewer_runs (
     wall_time_ms    INTEGER,
     findings        TEXT,
     input_tokens    INTEGER,
-    output_tokens   INTEGER
+    output_tokens   INTEGER,
+    specialist_composition TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS escaped_defects (
     defect_id           TEXT PRIMARY KEY,
@@ -598,6 +599,35 @@ class TestLogReviewerRun:
             rows = _query_all(conn, "reviewer_runs")
             assert rows[0]["input_tokens"] == 1200
             assert rows[0]["output_tokens"] == 800
+
+    def test_specialist_composition_stored(self, test_db):
+        import json
+        log_reviewer_run(
+            repo="tms", pr_number=54, review_round=1,
+            reviewer_agent="reviewer", model="deepseek-v4-pro",
+            provider_used="deepseek",
+            diff_sha_reviewed="sha", p0=0, p1=0, p2=0,
+            wall_time_ms=100,
+            specialist_composition=["security", "schema"],
+        )
+        with test_db() as conn:
+            rows = _query_all(conn, "reviewer_runs")
+            stored = json.loads(rows[0]["specialist_composition"])
+            assert sorted(stored) == ["schema", "security"]
+
+    def test_specialist_composition_defaults_to_empty(self, test_db):
+        import json
+        log_reviewer_run(
+            repo="tms", pr_number=54, review_round=1,
+            reviewer_agent="reviewer", model="deepseek-v4-pro",
+            provider_used="deepseek",
+            diff_sha_reviewed="sha", p0=0, p1=0, p2=0,
+            wall_time_ms=100,
+        )
+        with test_db() as conn:
+            rows = _query_all(conn, "reviewer_runs")
+            stored = json.loads(rows[0]["specialist_composition"])
+            assert stored == []
 
 
 # ── AC5: seeded-defect gold set ───────────────────────────────────
