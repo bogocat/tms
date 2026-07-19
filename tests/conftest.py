@@ -56,8 +56,15 @@ def test_db(monkeypatch):
             conn = test_db()
             rows = conn.cursor().execute("SELECT * FROM events").fetchall()
     """
-    from tms import events as mod
-    _orig = mod._get_conn
+    from tms import events as events_mod
+    _orig_events = events_mod._get_conn
+
+    try:
+        from tms import dispatch_monitor as dm_mod
+        _orig_dm = dm_mod._get_conn
+    except ImportError:
+        dm_mod = None
+        _orig_dm = None
 
     _conn = sqlite3.connect(":memory:")
     for stmt in _CREATE_EVENTS_TABLE.split(";"):
@@ -116,7 +123,11 @@ def test_db(monkeypatch):
     def _make_conn():
         return _SharedConnection()
 
-    monkeypatch.setattr(mod, "_get_conn", _make_conn)
+    monkeypatch.setattr(events_mod, "_get_conn", _make_conn)
+    if dm_mod is not None:
+        monkeypatch.setattr(dm_mod, "_get_conn", _make_conn)
     yield _make_conn
-    monkeypatch.setattr(mod, "_get_conn", _orig)
+    monkeypatch.setattr(events_mod, "_get_conn", _orig_events)
+    if dm_mod is not None:
+        monkeypatch.setattr(dm_mod, "_get_conn", _orig_dm)
     _conn.close()
