@@ -5,15 +5,22 @@ Design:
   - Poller mirrors review_poll.py's systemd-timer-friendly shape.
   - Watermark is a file (~/.local/state/tmq/wrap-watermark.json) storing
     the last-processed terminal transition timestamp.
+  - Cross-process locking via fcntl.flock on the watermark path prevents
+    duplicate comments from overlapping cron invocations.
   - For each new terminal transition, cross-references the dispatch event
     to resolve repo+issue, then synthesizes an objective wrap from:
       * tms_review.events — the transition history for this session
-      * gh — PRs and commits referencing the issue
+      * gh — PRs and commits referencing the issue (post-filtered to
+        only include PRs that actually reference the issue)
       * bogocat.llm_call_log — calls from this worktree (best-effort,
         documented in the wrap itself)
   - Output: a memory file keyed by issue at
     ~/.claude/projects/-root/memory/issue-wrap-<repo>#<issue>.md +
-    a closing comment on the GitHub issue.
+    a closing comment on the GitHub issue (comment posted BEFORE file
+    write, so crash between them doesn't orphan a comment-less wrap).
+  - Dead-letter tracking: per-item failures don't stall later items;
+    a quarantine file records permanently-failing (repo, issue) pairs
+    so they're skipped on future runs.
 
 Public API:
   - read_watermark(path) -> str | None
@@ -28,11 +35,14 @@ Public API:
 """
 
 import datetime
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
+import traceback
+
 import yaml
 
 
@@ -40,8 +50,96 @@ import yaml
 
 MEMORY_DIR = os.path.expanduser("~/.claude/projects/-root/memory")
 WATERMARK_PATH = os.path.expanduser("~/.local/state/tmq/wrap-watermark.json")
+DEAD_LETTER_PATH = os.path.expanduser("~/.local/state/tmq/wrap-dead-letter.json")
+LOCK_PATH = os.path.expanduser("~/.local/state/tmq/wrap-watermark.lock")
 
-# ── Watermark persistence ─────────────────────────────────────────
+# ── Error counters (per-run) ──────────────────────────────────────
+
+_ERROR_COUNTS = {
+    "db": 0,
+    "gh": 0,
+    "llm": 0,
+    "write": 0,
+    "comment": 0,
+    "frontmatter": 0,
+}
+
+
+def _log_error(category, msg):
+    """Log an error to stderr and increment the per-category counter."""
+    _ERROR_COUNTS[category] = _ERROR_COUNTS.get(category, 0) + 1
+    print(f"[wrap-on-terminal] {category}: {msg}", file=sys.stderr)
+
+
+def get_error_counts():
+    """Return a copy of the current error counters."""
+    return dict(_ERROR_COUNTS)
+
+
+# ── Locking ───────────────────────────────────────────────────────
+
+
+def _acquire_lock(lock_path=None):
+    """Acquire an exclusive flock on the lock file. Returns fd or None."""
+    p = lock_path or LOCK_PATH
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    try:
+        fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except (BlockingIOError, OSError):
+        if 'fd' in dir():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return None
+
+
+def _release_lock(fd):
+    """Release the flock and close the fd."""
+    if fd is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        except OSError:
+            pass
+
+
+# ── Dead-letter tracking ──────────────────────────────────────────
+
+
+def _load_dead_letters(path=None):
+    """Return the set of (repo, issue) tuples that are permanently failing."""
+    p = path or DEAD_LETTER_PATH
+    try:
+        with open(p) as f:
+            data = json.load(f)
+            return {tuple(item) for item in data.get("dead", [])}
+    except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError):
+        return set()
+
+
+def _save_dead_letters(dead_set, path=None):
+    """Persist the dead-letter set."""
+    import tempfile as _tmp
+
+    p = path or DEAD_LETTER_PATH
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    fd_w, tmp_path = _tmp.mkstemp(dir=os.path.dirname(p), suffix=".tmp")
+    try:
+        with os.fdopen(fd_w, "w") as f:
+            json.dump({"dead": [list(item) for item in sorted(dead_set)]}, f)
+        os.replace(tmp_path, p)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+# ── Timestamp normalization ───────────────────────────────────────
 
 
 def _to_iso_string(ts):
@@ -56,6 +154,9 @@ def _to_iso_string(ts):
     if hasattr(ts, "isoformat"):
         return ts.isoformat()
     return str(ts)
+
+
+# ── Watermark persistence ─────────────────────────────────────────
 
 
 def read_watermark(path=None):
@@ -101,7 +202,7 @@ def is_new_terminal(watermark, terminal_ts):
 
     A terminal transition that is equal to the watermark is NOT new
     (idempotent: we've already processed transitions up to and including
-    the watermark).
+    the watermark). ISO-8601 fixed-format string comparison is safe here.
     """
     if watermark is None:
         return True
@@ -129,6 +230,7 @@ def validate_frontmatter(content):
     Returns a list of error strings. Empty list = valid.
 
     Required keys: name, description, metadata.
+    Also validates that these keys have non-empty values.
     """
     errors = []
 
@@ -171,6 +273,8 @@ def validate_frontmatter(content):
     for key in _REQUIRED_FRONTMATTER_KEYS:
         if key not in fm:
             errors.append(f"missing required frontmatter key: '{key}'")
+        elif fm[key] is None or (isinstance(fm[key], str) and not fm[key].strip()):
+            errors.append(f"required frontmatter key '{key}' has empty value")
 
     return errors
 
@@ -185,19 +289,19 @@ def _get_conn():
 
 
 def find_terminal_transitions_since(watermark):
-    """Find terminal transitions with event_timestamp > watermark.
+    """Find terminal transitions with event_timestamp >= watermark.
 
+    Uses >= to handle microsecond collision edge cases (P1-8).
     Returns a list of dicts, each with {aoe_id_prefix, repo, issue,
-    terminal_ts, event_history}. Terminal transitions that cannot be
-    resolved to a dispatch event (no repo/issue) are excluded — we
-    cannot synthesize a wrap without knowing which issue this is.
+    terminal_ts}. Terminal transitions that cannot be resolved to a
+    dispatch event (no repo/issue) are excluded.
+
+    The caller is responsible for deduplicating by (repo, issue) and
+    filtering out already-processed items (via dead-letter set).
     """
     try:
         with _get_conn() as conn:
             with conn.cursor() as cur:
-                # Find terminal transitions with matching dispatch events.
-                # Dedupe in Python since the JOIN may produce multiple rows
-                # when the same aoe_id_prefix has multiple dispatch events.
                 if watermark:
                     cur.execute(
                         """SELECT t.aoe_id_prefix, t.event_timestamp,
@@ -208,7 +312,7 @@ def find_terminal_transitions_since(watermark):
                             AND d.event_type = 'dispatch'
                            WHERE t.event_type = 'transition'
                              AND t.to_status = 'terminal'
-                             AND t.event_timestamp > %s
+                             AND t.event_timestamp >= %s
                              AND d.repo IS NOT NULL
                              AND d.issue IS NOT NULL
                            ORDER BY t.event_timestamp""",
@@ -230,12 +334,7 @@ def find_terminal_transitions_since(watermark):
                     )
 
                 results = []
-                seen = set()
                 for aoe_prefix, ts, repo, issue in cur.fetchall():
-                    key = (aoe_prefix, ts)
-                    if key in seen:
-                        continue
-                    seen.add(key)
                     results.append({
                         "aoe_id_prefix": aoe_prefix,
                         "terminal_ts": ts,
@@ -243,7 +342,8 @@ def find_terminal_transitions_since(watermark):
                         "issue": int(issue) if issue is not None else None,
                     })
                 return results
-    except Exception:
+    except Exception as e:
+        _log_error("db", f"find_terminal_transitions_since: {e}")
         return []
 
 
@@ -274,7 +374,8 @@ def collect_event_history(aoe_id_prefix):
                         "blocked_class": blocked_class,
                     })
                 return results
-    except Exception:
+    except Exception as e:
+        _log_error("db", f"collect_event_history({aoe_id_prefix}): {e}")
         return []
 
 
@@ -291,7 +392,7 @@ def _run(cmd, timeout=15):
 
 
 def _gh_json(args, timeout=15):
-    """Run a ``gh`` subcommand, return parsed JSON (or None on error)."""
+    """Run a ``gh`` subprocess, return parsed JSON (or None on error)."""
     out = _run(["gh"] + args, timeout=timeout)
     if not out:
         return None
@@ -301,43 +402,74 @@ def _gh_json(args, timeout=15):
         return None
 
 
+_ISSUE_REF_RE = re.compile(
+    r'(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved|ref|refs|see)\s+#?(\d+)',
+    re.IGNORECASE,
+)
+
+
+def _pr_references_issue(pr, issue):
+    """Return True if the PR title or body references the given issue number.
+
+    Checks for common closing/fixing/referencing keywords followed by #N.
+    This post-filters gh search results, which can include false positives
+    from bare number matches in commit hashes or other numeric fields.
+    """
+    title = (pr.get("title", "") or "")
+    body = (pr.get("body", "") or "")
+
+    # Direct #N reference anywhere in title or body
+    needle = f"#{issue}"
+    if needle in title or needle in body:
+        return True
+
+    # Keyword reference: "Closes #N", "Fixes #N", "Refs #N", etc.
+    for match in _ISSUE_REF_RE.finditer(title + "\n" + body):
+        if int(match.group(1)) == issue:
+            return True
+
+    return False
+
+
 def _fetch_gh_prs(gh_repo, issue):
     """Fetch PRs that reference the issue via gh search.
 
-    Returns a list of {number, title, state, mergedAt, url}.
+    Post-filters results to only include PRs that actually reference
+    the issue number (P1-6). Returns a list of {number, title, state,
+    mergedAt, url}.
     """
     query = f"repo:{gh_repo} {issue} in:title,body type:pr"
     data = _gh_json([
         "search", "prs", query,
-        "--json", "number,title,state,mergedAt,url",
+        "--json", "number,title,state,mergedAt,url,body",
         "--limit", "20",
     ])
     if not isinstance(data, list):
+        if data is None:
+            _log_error("gh", f"gh search failed for {gh_repo}#{issue}")
         return []
-    return data
+
+    # Post-filter: only PRs that genuinely reference this issue
+    filtered = [pr for pr in data if _pr_references_issue(pr, issue)]
+    if len(filtered) < len(data):
+        _log_error("gh", (
+            f"Post-filter dropped {len(data) - len(filtered)}/{len(data)} PRs "
+            f"for {gh_repo}#{issue} (false positives from bare number match)"
+        ))
+    return filtered
 
 
 def _fetch_llm_call_count(repo, issue):
     """Count llm_call_log rows from the worktree for (repo, issue).
 
-    Matches meta->>'encoded_cwd' against the pattern
-    ``--root-wt-<repo>-<issue>--``. Returns the count (best-effort;
-    also counts sibling sessions on the same worktree).
+    Routes through _get_conn() (same connection abstraction as the rest
+    of the module — P1-5). Matches meta->>'encoded_cwd' against the
+    pattern ``--root-wt-<repo>-<issue>--``. Returns the count
+    (best-effort; also counts sibling sessions on the same worktree).
     """
     cwd_pattern = f"--root-wt-{repo}-{issue}--"
-    conn = None
     try:
-        from tms.events import _read_db_config
-        import psycopg2
-
-        cfg = _read_db_config()
-        conn = psycopg2.connect(
-            host=cfg["host"],
-            dbname=cfg["dbname"],
-            user=cfg["user"],
-            password=cfg["password"],
-        )
-        with conn:
+        with _get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """SELECT COUNT(*)
@@ -348,14 +480,8 @@ def _fetch_llm_call_count(repo, issue):
                 row = cur.fetchone()
                 if row:
                     return int(row[0])
-    except Exception:
-        pass
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+    except Exception as e:
+        _log_error("llm", f"_fetch_llm_call_count({repo}#{issue}): {e}")
     return 0
 
 
@@ -363,6 +489,7 @@ def _fetch_llm_call_count(repo, issue):
 
 # Map of repo short names to full gh org/repo. Mirrors the tmq
 # registry. Keep in sync with tmq list --machine output.
+# Test: test_repo_to_gh_matches_tmq_registry
 REPO_TO_GH = {
     "tms": "bogocat/tms",
     "distillery": "bogocat/distillery",
@@ -529,32 +656,66 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
     mem = memory_dir or MEMORY_DIR
     wp = watermark_path or WATERMARK_PATH
 
+    # P1-1: Cross-process lock — prevent overlapping cron invocations
+    # from racing on wrap_exists() and posting duplicate comments.
+    lock_fd = None
+    if dispatch and not dry_run:
+        lock_fd = _acquire_lock()
+        if lock_fd is None:
+            print("[wrap-on-terminal] Lock held by another process, "
+                  "skipping this run.", file=sys.stderr)
+            return [_result("", 0, "skip_locked")]
+
+    try:
+        results = _scan_and_wrap_locked(
+            dispatch=dispatch, memory_dir=mem, watermark_path=wp,
+            dry_run=dry_run,
+        )
+    finally:
+        _release_lock(lock_fd)
+
+    return results
+
+
+def _scan_and_wrap_locked(dispatch, memory_dir, watermark_path, dry_run):
+    """Core scan logic — assumes lock is already held."""
+    mem = memory_dir
+    wp = watermark_path
+
     watermark = read_watermark(wp)
+    dead_letters = _load_dead_letters()
     terminals = find_terminal_transitions_since(watermark)
     results = []
 
     if not terminals:
         return results
 
-    # Watermark discipline: advance only through a contiguous prefix of
-    # successfully-handled transitions. On any failure, stop processing
-    # the batch — the watermark stays at the last successful position,
-    # so the failed transition is re-queried next run.
-    wrapped_ts = watermark
-    seen_issues = set()  # dedupe within a single scan run
-
+    # P1-7: Group terminals by (repo, issue), pick the latest session
+    # for each issue so the wrap reflects the most recent attempt.
+    by_issue = {}
     for term in terminals:
-        repo = term["repo"]
-        issue = term["issue"]
-        aoe_prefix = term["aoe_id_prefix"]
+        key = (term["repo"], term["issue"])
         ts = _to_iso_string(term["terminal_ts"])
+        if key not in by_issue or ts > by_issue[key][0]:
+            by_issue[key] = (ts, term)
 
-        # Deduplicate within run: same issue may appear from multiple
-        # terminal transitions (re-dispatch after FAIL).
-        issue_key = (repo, issue)
-        if issue_key in seen_issues:
+    # Sort by terminal_ts so watermark advances in order
+    sorted_issues = sorted(by_issue.items(), key=lambda kv: kv[1][0])
+
+    # Watermark: advance past successfully handled items. Per-item
+    # failures don't stall later items (P1-4 fix: continue, don't break).
+    wrapped_ts = watermark
+    new_dead = set()
+
+    for (repo, issue), (ts, term) in sorted_issues:
+        aoe_prefix = term["aoe_id_prefix"]
+
+        # P1-4: Skip dead-letter items (known-bad from previous runs)
+        if (repo, issue) in dead_letters:
+            results.append(_result(repo, issue, "skip_dead_letter"))
+            if ts > (wrapped_ts or ""):
+                wrapped_ts = ts
             continue
-        seen_issues.add(issue_key)
 
         # Idempotency: skip if a wrap already exists
         if wrap_exists(mem, repo, issue):
@@ -564,7 +725,6 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
             continue
 
         # Dry-run and non-dispatch both collect data and synthesize
-        # content, but neither writes files or posts comments.
         collect = dispatch or dry_run
         if not collect:
             results.append(_result(repo, issue, "would_wrap",
@@ -573,37 +733,55 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
                 wrapped_ts = ts
             continue
 
-        # Collect data
+        # ── Collect objective data ────────────────────────────
         transitions = collect_event_history(aoe_prefix)
         gh_repo = _resolve_gh_repo(repo)
         gh_prs = _fetch_gh_prs(gh_repo, issue)
         llm_count = _fetch_llm_call_count(repo, issue)
 
-        # Synthesize wrap
+        # ── Synthesize and validate ───────────────────────────
         content = synthesize_wrap_content(
             repo, issue, transitions, gh_prs, llm_count,
         )
-
-        # Frontmatter validation guard — failure stops the batch.
-        # This is a code bug (generated content is invalid), not
-        # a transient error — retrying won't help.
         errors = validate_frontmatter(content)
         if errors:
+            _log_error("frontmatter",
+                       f"{repo}#{issue}: {', '.join(errors)}")
             results.append(_result(repo, issue, "skip_frontmatter_invalid",
                                    {"errors": errors}))
-            break
+            new_dead.add((repo, issue))
+            # Advance watermark past poison pill so it doesn't
+            # stall later items (P1-4)
+            if ts > (wrapped_ts or ""):
+                wrapped_ts = ts
+            continue
 
         if dry_run:
             results.append(_result(repo, issue, "dry_run",
                                    {"content_len": len(content)}))
             continue
 
-        # Write memory file atomically (tmp + os.replace) so a
-        # partial write cannot masquerade as a successful wrap.
+        # ── Post comment BEFORE writing file ──────────────────
+        # P1-2: If the process crashes between file write and
+        # comment post, the wrap file exists but the comment is
+        # missing forever. Reversing the order means:
+        #   - Comment succeeds, file goes down → crash still leaves
+        #     a comment (idempotent re-post is harmless on re-run
+        #     since wrap_exists() catches the file)
+        #   - Comment fails → don't write file → retry next run
+        filename = f"issue-wrap-{repo}#{issue}.md"
+        comment_ok = _post_issue_comment(gh_repo, issue, filename,
+                                         transitions, gh_prs, llm_count)
+        if not comment_ok:
+            _log_error("comment", f"{repo}#{issue}: gh issue comment failed")
+            # Don't advance watermark — retry next run
+            # But also don't dead-letter this; comments can fail transiently
+            continue
+
+        # ── Write memory file ─────────────────────────────────
         import tempfile as _tmp2
         try:
             os.makedirs(mem, exist_ok=True)
-            filename = f"issue-wrap-{repo}#{issue}.md"
             filepath = os.path.join(mem, filename)
             fd2, tmp_path2 = _tmp2.mkstemp(
                 dir=mem, prefix=f".tmp-issue-wrap-{repo}#{issue}-",
@@ -620,28 +798,25 @@ def scan_and_wrap(dispatch=False, memory_dir=None, watermark_path=None,
                     pass
                 raise
         except OSError as e:
+            _log_error("write", f"{repo}#{issue}: {e}")
             results.append(_result(repo, issue, "skip_write_error",
                                    {"error": str(e)}))
-            break
-
-        # Post issue comment. If the comment fails, record the failure
-        # but still count this as wrapped (the memory file is the durable
-        # artifact). The comment can be posted manually.
-        comment_ok = _post_issue_comment(gh_repo, issue, filename, transitions,
-                                         gh_prs, llm_count)
+            # Don't advance watermark; retry next run
+            continue
 
         results.append(_result(
             repo, issue, "wrapped",
             {"terminal_ts": ts, "comment_ok": comment_ok},
         ))
-
         if ts > (wrapped_ts or ""):
             wrapped_ts = ts
 
-    # Advance watermark past the contiguous block of successfully
-    # handled transitions. Any break (validation error, write error)
-    # leaves the watermark at the last success, so the failed row
-    # is re-queried next run.
+    # Persist dead letters (P1-4: so future runs skip known-bad items)
+    if new_dead:
+        dead_letters |= new_dead
+        _save_dead_letters(dead_letters)
+
+    # Advance watermark (only on dispatch, not dry-run)
     if dispatch and not dry_run and wrapped_ts and wrapped_ts != watermark:
         write_watermark(wp, wrapped_ts)
 
@@ -705,8 +880,17 @@ def _post_issue_comment(gh_repo, issue, wrap_filename, transitions,
              "--body", body],
             capture_output=True, text=True, timeout=30,
         )
-        return r.returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
+        ok = r.returncode == 0
+        if not ok:
+            _log_error("comment",
+                       f"{gh_repo}#{issue}: gh exit {r.returncode}: "
+                       f"{(r.stderr or '').strip()[:200]}")
+        return ok
+    except subprocess.TimeoutExpired:
+        _log_error("comment", f"{gh_repo}#{issue}: gh timed out after 30s")
+        return False
+    except OSError as e:
+        _log_error("comment", f"{gh_repo}#{issue}: gh spawn failed: {e}")
         return False
 
 
@@ -727,12 +911,26 @@ def _format_report(results):
         extra = ""
         if r["status"] == "skip_exists":
             extra = " (wrap already exists)"
+        elif r["status"] == "skip_dead_letter":
+            extra = " (in dead-letter — previous failures)"
         elif r["status"] == "skip_frontmatter_invalid":
             errs = r.get("errors", [])
             extra = f" (frontmatter errors: {', '.join(errs)})"
+        elif r["status"] == "skip_locked":
+            extra = " (lock held by another process)"
         elif r["status"] == "wrapped":
             extra = f" (comment={'ok' if r.get('comment_ok') else 'failed'})"
         print(f"  [{r['status']}] {r['repo']}#{r['issue']}{extra}")
+
+    # Surface error counts in summary (P1-3)
+    err_counts = get_error_counts()
+    total_errs = sum(err_counts.values())
+    if total_errs > 0:
+        err_detail = ", ".join(
+            f"{cat}={n}" for cat, n in sorted(err_counts.items()) if n > 0
+        )
+        print()
+        print(f"Errors ({total_errs} total): {err_detail}")
 
     print()
     print("Summary: " + ", ".join(
