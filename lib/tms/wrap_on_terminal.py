@@ -269,7 +269,7 @@ def collect_event_history(aoe_id_prefix):
                     results.append({
                         "from_status": from_s,
                         "to_status": to_s,
-                        "timestamp": ts,
+                        "timestamp": _to_iso_string(ts),
                         "reason": reason,
                         "blocked_class": blocked_class,
                     })

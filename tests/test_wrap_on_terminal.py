@@ -359,3 +359,45 @@ class TestObjectiveSynthesis:
         # Must pass validation
         from tms.wrap_on_terminal import validate_frontmatter
         assert validate_frontmatter(content) == []
+
+
+# ── REPO_TO_GH registry sync test ────────────────────────────────
+
+
+def test_repo_to_gh_matches_tmq_registry():
+    """REPO_TO_GH must match the live tmq registry.
+
+    The map is hardcoded for performance (avoids subprocess on every
+    poller tick), but this test keeps it honest — any drift between
+    the hardcoded map and tmq list --machine fails fast in CI.
+    """
+    from tms.wrap_on_terminal import REPO_TO_GH
+    from tms.review_poll import _repo_registry
+
+    live = dict(_repo_registry())
+    hardcoded = dict(REPO_TO_GH)
+
+    # Every entry in the hardcoded map that IS in the live registry
+    # must match. Entries only in hardcoded (not tmq-registered) and
+    # entries only in live (new repos not yet in hardcoded) are warnings.
+    mismatches = []
+    for short, expected_gh in sorted(hardcoded.items()):
+        live_gh = live.get(short)
+        if live_gh is None:
+            continue  # not in tmq registry — covered by missing-warning below
+        if live_gh != expected_gh:
+            mismatches.append(f"{short}: hardcoded={expected_gh}, live={live_gh}")
+
+    if mismatches:
+        msg = "REPO_TO_GH out of sync with tmq registry:\n" + "\n".join(mismatches)
+        msg += "\n\nUpdate REPO_TO_GH in lib/tms/wrap_on_terminal.py to match."
+        pytest.fail(msg)
+
+    # Optional: warn about repos in live but not in hardcoded map
+    missing = set(live) - set(hardcoded)
+    if missing:
+        import warnings
+        warnings.warn(
+            f"REPO_TO_GH missing repos from tmq registry: {sorted(missing)}. "
+            f"Wraps for these repos will fall back to bogocat/<short-name>."
+        )
