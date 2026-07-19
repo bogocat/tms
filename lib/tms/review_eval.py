@@ -149,6 +149,7 @@ def log_reviewer_run(
     findings=None,
     input_tokens=None,
     output_tokens=None,
+    specialist_composition=None,
 ):
     """Insert a reviewer_run record into tms_review.reviewer_runs.
 
@@ -178,14 +179,17 @@ def log_reviewer_run(
                    (run_id, repo, pr_number, review_round,
                     reviewer_agent, model, provider_used,
                     diff_sha_reviewed, p0, p1, p2, wall_time_ms,
-                    findings, input_tokens, output_tokens)
+                    findings, input_tokens, output_tokens,
+                    specialist_composition)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
-                           %s, %s, %s, %s, %s, %s, %s)""",
+                           %s, %s, %s, %s, %s, %s, %s,
+                           %s)""",
                 (
                     run_id, repo, pr_number, review_round,
                     reviewer_agent, model, provider_used,
                     diff_sha_reviewed, p0, p1, p2, wall_time_ms,
                     findings_json, input_tokens, output_tokens,
+                    json.dumps(specialist_composition if specialist_composition is not None else []),
                 ),
             )
         conn.commit()
@@ -376,7 +380,7 @@ def _read_sql_reviewer_runs():
                           reviewer_agent, model, provider_used,
                           diff_sha_reviewed, p0, p1, p2,
                           wall_time_ms, findings, input_tokens,
-                          output_tokens
+                          output_tokens, specialist_composition
                    FROM tms_review.reviewer_runs
                    ORDER BY created_at"""
             )
@@ -397,6 +401,14 @@ def _read_sql_reviewer_runs():
                     d["input_tokens"] = row[13]
                 if row[14] is not None:
                     d["output_tokens"] = row[14]
+                if len(row) > 15 and row[15] is not None:
+                    d["specialist_composition"] = (
+                        json.loads(row[15])
+                        if isinstance(row[15], str)
+                        else row[15]
+                    )
+                else:
+                    d["specialist_composition"] = []
                 rows.append(d)
             return rows
 
@@ -902,6 +914,47 @@ def compute_review_stats():
             "false_positives", 0
         )
 
+    # --- Per-specialist stats (#94) ---
+    # NOTE: p0/p1/p2 counts and wall_time_ms are NOT additive across
+    # specialists. A run with ["security", "schema"] contributes its
+    # full findings and wall time to BOTH buckets — these are overlapping
+    # populations. Summing across specialists will overcount.
+    per_specialist = {}
+    for rr in reviewer_runs:
+        composition = rr.get("specialist_composition", [])
+        if isinstance(composition, str):
+            try:
+                composition = json.loads(composition)
+            except (json.JSONDecodeError, ValueError):
+                composition = []
+        if not composition:
+            # Generalist-only panel
+            key = "generalist"
+            if key not in per_specialist:
+                per_specialist[key] = {
+                    "total_reviews": 0, "total_p0": 0,
+                    "total_p1": 0, "total_p2": 0,
+                    "total_wall_time_ms": 0,
+                }
+            per_specialist[key]["total_reviews"] += 1
+            per_specialist[key]["total_p0"] += rr.get("p0", 0)
+            per_specialist[key]["total_p1"] += rr.get("p1", 0)
+            per_specialist[key]["total_p2"] += rr.get("p2", 0)
+            per_specialist[key]["total_wall_time_ms"] += rr.get("wall_time_ms", 0)
+        else:
+            for specialist in composition:
+                if specialist not in per_specialist:
+                    per_specialist[specialist] = {
+                        "total_reviews": 0, "total_p0": 0,
+                        "total_p1": 0, "total_p2": 0,
+                        "total_wall_time_ms": 0,
+                    }
+                per_specialist[specialist]["total_reviews"] += 1
+                per_specialist[specialist]["total_p0"] += rr.get("p0", 0)
+                per_specialist[specialist]["total_p1"] += rr.get("p1", 0)
+                per_specialist[specialist]["total_p2"] += rr.get("p2", 0)
+                per_specialist[specialist]["total_wall_time_ms"] += rr.get("wall_time_ms", 0)
+
     # --- Panel uniqueness ---
     panel_uniqueness = {}
     panels = {}
@@ -971,6 +1024,7 @@ def compute_review_stats():
         "per_reviewer": per_reviewer,
         "per_author": per_author,
         "per_defect_class": per_defect_class,
+        "per_specialist": per_specialist,
         "panel_uniqueness": panel_uniqueness,
         "panel_suggestions": panel_suggestions,
     }
@@ -1075,6 +1129,36 @@ def format_review_report(stats, as_json=False):
             print(
                 f"    {model}: {ustats['unique_findings']} unique "
                 f"in {ustats['panels_participated']} panel(s)"
+            )
+        print()
+
+    psp = stats.get("per_specialist", {})
+    if psp:
+        print("  Per-specialist panel composition:")
+        hdr = (
+            f"  {'Specialist':<20} {'Reviews':>8} {'P0':>5} "
+            f"{'P1':>5} {'P2':>5} {'Avg Time':>10}"
+        )
+        print(hdr)
+        sep = (
+            f"  {'─'*20} {'─'*8} {'─'*5} {'─'*5} "
+            f"{'─'*5} {'─'*10}"
+        )
+        print(sep)
+        for spec, sstats in sorted(psp.items()):
+            runs = sstats["total_reviews"]
+            avg_ms = (
+                sstats["total_wall_time_ms"] / runs
+                if runs > 0 else 0
+            )
+            avg_sec = avg_ms / 1000
+            print(
+                f"  {spec:<20} "
+                f"{runs:>8} "
+                f"{sstats['total_p0']:>5} "
+                f"{sstats['total_p1']:>5} "
+                f"{sstats['total_p2']:>5} "
+                f"{avg_sec:>9.1f}s"
             )
         print()
 

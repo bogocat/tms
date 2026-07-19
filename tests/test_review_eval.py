@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS reviewer_runs (
     wall_time_ms    INTEGER,
     findings        TEXT,
     input_tokens    INTEGER,
-    output_tokens   INTEGER
+    output_tokens   INTEGER,
+    specialist_composition TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS escaped_defects (
     defect_id           TEXT PRIMARY KEY,
@@ -599,6 +600,35 @@ class TestLogReviewerRun:
             assert rows[0]["input_tokens"] == 1200
             assert rows[0]["output_tokens"] == 800
 
+    def test_specialist_composition_stored(self, test_db):
+        import json
+        log_reviewer_run(
+            repo="tms", pr_number=54, review_round=1,
+            reviewer_agent="reviewer", model="deepseek-v4-pro",
+            provider_used="deepseek",
+            diff_sha_reviewed="sha", p0=0, p1=0, p2=0,
+            wall_time_ms=100,
+            specialist_composition=["security", "schema"],
+        )
+        with test_db() as conn:
+            rows = _query_all(conn, "reviewer_runs")
+            stored = json.loads(rows[0]["specialist_composition"])
+            assert sorted(stored) == ["schema", "security"]
+
+    def test_specialist_composition_defaults_to_empty(self, test_db):
+        import json
+        log_reviewer_run(
+            repo="tms", pr_number=54, review_round=1,
+            reviewer_agent="reviewer", model="deepseek-v4-pro",
+            provider_used="deepseek",
+            diff_sha_reviewed="sha", p0=0, p1=0, p2=0,
+            wall_time_ms=100,
+        )
+        with test_db() as conn:
+            rows = _query_all(conn, "reviewer_runs")
+            stored = json.loads(rows[0]["specialist_composition"])
+            assert stored == []
+
 
 # ── AC5: seeded-defect gold set ───────────────────────────────────
 
@@ -839,8 +869,64 @@ class TestComputeReviewStats:
         assert stats["total_escaped_defects"] == 0
         assert stats["per_reviewer"] == {}
         assert stats["per_author"] == {}
+        assert stats["per_specialist"] == {}
         assert stats["panel_uniqueness"] == {}
         assert stats["panel_suggestions"] == []
+
+    def test_per_specialist_generalist(self, test_db):
+        from tms.review_eval import compute_review_stats
+        log_reviewer_run(
+            repo="tms", pr_number=54, review_round=1,
+            reviewer_agent="reviewer", model="deepseek-v4-pro",
+            provider_used="deepseek",
+            diff_sha_reviewed="sha", p0=1, p1=2, p2=0,
+            wall_time_ms=10000,
+            specialist_composition=[],
+        )
+        stats = compute_review_stats()
+        assert "generalist" in stats["per_specialist"]
+        g = stats["per_specialist"]["generalist"]
+        assert g["total_reviews"] == 1
+        assert g["total_p0"] == 1
+
+    def test_per_specialist_single_specialist(self, test_db):
+        from tms.review_eval import compute_review_stats
+        log_reviewer_run(
+            repo="tms", pr_number=54, review_round=1,
+            reviewer_agent="reviewer", model="deepseek-v4-pro",
+            provider_used="deepseek",
+            diff_sha_reviewed="sha", p0=0, p1=1, p2=3,
+            wall_time_ms=5000,
+            specialist_composition=["security"],
+        )
+        stats = compute_review_stats()
+        assert "security" in stats["per_specialist"]
+        s = stats["per_specialist"]["security"]
+        assert s["total_reviews"] == 1
+        assert s["total_p1"] == 1
+        assert s["total_p2"] == 3
+
+    def test_per_specialist_multi_specialist(self, test_db):
+        # Multi-specialist reviews attribute findings to each specialist.
+        # Counts are NOT additive across specialists — documented behavior.
+        from tms.review_eval import compute_review_stats
+        log_reviewer_run(
+            repo="tms", pr_number=54, review_round=1,
+            reviewer_agent="reviewer", model="deepseek-v4-pro",
+            provider_used="deepseek",
+            diff_sha_reviewed="sha", p0=2, p1=0, p2=0,
+            wall_time_ms=8000,
+            specialist_composition=["security", "schema"],
+        )
+        stats = compute_review_stats()
+        assert "security" in stats["per_specialist"]
+        assert "schema" in stats["per_specialist"]
+        sec = stats["per_specialist"]["security"]
+        sch = stats["per_specialist"]["schema"]
+        assert sec["total_reviews"] == 1
+        assert sch["total_reviews"] == 1
+        assert sec["total_p0"] == 2  # same findings attributed to both
+        assert sch["total_p0"] == 2
 
     def test_format_review_report_pretty(self, test_db):
         from tms.review_eval import (

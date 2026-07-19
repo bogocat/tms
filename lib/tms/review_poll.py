@@ -48,6 +48,8 @@ import subprocess
 import sys
 import traceback
 
+from tms.diff_shape import classify_diff
+
 
 # ── Verdict-line parser (consumes the pi-dotfiles contract) ───────
 #
@@ -375,6 +377,35 @@ def live_review_sessions():
     return live
 
 
+# ── Diff-shape classifier integration (#94) ───────────────────────
+
+def _fetch_pr_diff(gh_repo, pr_number):
+    """Fetch the diff for a PR via ``gh pr diff``.
+
+    Returns the diff text as a string, or empty string on failure.
+    The caller treats empty string as fail-open (no specialist signals).
+    """
+    out = _run(['gh', 'pr', 'diff', str(pr_number), '--repo', gh_repo],
+               timeout=30)
+    if not out:
+        print(f'WARNING: gh pr diff {gh_repo}#{pr_number} returned empty '
+              f'(timeout, auth error, or rate limit)', file=sys.stderr)
+    return out if out else ''
+
+
+def _classify_pr(gh_repo, pr_number):
+    """Fetch a PR's diff and classify it for specialist signals.
+
+    Returns a set of specialist signal strings (subset of
+    ``SPECIALIST_SIGNALS``). Returns empty set on fetch failure
+    (fail-open: generalist-only panel).
+    """
+    diff_text = _fetch_pr_diff(gh_repo, pr_number)
+    if not diff_text:
+        return set()
+    return classify_diff(diff_text)
+
+
 # ── Dispatch ──────────────────────────────────────────────────────
 
 # Per-run dispatch-failure tracking to break retry loops (#77).
@@ -389,12 +420,16 @@ _DISPATCH_FAILURES_TODAY = {}
 _MAX_FAILURES_PER_DAY = 6  # ~30 min of 5-min cycles
 
 
-def _dispatch_review(repo, pr):
+def _dispatch_review(repo, pr, specialists=None):
     """Spawn ``tmq review <repo> <pr>`` for a PR needing review.
 
     Sets ``TMQ_NO_LOG=1`` so tmq does not log its own dispatch event — the
     poller logs the dispatch itself (with ``source='poller'``) so #53 stats
     can split author-self-triggered from poller-triggered reviews.
+
+    When ``specialists`` is provided (non-empty list of specialist signal
+    names), sets ``TMQ_SPECIALIST`` in the environment so the review session
+    can include specialist reviewer personas (#94).
 
     Returns ``True`` if tmq launched successfully (exit 0), ``False`` on
     failure (review P0: failed dispatches must not be counted as successful).
@@ -412,6 +447,8 @@ def _dispatch_review(repo, pr):
 
     env = dict(os.environ)
     env['TMQ_NO_LOG'] = '1'
+    if specialists:
+        env['TMQ_SPECIALIST'] = ','.join(sorted(specialists))
     try:
         r = subprocess.run(
             ['tmq', 'review', repo, str(pr)],
@@ -449,10 +486,11 @@ def _dispatch_review(repo, pr):
         return False
 
 
-def _result(repo, gh_repo, pr, status, head=None):
+def _result(repo, gh_repo, pr, status, head=None, specialists=None):
     return {
         'repo': repo, 'gh_repo': gh_repo, 'pr': pr,
         'status': status, 'head': head,
+        'specialists': sorted(specialists) if specialists else [],
     }
 
 
@@ -524,8 +562,14 @@ def scan_repos(dispatch=False, repo_filter=None, max_dispatch=3):
             # are reported but not dispatched (next run picks them up).
             can_dispatch = dispatch and dispatched_count < max_dispatch
 
+            # Classify diff for specialist signals (#94). Fetch diff for
+            # all viable candidates (even if we won't dispatch this run)
+            # so scan results always carry specialist composition.
+            specialists = _classify_pr(gh_repo, number)
+
             if not can_dispatch:
-                results.append(_result(short, gh_repo, number, 'would_dispatch', head))
+                results.append(_result(short, gh_repo, number, 'would_dispatch', head,
+                                       specialists=specialists))
                 continue
 
             # Re-check live sessions immediately before dispatch
@@ -541,12 +585,14 @@ def scan_repos(dispatch=False, repo_filter=None, max_dispatch=3):
                 results.append(_result(short, gh_repo, number, 'skip_closed', head))
                 continue
 
-            if _dispatch_review(short, number):
+            if _dispatch_review(short, number, specialists=specialists):
                 _log_poller_dispatch(short, number)
                 dispatched_count += 1
-                results.append(_result(short, gh_repo, number, 'dispatched', head))
+                results.append(_result(short, gh_repo, number, 'dispatched', head,
+                                       specialists=specialists))
             else:
-                results.append(_result(short, gh_repo, number, 'skip_dispatch_failed', head))
+                results.append(_result(short, gh_repo, number, 'skip_dispatch_failed', head,
+                                       specialists=specialists))
 
     return results
 

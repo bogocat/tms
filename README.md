@@ -19,6 +19,45 @@ tms issues
 tmq distillery 245
 ```
 
+## Review Routing (tms#94)
+
+The review poller classifies PR diffs for **specialist reviewer signals**
+that determine which specialist personas join the review panel.
+
+### Specialist signals
+
+| Signal | Detection | Specialist persona |
+|--------|-----------|-------------------|
+| `security` | Diff contains auth/crypto/session/token/password/permission/policy keywords in added lines, or file paths containing `auth`, `secret`, `crypto`, `permission`, `policy` anywhere in the path (e.g. `authenticator.py`, `crypto_helper.py`, `my-secrets.yaml`) | `reviewer-security` |
+| `schema` | Diff touches migration/SQL/schema/alembic files, or contains DDL keywords (`CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `ADD COLUMN`, `CREATE INDEX`) in added lines | `reviewer-schema` |
+| `duplication` | >40% of changed lines are deletions, or duplicated added-line blocks | *(future — persona TBD)* |
+| `editorial` | ALL changed files are documentation (`*.md`, `*.rst`, `*.txt`, `docs/`, `README*`, `CHANGELOG*`, `LICENSE*`) | *(fast-path — generalist still runs)* |
+
+### Composition rule
+
+**Specialists ADD to the default panel, never replace it.** The generalist
+`reviewer` + `reviewer-m3` pass always runs. Specialist signals add additional
+reviewer personas to the panel.
+
+### TMQ_SPECIALIST env contract
+
+When the review poller dispatches `tmq review`, it sets the `TMQ_SPECIALIST`
+environment variable to a comma-separated list of signal names (e.g.
+`security,schema`). The review session reads this variable to include the
+corresponding specialist reviewer personas. No specialists = empty/unset
+variable = generalist-only panel.
+
+### Adding a new specialist signal
+
+1. Add the signal name to `SPECIALIST_SIGNALS` in `lib/tms/diff_shape.py`
+2. Implement detection logic in `classify_diff()`
+3. Add unit tests in `tests/test_diff_shape.py`
+4. Create the specialist persona skill in `pi-dotfiles/skills/reviewer-<signal>/SKILL.md`
+5. Wire it in the review session prompt (reads `TMQ_SPECIALIST`)
+6. Update the routing table above
+
+## Quick start
+
 ## Tools
 
 ### tms — session manager
