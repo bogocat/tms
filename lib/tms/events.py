@@ -1096,7 +1096,250 @@ def format_stats_report(stats, as_json=False, by_label=False,
                 print(f"  {cls:<24} {count:>6}")
 
 
+# ── Per-class stats (issue #112) ──────────────────────────────────
+
+
+def _worktree_to_encoded_cwd(worktree):
+    """Transform /root/wt-<repo>-<issue> → --root-wt-<repo>-<issue>--.
+
+    Returns None if the path doesn't match the worktree convention.
+    """
+    if not worktree:
+        return None
+    parts = worktree.strip("/").split("/")
+    # Expect: root/wt-<repo>-<num>
+    if len(parts) < 2 or not parts[-1].startswith("wt-"):
+        return None
+    dirname = parts[-1]  # wt-tms-112
+    if not dirname.startswith("wt-") or "-" not in dirname[3:]:
+        return None
+    # dirname = wt-tms-112 → --root-wt-tms-112--
+    return "--root-" + dirname + "--"
+
+
+def compute_stats_by_class(since=None):
+    """Compute per-class (repo:dispatch_type) aggregate stats.
+
+    Joins tms_review.events + dispatch_outcomes for merged/blocked
+    outcomes, reviewer_runs for review rounds (per repo — per-class
+    mapping from issue→PR is not directly available), and
+    bogocat.llm_call_log for cost via meta->>'encoded_cwd'.
+
+    Returns a list of dicts, one per class, sorted by (repo, dispatch_type).
+    """
+    events = _read_events_from_db(since)
+    dispatches = [e for e in events if e.get("event_type") == "dispatch"]
+
+    if not dispatches:
+        return []
+
+    # 1. Group dispatches by class = repo:dispatch_type
+    #    Also collect (repo, issue) pairs for cost lookup.
+    classes = {}  # (repo, dispatch_type) → {dispatches, issues, aoe_prefixes}
+    for d in dispatches:
+        repo = d.get("repo", "")
+        dtype = d.get("dispatch_type", "")
+        if not repo or not dtype:
+            continue
+        key = (repo, dtype)
+        if key not in classes:
+            classes[key] = {
+                "dispatches": 0,
+                "issues": {},  # issue_num → {"aoe_prefix", "worktree", "blocked_class"}
+            }
+        classes[key]["dispatches"] += 1
+        issue = d.get("issue")
+        if issue is not None:
+            aoe = d.get("aoe_id_prefix", "")
+            wt = d.get("worktree", "")
+            classes[key]["issues"][issue] = {
+                "aoe_prefix": aoe,
+                "worktree": wt,
+                "blocked_class": None,
+            }
+
+    # 2. Look up outcomes from dispatch_outcomes
+    outcomes = {}  # aoe_id_prefix → outcome
+    try:
+        with _get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT aoe_id_prefix, outcome "
+                    "FROM tms_review.dispatch_outcomes"
+                )
+                for row in cur.fetchall():
+                    outcomes[row[0]] = row[1]
+    except (psycopg2.OperationalError, psycopg2.DatabaseError, OSError):
+        pass
+
+    # 3. Mark blocked classes from transition events
+    transitions = [e for e in events if e.get("event_type") == "transition"]
+    for t in transitions:
+        if t.get("to_status") == "BLOCKED":
+            aoe = t.get("aoe_id_prefix", "")
+            bc = t.get("blocked_class") or "other"
+            # Find which class this aoe_prefix belongs to
+            for key, cdata in classes.items():
+                for issue, idata in cdata["issues"].items():
+                    if idata["aoe_prefix"] == aoe:
+                        idata["blocked_class"] = bc
+                        break
+
+    # 4. Compute merged/blocked counts per class
+    for key, cdata in classes.items():
+        merged = 0
+        blocked = 0
+        for issue, idata in cdata["issues"].items():
+            aoe = idata["aoe_prefix"]
+            outcome = outcomes.get(aoe, "unknown")
+            if outcome == "merged":
+                merged += 1
+            if idata.get("blocked_class"):
+                blocked += 1
+        cdata["merged"] = merged
+        cdata["blocked"] = blocked
+
+    # 5. Review rounds from reviewer_runs (per repo, not per-class)
+    repo_rounds = {}  # repo → list of review_round values
+    try:
+        with _get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT repo, review_round "
+                    "FROM tms_review.reviewer_runs"
+                )
+                for row in cur.fetchall():
+                    repo = row[0]
+                    rnd = row[1]
+                    if repo not in repo_rounds:
+                        repo_rounds[repo] = []
+                    repo_rounds[repo].append(rnd)
+    except (psycopg2.OperationalError, psycopg2.DatabaseError, OSError):
+        pass
+
+    def _median(values):
+        if not values:
+            return None
+        s = sorted(values)
+        n = len(s)
+        if n % 2 == 1:
+            return float(s[n // 2])
+        return (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+    # 6. Cost from llm_call_log via encoded_cwd
+    # Build encoded_cwd → total cost for all resolved worktrees
+    encoded_to_cost = {}  # encoded_cwd → total cost_usd
+    try:
+        with _get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT meta->>'encoded_cwd', "
+                    "       COALESCE(SUM(cost_usd), 0) "
+                    "FROM bogocat.llm_call_log "
+                    "WHERE meta->>'encoded_cwd' IS NOT NULL "
+                    "GROUP BY meta->>'encoded_cwd'"
+                )
+                for row in cur.fetchall():
+                    encoded_to_cost[row[0]] = float(row[1]) if row[1] else 0.0
+    except (psycopg2.OperationalError, psycopg2.DatabaseError, OSError):
+        pass
+
+    # 7. Build result list
+    result = []
+    for (repo, dtype), cdata in sorted(classes.items()):
+        dispatches_n = cdata["dispatches"]
+        merged_n = cdata["merged"]
+        blocked_n = cdata["blocked"]
+        pass_rate = merged_n / dispatches_n if dispatches_n > 0 else 0.0
+
+        # Rounds: per-repo median (NULL if no data)
+        rounds_list = repo_rounds.get(repo, [])
+        median_rounds = _median(rounds_list)
+
+        # Blocked-class distribution
+        blocked_dist = {}
+        for issue, idata in cdata["issues"].items():
+            bc = idata.get("blocked_class")
+            if bc:
+                blocked_dist[bc] = blocked_dist.get(bc, 0) + 1
+
+        # Cost: per merged issue, via encoded_cwd
+        costs = []
+        for issue, idata in cdata["issues"].items():
+            aoe = idata["aoe_prefix"]
+            outcome = outcomes.get(aoe, "unknown")
+            if outcome == "merged":
+                wt = idata.get("worktree", "")
+                ec = _worktree_to_encoded_cwd(wt)
+                if ec and ec in encoded_to_cost:
+                    costs.append(encoded_to_cost[ec])
+        median_cost = _median(costs)
+
+        result.append({
+            "class": f"{repo}:{dtype}",
+            "repo": repo,
+            "dispatch_type": dtype,
+            "dispatches": dispatches_n,
+            "merged": merged_n,
+            "blocked": blocked_n,
+            "pass_rate": round(pass_rate, 3),
+            "median_rounds": median_rounds,
+            "blocked_class_distribution": blocked_dist,
+            "median_cost": median_cost,
+        })
+
+    return result
+
+
+def format_stats_by_class(stats, as_json=False):
+    """Pretty-print per-class stats (issue #112).
+
+    If as_json=True, output as JSON for machine consumption.
+    """
+    if as_json:
+        print(json.dumps(stats, indent=2, default=str))
+        return
+
+    print("=== Per-class breakdown (repo:dispatch_type) ===")
+    print()
+    header = (
+        "  {:28} {:>5} {:>7} {:>7} {:>8} {:>8} {:>10}"
+        .format("Class", "Disp", "Merged", "Pass%",
+                "Rounds", "Blocked", "Cost")
+    )
+    print(header)
+    print(f"  {'─'*28} {'─'*5} {'─'*7} {'─'*7} {'─'*8} {'─'*8} {'─'*10}")
+
+    for row in stats:
+        cls = row["class"]
+        disp = row["dispatches"]
+        merged = row["merged"]
+        pass_rate = f"{row['pass_rate']:.0%}"
+        rounds = (
+            f"{row['median_rounds']:.1f}" if row["median_rounds"] is not None
+            else "—"
+        )
+        blocked_n = row["blocked"]
+        cost = (
+            f"${row['median_cost']:.2f}"
+            if row["median_cost"] is not None else "—"
+        )
+        print(
+            f"  {cls:<28} {disp:>5} {merged:>7} {pass_rate:>7} "
+            f"{rounds:>8} {blocked_n:>8} {cost:>10}"
+        )
+
+        # Blocked-class distribution if any
+        bcd = row.get("blocked_class_distribution", {})
+        if bcd:
+            parts = ", ".join(
+                f"{k}:{v}" for k, v in sorted(bcd.items())
+            )
+            print(f"  {'':>28} {'':>5}  blocked: {parts}")
+
+
 # ── CLI entry point ───────────────────────────────────────────────
+
 
 def main():
     """Entry point for `python3 -m tms.events <subcommand>`.
@@ -1109,7 +1352,7 @@ def main():
       transitions
           Run detect_transitions() once (poll aoe + tmux panes).
 
-      stats [--since YYYY-MM-DD] [--json]
+      stats [--since YYYY-MM-DD] [--json] [--by-class]
           Compute and print the stats report.
     """
     if len(sys.argv) < 2:
@@ -1205,6 +1448,7 @@ def main():
         by_area = False
         by_point = False
         by_blocked_class = False
+        by_class = False
         args = sys.argv[2:]
         i = 0
         while i < len(args):
@@ -1226,14 +1470,21 @@ def main():
             elif args[i] == "--by-blocked-class":
                 by_blocked_class = True
                 i += 1
+            elif args[i] == "--by-class":
+                by_class = True
+                i += 1
             else:
                 i += 1
-        stats = compute_stats(since=since)
-        format_stats_report(
-            stats, as_json=as_json,
-            by_label=by_label, by_area=by_area, by_point=by_point,
-            by_blocked_class=by_blocked_class,
-        )
+        if by_class:
+            stats = compute_stats_by_class(since=since)
+            format_stats_by_class(stats, as_json=as_json)
+        else:
+            stats = compute_stats(since=since)
+            format_stats_report(
+                stats, as_json=as_json,
+                by_label=by_label, by_area=by_area, by_point=by_point,
+                by_blocked_class=by_blocked_class,
+            )
 
     else:
         print(f"unknown subcommand: {subcmd}", file=sys.stderr)
