@@ -647,6 +647,7 @@ def detect_transition_for_session(session_name: str):
         "reason": reason,
     }
     if new_state == "BLOCKED":
+        # classify_blocked_reason already handles None → "other"
         record["blocked_class"] = classify_blocked_reason(reason)
     append_event(record)
 

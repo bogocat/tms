@@ -616,6 +616,9 @@ class TestDetectTransitions:
                         {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
                          "title": "feat-tms#98", "path": "/root/wt-tms-98"},
                     ]), "")
+            if cmd == ["tmux", "has-session", "-t",
+                       "aoe_feat-tms_98_abc12345"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[0] == "tmux" and "capture-pane" in cmd:
                 return subprocess.CompletedProcess(
                     cmd, 0,
@@ -665,6 +668,9 @@ class TestDetectTransitions:
                         {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
                          "title": "feat-tms#98", "path": "/root/wt-tms-98"},
                     ]), "")
+            if cmd == ["tmux", "has-session", "-t",
+                       "aoe_feat-tms_98_abc12345"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[0] == "tmux" and "capture-pane" in cmd:
                 return subprocess.CompletedProcess(
                     cmd, 0, "<<AGENT-STATE: WORKING>>", "")
@@ -703,6 +709,9 @@ class TestDetectTransitions:
                         {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
                          "title": "feat-tms#98", "path": "/root/wt-tms-98"},
                     ]), "")
+            if cmd == ["tmux", "has-session", "-t",
+                       "aoe_feat-tms_98_abc12345"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[0] == "tmux" and "capture-pane" in cmd:
                 return subprocess.CompletedProcess(
                     cmd, 0, "<<AGENT-STATE: WORKING>>", "")
