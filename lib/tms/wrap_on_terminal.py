@@ -436,14 +436,15 @@ def _fetch_gh_prs(gh_repo, issue):
 
     Post-filters results to only include PRs that actually reference
     the issue number (P1-6). Returns a list of {number, title, state,
-    mergedAt, url}.
+    url}. (mergedAt is not a valid gh-search JSON field; state carries
+    MERGED.)
     """
     # NOTE: pass the repo via --repo flag and omit type:pr — embedding
     # `repo:` in the query string makes gh mangle+reject the search.
     query = f"{issue} in:title,body"
     data = _gh_json([
         "search", "prs", "--repo", gh_repo, query,
-        "--json", "number,title,state,mergedAt,url,body",
+        "--json", "number,title,state,url,body",
         "--limit", "20",
     ])
     if not isinstance(data, list):
@@ -558,7 +559,7 @@ def synthesize_wrap_content(repo, issue, transitions, gh_prs, llm_call_count):
         num = pr.get("number", "?")
         pr_title = _markdown_escape(pr.get("title", ""))
         state = pr.get("state", "?")
-        merged = "merged" if pr.get("mergedAt") else state
+        merged = "merged" if str(state).upper() == "MERGED" or pr.get("mergedAt") else state
         pr_lines.append(f"- PR #{num} ({merged}) — {pr_title}")
 
     if not pr_lines:
