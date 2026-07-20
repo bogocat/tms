@@ -139,6 +139,32 @@ that last longer than its interval, which the dispatch-loop states do.
 Do not tighten the cron interval to chase sub-minute flips — that would
 solve a non-problem and increase aoe API load for no statistical gain.
 
+## Synchronous transition flush (`--session`)
+
+When closing a session, the DONE→terminal transition must be captured
+*before* the session is archived. The cron poller (1-min interval)
+races the archiver — if the archiver wins, the session is gone before
+the poller fires, and the terminal transition is lost.
+
+Use `tms events transitions --session <aoe-title>` to flush a single
+session's current FSM state synchronously:
+
+```bash
+# Flush DONE→terminal before archiving (close-process step 2→3)
+tms events transitions --session feat-tms#98
+```
+
+This captures the pane, parses the AGENT-STATE marker, compares
+against the last-status cache, and writes a transition row immediately.
+Idempotent against cron overlap via the existing composite UNIQUE
+index on `(event_type, aoe_id_prefix, event_timestamp)`.
+
+**Close-process sequence:**
+1. Mark the session terminal (agent prints `DONE` or `MERGE-READY`)
+2. **Run `tms events transitions --session <name>`** to flush the
+   DONE→terminal transition synchronously
+3. Archive the session
+
 ## Example records
 
 ### Dispatch

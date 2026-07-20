@@ -592,6 +592,155 @@ class TestDetectTransitions:
         )
         assert name == "aoe_feat-tms_53_6e803f60"
 
+    # ── Session-scoped capture (issue #98) ─────────────────────────
+
+    def test_session_scoped_capture_emits_transition(
+            self, test_db, monkeypatch, tmp_path):
+        """--session <name> captures a single session synchronously."""
+        from tms.events import detect_transition_for_session, LAST_STATUS_PATH
+
+        last_status_path = tmp_path / "last_status.json"
+        monkeypatch.setattr(
+            "tms.events.LAST_STATUS_PATH", str(last_status_path))
+
+        # Pre-seed: session was WORKING
+        last_status_path.write_text(
+            json.dumps({"abc12345": "WORKING"}))
+
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    _make_aoe_list_json([
+                        {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
+                         "title": "feat-tms#98", "path": "/root/wt-tms-98"},
+                    ]), "")
+            if cmd[0] == "tmux" and "capture-pane" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    "...\n<<AGENT-STATE: PR-REVIEW>>\nwaiting...", "")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            emitted, old_st, new_st = \
+                detect_transition_for_session("feat-tms#98")
+
+        assert emitted is True
+        assert old_st == "WORKING"
+        assert new_st == "PR-REVIEW"
+        conn = test_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT event_type, from_status, to_status, aoe_id_prefix "
+                "FROM events")
+            row = cur.fetchone()
+        assert row[0] == "transition"
+        assert row[1] == "WORKING"
+        assert row[2] == "PR-REVIEW"
+        assert row[3] == "abc12345"
+        # last_status.json must be updated
+        state = json.loads(last_status_path.read_text())
+        assert state["abc12345"] == "PR-REVIEW"
+
+    def test_session_scoped_no_change_is_noop(
+            self, test_db, monkeypatch, tmp_path):
+        """--session with unchanged state emits 0 events."""
+        from tms.events import detect_transition_for_session, LAST_STATUS_PATH
+
+        last_status_path = tmp_path / "last_status.json"
+        monkeypatch.setattr(
+            "tms.events.LAST_STATUS_PATH", str(last_status_path))
+
+        last_status_path.write_text(
+            json.dumps({"abc12345": "WORKING"}))
+
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    _make_aoe_list_json([
+                        {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
+                         "title": "feat-tms#98", "path": "/root/wt-tms-98"},
+                    ]), "")
+            if cmd[0] == "tmux" and "capture-pane" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0, "<<AGENT-STATE: WORKING>>", "")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            emitted, old_st, new_st = \
+                detect_transition_for_session("feat-tms#98")
+
+        assert emitted is False
+        assert old_st == "WORKING"
+        assert new_st == "WORKING"
+        conn = test_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM events")
+            assert cur.fetchone()[0] == 0
+
+    def test_session_scoped_first_run_seeds_no_event(
+            self, test_db, monkeypatch, tmp_path):
+        """--session on first run (no prior cache) seeds state, no event."""
+        from tms.events import detect_transition_for_session, LAST_STATUS_PATH
+
+        last_status_path = tmp_path / "last_status.json"
+        monkeypatch.setattr(
+            "tms.events.LAST_STATUS_PATH", str(last_status_path))
+
+        # No pre-existing last_status.json
+
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    _make_aoe_list_json([
+                        {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
+                         "title": "feat-tms#98", "path": "/root/wt-tms-98"},
+                    ]), "")
+            if cmd[0] == "tmux" and "capture-pane" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0, "<<AGENT-STATE: WORKING>>", "")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            emitted, old_st, new_st = \
+                detect_transition_for_session("feat-tms#98")
+
+        assert emitted is False
+        assert old_st is None
+        assert new_st == "WORKING"
+        conn = test_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM events")
+            assert cur.fetchone()[0] == 0
+        # Must seed state for future runs
+        state = json.loads(last_status_path.read_text())
+        assert state["abc12345"] == "WORKING"
+
+    def test_session_scoped_unknown_session_errors_gracefully(
+            self, test_db, monkeypatch, tmp_path):
+        """--session with unknown name must raise clear error, not crash."""
+        from tms.events import detect_transition_for_session
+
+        # aoe list returns empty — no matching session
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                return subprocess.CompletedProcess(cmd, 0, "[]", "")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            with pytest.raises(ValueError, match="Session not found"):
+                detect_transition_for_session("nonexistent")
+
     def test_capture_pane_target_uses_correct_session_name(self, test_db, monkeypatch, tmp_path):
         """P0 regression: tmux capture-pane target must match 8-char prefix."""
         from tms.events import detect_transitions, LAST_STATUS_PATH
