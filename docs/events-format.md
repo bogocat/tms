@@ -156,8 +156,13 @@ tms events transitions --session feat-tms#98
 
 This captures the pane, parses the AGENT-STATE marker, compares
 against the last-status cache, and writes a transition row immediately.
-Idempotent against cron overlap via the existing composite UNIQUE
-index on `(event_type, aoe_id_prefix, event_timestamp)`.
+Idempotent against cron overlap via the shared state cache
+(last_status.json, updated atomically): if the flush writes the
+new state before the cron fires, the cron sees the already-transitioned
+state and emits no duplicate. The composite UNIQUE index on
+`(event_type, aoe_id_prefix, event_timestamp)` provides a second
+line of defense when both invocations happen to capture the same
+transition at the exact same second.
 
 **Close-process sequence:**
 1. Mark the session terminal (agent prints `DONE` or `MERGE-READY`)

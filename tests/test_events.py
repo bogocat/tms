@@ -741,6 +741,77 @@ class TestDetectTransitions:
             with pytest.raises(ValueError, match="Session not found"):
                 detect_transition_for_session("nonexistent")
 
+    def test_session_scoped_blocked_classification(
+            self, test_db, monkeypatch, tmp_path):
+        """Session-scoped capture must classify BLOCKED transitions (#98)."""
+        from tms.events import detect_transition_for_session, LAST_STATUS_PATH
+
+        last_status_path = tmp_path / "last_status.json"
+        monkeypatch.setattr(
+            "tms.events.LAST_STATUS_PATH", str(last_status_path))
+
+        last_status_path.write_text(
+            json.dumps({"abc12345": "WORKING"}))
+
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    _make_aoe_list_json([
+                        {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
+                         "title": "feat-tms#98", "path": "/root/wt-tms-98"},
+                    ]), "")
+            if cmd == ["tmux", "has-session", "-t",
+                       "aoe_feat-tms_98_abc12345"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[0] == "tmux" and "capture-pane" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    "<<AGENT-STATE: BLOCKED: AC is ambiguous>>", "")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            emitted, old_st, new_st = \
+                detect_transition_for_session("feat-tms#98")
+
+        assert emitted is True
+        assert old_st == "WORKING"
+        assert new_st == "BLOCKED"
+        conn = test_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT to_status, reason, blocked_class FROM events")
+            row = cur.fetchone()
+        assert row[0] == "BLOCKED"
+        assert row[1] == "AC is ambiguous"
+        assert row[2] == "ambiguous-ac"
+
+    def test_session_scoped_dead_tmux_session_raises(
+            self, test_db, monkeypatch, tmp_path):
+        """When tmux has-session fails, raise clear error (not silent)."""
+        from tms.events import detect_transition_for_session
+
+        def fake_run(cmd, *args, **kwargs):
+            import subprocess
+            if cmd[:3] == ["aoe", "list", "--json"]:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    _make_aoe_list_json([
+                        {"id": "abc12345-fedc-fedc-fedc-fedcba987654",
+                         "title": "feat-tms#98", "path": "/root/wt-tms-98"},
+                    ]), "")
+            if cmd == ["tmux", "has-session", "-t",
+                       "aoe_feat-tms_98_abc12345"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "no server")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        with patch("tms.events.subprocess.run", side_effect=fake_run):
+            with pytest.raises(ValueError, match="tmux session.*not found"):
+                detect_transition_for_session("feat-tms#98")
+
     def test_capture_pane_target_uses_correct_session_name(self, test_db, monkeypatch, tmp_path):
         """P0 regression: tmux capture-pane target must match 8-char prefix."""
         from tms.events import detect_transitions, LAST_STATUS_PATH

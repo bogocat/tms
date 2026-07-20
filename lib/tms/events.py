@@ -586,7 +586,23 @@ def detect_transition_for_session(session_name: str):
             f"(title={title!r}, id={sid!r})"
         )
 
-    # 3. Capture pane and parse AGENT-STATE marker
+    # 3. Verify tmux session exists (fast check, no capture cost)
+    try:
+        r = subprocess.run(
+            ["tmux", "has-session", "-t", tmux_name],
+            capture_output=True, timeout=3,
+        )
+        if r.returncode != 0:
+            raise ValueError(
+                f"Session {session_name}: tmux session "
+                f"{tmux_name!r} not found"
+            )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise ValueError(
+            f"Session {session_name}: tmux unreachable ({e})"
+        ) from e
+
+    # 4. Capture pane and parse AGENT-STATE marker
     pane_text = _run(
         ["tmux", "capture-pane", "-t", tmux_name, "-p", "-S", "-200"],
         timeout=3,
@@ -598,7 +614,7 @@ def detect_transition_for_session(session_name: str):
     new_state = parsed[0]
     reason = parsed[1]
 
-    # 4. Load last_status and compare
+    # 5. Load last_status and compare
     last_status = {}
     try:
         if os.path.exists(LAST_STATUS_PATH):
@@ -619,7 +635,7 @@ def detect_transition_for_session(session_name: str):
     if old_state == new_state:
         return (False, old_state, new_state)
 
-    # 5. State changed — emit transition (dedup via UNIQUE index)
+    # 6. State changed — emit transition (dedup via UNIQUE index)
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     record = {
         "event_type": "transition",
@@ -634,7 +650,7 @@ def detect_transition_for_session(session_name: str):
         record["blocked_class"] = classify_blocked_reason(reason)
     append_event(record)
 
-    # 6. Update last_status
+    # 7. Update last_status
     last_status[id_prefix] = new_state
     from tms.atomic import atomic_write_json
     atomic_write_json(LAST_STATUS_PATH, last_status)
