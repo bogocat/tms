@@ -10,7 +10,7 @@ Covers:
 import json
 import os
 import tempfile
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -345,7 +345,7 @@ class TestObjectiveSynthesis:
             issue=82,
             transitions=transitions,
             gh_prs=[{"number": 83, "title": "feat: wrap-on-terminal hook"}],
-            llm_call_count=42,
+            usage={"calls": 42, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0, "etl_lag_detected": False},
         )
 
         # Must start with valid YAML frontmatter
@@ -401,6 +401,201 @@ def test_repo_to_gh_matches_tmq_registry():
             f"REPO_TO_GH missing repos from tmq registry: {sorted(missing)}. "
             f"Wraps for these repos will fall back to bogocat/<short-name>."
         )
+
+
+class TestFetchLlmUsage:
+    """_fetch_llm_usage aggregation: calls, cost, tokens, ETL-lag detection."""
+
+    def test_fetch_llm_usage_zero_rows(self, monkeypatch):
+        """When llm_call_log has no rows for this worktree, returns zeros."""
+        from tms import wrap_on_terminal as wot
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = None
+        mock_cursor.__enter__ = lambda s: s
+        mock_cursor.__exit__ = lambda s, *a: None
+
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_conn.__enter__ = lambda s: s
+        mock_conn.__exit__ = lambda s, *a: None
+
+        monkeypatch.setattr(wot, "_get_conn", lambda: mock_conn)
+
+        result = wot._fetch_llm_usage("tms", 99)
+        assert result == {
+            "calls": 0,
+            "cost_usd": 0.0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "etl_lag_detected": False,
+        }
+
+    def test_fetch_llm_usage_with_data(self, monkeypatch):
+        """Returns aggregated sums when llm_call_log has rows."""
+        from tms import wrap_on_terminal as wot
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (42, 0.156, 105000, 32000)
+        mock_cursor.__enter__ = lambda s: s
+        mock_cursor.__exit__ = lambda s, *a: None
+
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_conn.__enter__ = lambda s: s
+        mock_conn.__exit__ = lambda s, *a: None
+
+        monkeypatch.setattr(wot, "_get_conn", lambda: mock_conn)
+
+        result = wot._fetch_llm_usage("tms", 99)
+        assert result["calls"] == 42
+        assert result["cost_usd"] == 0.156
+        assert result["input_tokens"] == 105000
+        assert result["output_tokens"] == 32000
+
+    def test_fetch_llm_usage_sql_uses_correct_pattern(self, monkeypatch):
+        """SQL query uses the correct encoded_cwd pattern."""
+        from tms import wrap_on_terminal as wot
+
+        captured_sql = {}
+
+        def fake_execute(sql, params=None):
+            captured_sql["sql"] = sql
+            captured_sql["params"] = params
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (5, 0.01, 1000, 500)
+        mock_cursor.execute = fake_execute
+        mock_cursor.__enter__ = lambda s: s
+        mock_cursor.__exit__ = lambda s, *a: None
+
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_conn.__enter__ = lambda s: s
+        mock_conn.__exit__ = lambda s, *a: None
+
+        monkeypatch.setattr(wot, "_get_conn", lambda: mock_conn)
+
+        wot._fetch_llm_usage("distillery", 558)
+        assert "--root-wt-distillery-558--" in captured_sql.get("params", [None])[0]
+
+
+class TestCostFrontmatter:
+    """cost_usd + llm_calls in frontmatter, cost section in body."""
+
+    def test_synthesize_wrap_includes_cost_in_frontmatter(self):
+        """Frontmatter includes cost_usd and llm_calls fields."""
+        from tms.wrap_on_terminal import synthesize_wrap_content
+
+        usage = {
+            "calls": 42,
+            "cost_usd": 0.156,
+            "input_tokens": 105000,
+            "output_tokens": 32000,
+            "etl_lag_detected": False,
+        }
+
+        content = synthesize_wrap_content(
+            repo="tms", issue=82,
+            transitions=[], gh_prs=[], usage=usage,
+        )
+
+        # Extract frontmatter
+        assert content.startswith("---\n")
+        parts = content.split("---\n", 2)
+        fm_text = parts[1]
+
+        assert "cost_usd:" in fm_text
+        assert "0.156" in fm_text
+        assert "llm_calls:" in fm_text
+        assert "42" in fm_text
+
+    def test_synthesize_wrap_includes_cost_section(self):
+        """Body includes a ### Cost section with calls, cost, token sums."""
+        from tms.wrap_on_terminal import synthesize_wrap_content
+
+        usage = {
+            "calls": 42,
+            "cost_usd": 0.156,
+            "input_tokens": 105000,
+            "output_tokens": 32000,
+            "etl_lag_detected": False,
+        }
+
+        content = synthesize_wrap_content(
+            repo="tms", issue=82,
+            transitions=[], gh_prs=[], usage=usage,
+        )
+
+        assert "## Cost" in content
+        assert "- Calls: 42" in content
+        assert "$0.1560" in content
+        assert "105,000" in content  # formatted input tokens
+        assert "32,000" in content  # formatted output tokens
+
+    def test_synthesize_wrap_partial_data_note(self):
+        """When etl_lag_detected=True, body includes a partial-data note."""
+        from tms.wrap_on_terminal import synthesize_wrap_content
+
+        usage = {
+            "calls": 42,
+            "cost_usd": 0.156,
+            "input_tokens": 105000,
+            "output_tokens": 32000,
+            "etl_lag_detected": True,
+        }
+
+        content = synthesize_wrap_content(
+            repo="tms", issue=82,
+            transitions=[], gh_prs=[], usage=usage,
+        )
+
+        assert "partial" in content.lower()
+        assert "ETL" in content
+
+    def test_synthesize_wrap_no_partial_note_when_not_lagging(self):
+        """When etl_lag_detected=False, no partial-data note appears."""
+        from tms.wrap_on_terminal import synthesize_wrap_content
+
+        usage = {
+            "calls": 42,
+            "cost_usd": 0.156,
+            "input_tokens": 105000,
+            "output_tokens": 32000,
+            "etl_lag_detected": False,
+        }
+
+        content = synthesize_wrap_content(
+            repo="tms", issue=82,
+            transitions=[], gh_prs=[], usage=usage,
+        )
+
+        # Should NOT contain a partial-data warning
+        assert "partial" not in content.lower() or "partial" not in (
+            content.lower().replace("partially", "")
+        )
+
+    def test_validate_frontmatter_passes_with_cost_fields(self):
+        """Existing frontmatter validator still passes with cost_usd/llm_calls."""
+        from tms.wrap_on_terminal import validate_frontmatter
+
+        content = """---
+name: issue-wrap-tms#99
+description: "Wrap for tms#99"
+metadata:
+  node_type: memory
+  type: project
+  source: wrap-on-terminal
+  repo: tms
+  issue: 99
+cost_usd: 0.156
+llm_calls: 42
+---
+
+## Summary
+"""
+        errors = validate_frontmatter(content)
+        assert errors == []
 
 
 class TestFetchGhPrsInvocation:

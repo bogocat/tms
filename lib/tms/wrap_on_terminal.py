@@ -53,6 +53,11 @@ WATERMARK_PATH = os.path.expanduser("~/.local/state/tmq/wrap-watermark.json")
 DEAD_LETTER_PATH = os.path.expanduser("~/.local/state/tmq/wrap-dead-letter.json")
 LOCK_PATH = os.path.expanduser("~/.local/state/tmq/wrap-watermark.lock")
 
+# ETL-lag heuristic: if the most recent llm_call_log row for the worktree
+# was loaded this many minutes before the terminal transition, the cost
+# data is flagged as partial (best-effort; see issue #97).
+ETL_LAG_THRESHOLD_MINUTES = 5
+
 # ── Error counters (per-run) ──────────────────────────────────────
 
 _ERROR_COUNTS = {
@@ -462,30 +467,94 @@ def _fetch_gh_prs(gh_repo, issue):
     return filtered
 
 
-def _fetch_llm_call_count(repo, issue):
-    """Count llm_call_log rows from the worktree for (repo, issue).
+def _fetch_llm_usage(repo, issue, terminal_ts=None):
+    """Aggregate llm_call_log rows from the worktree for (repo, issue).
 
-    Routes through _get_conn() (same connection abstraction as the rest
-    of the module — P1-5). Matches meta->>'encoded_cwd' against the
-    pattern ``--root-wt-<repo>-<issue>--``. Returns the count
-    (best-effort; also counts sibling sessions on the same worktree).
+    Returns a dict with {calls, cost_usd, input_tokens, output_tokens,
+    etl_lag_detected}. Matches meta->>'encoded_cwd' against the
+    pattern ``--root-wt-<repo>-<issue>--``.
+
+    When terminal_ts is provided, compares MAX(created_at) of matching
+    rows to terminal_ts: if the youngest row was loaded fewer than
+    ETL_LAG_THRESHOLD_MINUTES before the terminal transition, sets
+    etl_lag_detected=True (best-effort — those last few minutes of
+    calls may not have landed in the log yet).
     """
     cwd_pattern = f"--root-wt-{repo}-{issue}--"
+    default = {
+        "calls": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "etl_lag_detected": False,
+    }
     try:
         with _get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT COUNT(*)
+                    """SELECT COUNT(*)::int,
+                              COALESCE(SUM(cost_usd), 0)::float,
+                              COALESCE(SUM(input_tokens), 0)::bigint,
+                              COALESCE(SUM(output_tokens), 0)::bigint,
+                              MAX(created_at)
                        FROM bogocat.llm_call_log
                        WHERE meta->>'encoded_cwd' = %s""",
                     (cwd_pattern,),
                 )
                 row = cur.fetchone()
-                if row:
-                    return int(row[0])
+                if not row or row[0] is None:
+                    return default
+                usage = {
+                    "calls": int(row[0]) if row[0] is not None else 0,
+                    "cost_usd": float(row[1]) if row[1] is not None else 0.0,
+                    "input_tokens": int(row[2]) if row[2] is not None else 0,
+                    "output_tokens": int(row[3]) if row[3] is not None else 0,
+                    "etl_lag_detected": False,
+                }
+                # ETL-lag heuristic: compare youngest llm_call_log row
+                # to the terminal transition timestamp
+                if terminal_ts is not None and row[4] is not None:
+                    youngest = row[4]
+                    if hasattr(youngest, "isoformat"):
+                        youngest = youngest.isoformat()
+                    youngest = str(youngest)
+                    term = _to_iso_string(terminal_ts)
+                    if term is not None:
+                        lag = _iso_diff_minutes(term, youngest)
+                        if lag is not None and lag < ETL_LAG_THRESHOLD_MINUTES:
+                            usage["etl_lag_detected"] = True
+                return usage
     except Exception as e:
-        _log_error("llm", f"_fetch_llm_call_count({repo}#{issue}): {e}")
-    return 0
+        _log_error("llm", f"_fetch_llm_usage({repo}#{issue}): {e}")
+    return default
+
+
+def _iso_diff_minutes(iso_a, iso_b):
+    """Return |iso_a - iso_b| in minutes, or None on parse failure."""
+    from datetime import datetime as _dt
+    import re as _re
+
+    def _parse(iso_str):
+        # Handle various ISO-8601 sub-second / tz formats
+        clean = _re.sub(r'\.[0-9]+', '', iso_str)
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S+00:00",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S%z",
+            "%Y-%m-%d %H:%M:%S",
+        ):
+            try:
+                return _dt.strptime(clean, fmt)
+            except ValueError:
+                continue
+        return None
+
+    dt_a = _parse(iso_a)
+    dt_b = _parse(iso_b)
+    if dt_a is None or dt_b is None:
+        return None
+    return abs((dt_a - dt_b).total_seconds()) / 60.0
 
 
 # ── Wrap synthesis ────────────────────────────────────────────────
@@ -523,7 +592,7 @@ def _markdown_escape(text):
     return (text or "").replace("|", "\\|")
 
 
-def synthesize_wrap_content(repo, issue, transitions, gh_prs, llm_call_count):
+def synthesize_wrap_content(repo, issue, transitions, gh_prs, usage):
     """Produce a complete memory file as a string.
 
     Args:
@@ -531,7 +600,8 @@ def synthesize_wrap_content(repo, issue, transitions, gh_prs, llm_call_count):
         issue: issue number
         transitions: list of transition dicts from collect_event_history
         gh_prs: list of PR dicts from _fetch_gh_prs
-        llm_call_count: int, approximate count from llm_call_log
+        usage: dict from _fetch_llm_usage with {calls, cost_usd,
+               input_tokens, output_tokens, etl_lag_detected}
 
     Returns a string with YAML frontmatter + markdown body.
     """
@@ -575,6 +645,8 @@ def synthesize_wrap_content(repo, issue, transitions, gh_prs, llm_call_count):
         "  source: wrap-on-terminal",
         f"  repo: {repo}",
         f"  issue: {issue}",
+        f"cost_usd: {usage.get('cost_usd', 0):.6f}",
+        f"llm_calls: {usage.get('calls', 0)}",
         "---",
         "",
         f"# Objective wrap: {repo}#{issue}",
@@ -595,14 +667,31 @@ def synthesize_wrap_content(repo, issue, transitions, gh_prs, llm_call_count):
     lines.append("")
     lines.extend(pr_lines)
     lines.append("")
-    lines.append("## Approximate LLM calls")
+    lines.append("## Cost")
+    lines.append("")
+    cost = usage.get("cost_usd", 0) or 0
+    calls = usage.get("calls", 0) or 0
+    inp = usage.get("input_tokens", 0) or 0
+    out = usage.get("output_tokens", 0) or 0
+    lines.append(f"- Calls: {calls}")
+    lines.append(f"- Cost: ${cost:.4f}")
+    lines.append(f"- Input tokens: {inp:,}")
+    lines.append(f"- Output tokens: {out:,}")
     lines.append("")
     lines.append(
-        f"{llm_call_count} calls from worktree `--root-wt-{repo}-{issue}--`"
+        f"*Worktree filter: `--root-wt-{repo}-{issue}--` "
+        f"(via `bogocat.llm_call_log.meta->>'encoded_cwd'`).*"
     )
-    lines.append(
-        f"(via `bogocat.llm_call_log.meta->>'encoded_cwd'`)."
-    )
+    if usage.get("etl_lag_detected"):
+        lines.append("")
+        lines.append(
+            f"> **Note:** The most recent ETL row for this worktree was loaded "
+            f"fewer than {ETL_LAG_THRESHOLD_MINUTES} minutes before the "
+            f"terminal transition. Cost and token totals may be partial — "
+            f"the last few minutes of LLM calls may not have landed in "
+            f"`bogocat.llm_call_log` yet. This is best-effort; the data "
+            f"will be complete on the next archive run."
+        )
     lines.append("")
     lines.append("## Blocked reasons")
     lines.append("")
@@ -622,8 +711,11 @@ def synthesize_wrap_content(repo, issue, transitions, gh_prs, llm_call_count):
     lines.append("  AND aoe_id_prefix = '<prefix>'")
     lines.append("ORDER BY event_timestamp;")
     lines.append("")
-    lines.append("-- LLM calls from this worktree")
-    lines.append("SELECT COUNT(*)")
+    lines.append("-- LLM usage from this worktree")
+    lines.append("SELECT COUNT(*) AS calls,")
+    lines.append("       SUM(cost_usd) AS cost_usd,")
+    lines.append("       SUM(input_tokens) AS input_tokens,")
+    lines.append("       SUM(output_tokens) AS output_tokens")
     lines.append("FROM bogocat.llm_call_log")
     lines.append(
         f"WHERE meta->>'encoded_cwd' = '--root-wt-{repo}-{issue}--';"
@@ -740,11 +832,11 @@ def _scan_and_wrap_locked(dispatch, memory_dir, watermark_path, dry_run):
         transitions = collect_event_history(aoe_prefix)
         gh_repo = _resolve_gh_repo(repo)
         gh_prs = _fetch_gh_prs(gh_repo, issue)
-        llm_count = _fetch_llm_call_count(repo, issue)
+        usage = _fetch_llm_usage(repo, issue, terminal_ts=term["terminal_ts"])
 
         # ── Synthesize and validate ───────────────────────────
         content = synthesize_wrap_content(
-            repo, issue, transitions, gh_prs, llm_count,
+            repo, issue, transitions, gh_prs, usage,
         )
         errors = validate_frontmatter(content)
         if errors:
@@ -774,7 +866,7 @@ def _scan_and_wrap_locked(dispatch, memory_dir, watermark_path, dry_run):
         #   - Comment fails → don't write file → retry next run
         filename = f"issue-wrap-{repo}#{issue}.md"
         comment_ok = _post_issue_comment(gh_repo, issue, filename,
-                                         transitions, gh_prs, llm_count)
+                                         transitions, gh_prs, usage)
         if not comment_ok:
             _log_error("comment", f"{repo}#{issue}: gh issue comment failed")
             # Don't advance watermark — retry next run
@@ -827,7 +919,7 @@ def _scan_and_wrap_locked(dispatch, memory_dir, watermark_path, dry_run):
 
 
 def _post_issue_comment(gh_repo, issue, wrap_filename, transitions,
-                        gh_prs, llm_count):
+                        gh_prs, usage):
     """Post a closing comment on the GitHub issue.
 
     Returns True on success, False on failure.
@@ -843,6 +935,11 @@ def _post_issue_comment(gh_repo, issue, wrap_filename, transitions,
         to_s = t.get("to_status", "?")
         timeline_summary.append(f"{ts}: {from_s} → {to_s}")
 
+    calls = usage.get("calls", 0) if usage else 0
+    cost = usage.get("cost_usd", 0) if usage else 0
+    inp = usage.get("input_tokens", 0) if usage else 0
+    out = usage.get("output_tokens", 0) if usage else 0
+
     body_parts = [
         "## 🤖 Objective wrap (wrap-on-terminal)",
         "",
@@ -850,7 +947,12 @@ def _post_issue_comment(gh_repo, issue, wrap_filename, transitions,
         "",
         "### What shipped",
         f"- PRs referencing this issue: {pr_list}",
-        f"- Approximate LLM calls from this worktree: {llm_count}",
+        "",
+        "### Cost",
+        f"- Calls: {calls}",
+        f"- Cost: ${cost:.4f}",
+        f"- Input tokens: {inp:,}",
+        f"- Output tokens: {out:,}",
         "",
         "### Transition timeline",
     ]
