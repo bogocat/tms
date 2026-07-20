@@ -523,6 +523,142 @@ def detect_transitions():
     return emitted
 
 
+def detect_transition_for_session(session_name: str):
+    """Capture a single session's FSM state synchronously.
+
+    Looks up ``session_name`` (aoe title, e.g. "feat-tms#98") in
+    ``aoe list --json``, captures the tmux pane, parses the most
+    recent AGENT-STATE marker, compares against last_status.json,
+    and writes a transition row if the state changed.
+
+    Idempotent against cron overlap via the existing composite UNIQUE
+    index on (event_type, aoe_id_prefix, event_timestamp) — the cron
+    poller and this flush share the same append_event() path and the
+    same dedup guard.
+
+    Returns (emitted: bool, from_status: str|None, to_status: str|None).
+    Raises ValueError if the session is not found in aoe list.
+    """
+    import json as _json
+
+    # 1. Look up the session by title in aoe list
+    try:
+        r = subprocess.run(
+            ["aoe", "list", "--json"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            raise ValueError(
+                f"Session not found: {session_name} (aoe list failed)"
+            )
+        aoe_sessions = _json.loads(r.stdout)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise ValueError(
+            f"Session not found: {session_name} ({e})"
+        ) from e
+    except _json.JSONDecodeError:
+        raise ValueError(
+            f"Session not found: {session_name} (invalid aoe JSON)"
+        )
+
+    # Find the matching session
+    match = None
+    for s in aoe_sessions:
+        if s.get("title") == session_name:
+            match = s
+            break
+    if match is None:
+        raise ValueError(f"Session not found: {session_name}")
+
+    sid = match.get("id", "")
+    if len(sid) < 8:
+        raise ValueError(
+            f"Session {session_name}: aoe id too short ({sid!r})"
+        )
+    id_prefix = sid[:8]
+    title = match.get("title", "")
+
+    # 2. Derive tmux session name
+    tmux_name = _derived_tmux_session_name(title, sid)
+    if not tmux_name:
+        raise ValueError(
+            f"Session {session_name}: cannot derive tmux name "
+            f"(title={title!r}, id={sid!r})"
+        )
+
+    # 3. Verify tmux session exists (fast check, no capture cost)
+    try:
+        r = subprocess.run(
+            ["tmux", "has-session", "-t", tmux_name],
+            capture_output=True, timeout=3,
+        )
+        if r.returncode != 0:
+            raise ValueError(
+                f"Session {session_name}: tmux session "
+                f"{tmux_name!r} not found"
+            )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise ValueError(
+            f"Session {session_name}: tmux unreachable ({e})"
+        ) from e
+
+    # 4. Capture pane and parse AGENT-STATE marker
+    pane_text = _run(
+        ["tmux", "capture-pane", "-t", tmux_name, "-p", "-S", "-200"],
+        timeout=3,
+    )
+    parsed = _parse_agent_state_from_pane(pane_text)
+    if parsed is None:
+        return (False, None, None)
+
+    new_state = parsed[0]
+    reason = parsed[1]
+
+    # 5. Load last_status and compare
+    last_status = {}
+    try:
+        if os.path.exists(LAST_STATUS_PATH):
+            with open(LAST_STATUS_PATH) as f:
+                last_status = _json.load(f)
+    except (_json.JSONDecodeError, OSError):
+        last_status = {}
+
+    old_state = last_status.get(id_prefix)
+
+    if old_state is None:
+        # First run for this session: seed state, no event
+        last_status[id_prefix] = new_state
+        from tms.atomic import atomic_write_json
+        atomic_write_json(LAST_STATUS_PATH, last_status)
+        return (False, None, new_state)
+
+    if old_state == new_state:
+        return (False, old_state, new_state)
+
+    # 6. State changed — emit transition (dedup via UNIQUE index)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    record = {
+        "event_type": "transition",
+        "timestamp": now,
+        "session": title,
+        "aoe_id_prefix": id_prefix,
+        "from_status": old_state,
+        "to_status": new_state,
+        "reason": reason,
+    }
+    if new_state == "BLOCKED":
+        # classify_blocked_reason already handles None → "other"
+        record["blocked_class"] = classify_blocked_reason(reason)
+    append_event(record)
+
+    # 7. Update last_status
+    last_status[id_prefix] = new_state
+    from tms.atomic import atomic_write_json
+    atomic_write_json(LAST_STATUS_PATH, last_status)
+
+    return (True, old_state, new_state)
+
+
 def _derived_tmux_session_name(title, aoe_id):
     """Derive the likely tmux session name from an aoe title + id.
 
@@ -1035,8 +1171,32 @@ def main():
         )
 
     elif subcmd == "transitions":
-        n = detect_transitions()
-        print(f"Emitted {n} transition event(s).")
+        # --session <name>: capture a single session synchronously (#98)
+        args = sys.argv[2:]
+        session_arg = None
+        i = 0
+        while i < len(args):
+            if args[i] == "--session" and i + 1 < len(args):
+                session_arg = args[i + 1]
+                i += 2
+            else:
+                i += 1
+        if session_arg:
+            emitted, old_st, new_st = \
+                detect_transition_for_session(session_arg)
+            if emitted:
+                print(
+                    f"Transition: {old_st} → {new_st} "
+                    f"(session: {session_arg})"
+                )
+            else:
+                print(
+                    f"No change (current: {new_st or 'unknown'}, "
+                    f"session: {session_arg})"
+                )
+        else:
+            n = detect_transitions()
+            print(f"Emitted {n} transition event(s).")
 
     elif subcmd == "stats":
         since = None

@@ -1437,8 +1437,9 @@ case "${1:-}" in
         #   dispatch-monitor  check dispatch_failed rate against SLO (#84)
         case "${2:-}" in
             transitions)
+                shift 2
                 PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" \
-                    python3 -m tms.events transitions
+                    python3 -m tms.events transitions "$@"
                 ;;
             stats)
                 shift 2
@@ -1465,7 +1466,7 @@ case "${1:-}" in
 tms events — fleet dispatch metrics (issue #53) + review poller (#57)
 
 Usage:
-  tms events transitions     poll aoe + tmux panes, emit transition events
+  tms events transitions [--session <name>]  poll aoe + tmux panes (sync flush with --session)
   tms events stats            compute and print aggregate metrics report
   tms events scan-reviews       list open PRs lacking a reviewer verdict (#57)
   tms events dispatch-monitor   check dispatch_failed rate against SLO (#84)
