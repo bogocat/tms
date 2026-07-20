@@ -1557,7 +1557,7 @@ class TestComputeStatsByClass:
                     if r["repo"] == "tms" and r["dispatch_type"] == "feature"][0]
 
         # reviewer_runs for tms: PRs with rounds [1, 3, 2] → median = 2
-        assert tms_feat["median_rounds"] == 2.0
+        assert tms_feat["repo_median_rounds"] == 2.0
 
     def test_never_dispatched_class(self, test_db):
         """tms:fix has 1 dispatch, 0 merged, 0 blocked, rounds from repo."""
@@ -1572,7 +1572,7 @@ class TestComputeStatsByClass:
         assert tms_fix["merged"] == 0
         assert tms_fix["blocked"] == 0
         # Rounds from reviewer_runs at repo level (not per-class)
-        assert tms_fix["median_rounds"] == 2.0  # same repo-level median
+        assert tms_fix["repo_median_rounds"] == 2.0  # same repo-level median
 
     def test_cost_join_via_encoded_cwd(self, test_db):
         """Cost joined via encoded_cwd, NULL when no match."""
@@ -1634,7 +1634,7 @@ class TestComputeStatsByClass:
             assert "dispatches" in row
             assert "merged" in row
             assert "pass_rate" in row
-            assert "median_rounds" in row
+            assert "repo_median_rounds" in row
             assert "blocked_class_distribution" in row
             assert "median_cost" in row
 

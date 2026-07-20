@@ -208,7 +208,7 @@ a short repo name and the dispatch type (`feature`, `fix`, `chore`,
 | `merged` | `tms_review.dispatch_outcomes` | Joined via aoe_id_prefix |
 | `blocked` | `tms_review.events` (transition, to_status=BLOCKED) | Per issue within class |
 | `pass_rate` | computed | merged / dispatches |
-| `median_rounds` | `tms_review.reviewer_runs` | Per-repo median (issue→PR mapping not directly available; rounds are at repo granularity, not per-class) |
+| `repo_median_rounds` | `tms_review.reviewer_runs` | Per-repo median (issue→PR mapping not directly available; rounds are at repo granularity, not per-class) |
 | `blocked_class_distribution` | `tms_review.events.blocked_class` | Taxonomy breakdown per class |
 | `median_cost` | `bogocat.llm_call_log` via `meta->>'encoded_cwd'` | Per merged issue; NULL when worktree cannot be resolved or no cost data exists |
 
@@ -233,7 +233,7 @@ a short repo name and the dispatch type (`feature`, `fix`, `chore`,
 ```
 === Per-class breakdown (repo:dispatch_type) ===
 
-  Class                         Disp  Merged   Pass%   Rounds  Blocked       Cost
+  Class                         Disp  Merged   Pass%  RepoRnd  Blocked       Cost
   ──────────────────────────── ───── ─────── ─────── ──────── ──────── ──────────
   distillery:feature               5       4     80%      2.0        1     $3.45
   distillery:fix                   2       1     50%      2.0        1    $12.00

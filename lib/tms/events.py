@@ -1254,7 +1254,7 @@ def compute_stats_by_class(since=None):
 
         # Rounds: per-repo median (NULL if no data)
         rounds_list = repo_rounds.get(repo, [])
-        median_rounds = _median(rounds_list)
+        repo_median_rounds = _median(rounds_list)
 
         # Blocked-class distribution
         blocked_dist = {}
@@ -1283,7 +1283,7 @@ def compute_stats_by_class(since=None):
             "merged": merged_n,
             "blocked": blocked_n,
             "pass_rate": round(pass_rate, 3),
-            "median_rounds": median_rounds,
+            "repo_median_rounds": repo_median_rounds,
             "blocked_class_distribution": blocked_dist,
             "median_cost": median_cost,
         })
@@ -1305,7 +1305,7 @@ def format_stats_by_class(stats, as_json=False):
     header = (
         "  {:28} {:>5} {:>7} {:>7} {:>8} {:>8} {:>10}"
         .format("Class", "Disp", "Merged", "Pass%",
-                "Rounds", "Blocked", "Cost")
+                "RepoRnd", "Blocked", "Cost")
     )
     print(header)
     print(f"  {'─'*28} {'─'*5} {'─'*7} {'─'*7} {'─'*8} {'─'*8} {'─'*10}")
@@ -1316,7 +1316,7 @@ def format_stats_by_class(stats, as_json=False):
         merged = row["merged"]
         pass_rate = f"{row['pass_rate']:.0%}"
         rounds = (
-            f"{row['median_rounds']:.1f}" if row["median_rounds"] is not None
+            f"{row['repo_median_rounds']:.1f}" if row["repo_median_rounds"] is not None
             else "—"
         )
         blocked_n = row["blocked"]
