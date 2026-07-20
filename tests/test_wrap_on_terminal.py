@@ -401,3 +401,58 @@ def test_repo_to_gh_matches_tmq_registry():
             f"REPO_TO_GH missing repos from tmq registry: {sorted(missing)}. "
             f"Wraps for these repos will fall back to bogocat/<short-name>."
         )
+
+
+class TestFetchGhPrsInvocation:
+    """Regression: gh search prs rejects an embedded repo: qualifier.
+
+    The query must use the --repo flag and omit type:pr (gh appends its
+    own). The old form `repo:X N in:title,body type:pr` as a single arg
+    made gh re-quote and reject every search (live bug, first cron run).
+    """
+
+    def test_fetch_gh_prs_uses_repo_flag_not_embedded(self, monkeypatch):
+        from tms import wrap_on_terminal as wot
+
+        captured = {}
+
+        def fake_gh_json(args, timeout=15):
+            captured["args"] = args
+            return [
+                {
+                    "number": 95,
+                    "title": "feat: thing (#94)",
+                    "state": "MERGED",
+                    "mergedAt": "2026-07-19",
+                    "url": "http://x",
+                    "body": "Closes #94",
+                }
+            ]
+
+        monkeypatch.setattr(wot, "_gh_json", fake_gh_json)
+        out = wot._fetch_gh_prs("bogocat/tms", 94)
+
+        args = captured["args"]
+        assert "--repo" in args
+        assert args[args.index("--repo") + 1] == "bogocat/tms"
+        query = args[args.index("--repo") + 2]
+        assert "repo:" not in query
+        assert "type:pr" not in query
+        assert "in:title,body" in query
+        assert out and out[0]["number"] == 95
+
+    def test_fetch_gh_prs_filters_non_referencing_results(self, monkeypatch):
+        from tms import wrap_on_terminal as wot
+
+        monkeypatch.setattr(
+            wot,
+            "_gh_json",
+            lambda args, timeout=15: [
+                {"number": 95, "title": "feat: thing", "state": "MERGED",
+                 "mergedAt": "", "url": "", "body": "Closes #94"},
+                {"number": 46, "title": "feat: unrelated", "state": "MERGED",
+                 "mergedAt": "", "url": "", "body": "no reference here"},
+            ],
+        )
+        out = wot._fetch_gh_prs("bogocat/tms", 94)
+        assert [p["number"] for p in out] == [95]

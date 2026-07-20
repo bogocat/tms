@@ -438,9 +438,11 @@ def _fetch_gh_prs(gh_repo, issue):
     the issue number (P1-6). Returns a list of {number, title, state,
     mergedAt, url}.
     """
-    query = f"repo:{gh_repo} {issue} in:title,body type:pr"
+    # NOTE: pass the repo via --repo flag and omit type:pr — embedding
+    # `repo:` in the query string makes gh mangle+reject the search.
+    query = f"{issue} in:title,body"
     data = _gh_json([
-        "search", "prs", query,
+        "search", "prs", "--repo", gh_repo, query,
         "--json", "number,title,state,mergedAt,url,body",
         "--limit", "20",
     ])
