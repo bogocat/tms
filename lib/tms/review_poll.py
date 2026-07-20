@@ -49,9 +49,149 @@ import sys
 import traceback
 
 from tms.diff_shape import classify_diff
+from tms.review_eval import _get_conn
 
 
-# ── Verdict-line parser (consumes the pi-dotfiles contract) ───────
+# ── Panel entry parsing (tms#96) ─────────────────────────────────
+
+# Panel entries can be in two formats:
+#   agent(model) — e.g. reviewer(deepseek-v4-pro)
+#   bare model   — e.g. deepseek-v4-pro
+# They are comma-separated, may have whitespace.
+# Entries with (max-sub) or (other annotations) in parens have the
+# annotation stripped; bare model entries are used as both agent and model.
+
+def _split_panel_entries(panel_text):
+    """Split a panel field value on commas, respecting parenthesized groups.
+
+    ``reviewer(deepseek-v4-pro),claude-sonnet(max-sub)`` →
+    ``['reviewer(deepseek-v4-pro)', 'claude-sonnet(max-sub)']``
+    """
+    if not panel_text:
+        return []
+    entries = []
+    depth = 0
+    current = []
+    for ch in panel_text:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            entries.append(''.join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    remaining = ''.join(current).strip()
+    if remaining:
+        entries.append(remaining)
+    return entries
+
+
+_AGENT_MODEL_RE = re.compile(
+    r'^([^(]+)\((.+)\)$'
+)
+
+
+def _parse_panel_entries(panel_text):
+    """Parse a panel field value into a list of (reviewer_agent, model) tuples.
+
+    Handles:
+        ``reviewer(deepseek-v4-pro),reviewer-m3(MiniMax-M3)``
+        ``deepseek-v4-pro,minimax-m3``
+        ``claude-sonnet(max-sub)``
+        ``reviewer-fast(claude-sonnet(max-sub))``
+        Mixed formats in the same panel.
+
+    Returns an empty list for empty or None panel_text.
+    """
+    if not panel_text or not panel_text.strip():
+        return []
+    entries = []
+    # Known subscription/pricing annotations (not part of model names).
+    # Strip these before attempting agent(model) extraction.
+    _ANNOTATION_RE = re.compile(r'\((?:max-sub|max|pro|lite|sub)\)')
+
+    for entry in _split_panel_entries(panel_text):
+        # Strip known annotation parens only, not model-name parens.
+        cleaned = _ANNOTATION_RE.sub('', entry).strip()
+        if not cleaned:
+            continue
+        m = _AGENT_MODEL_RE.match(cleaned)
+        if m:
+            agent = m.group(1).strip()
+            model = m.group(2).strip()
+            entries.append((agent, model))
+        else:
+            # Bare model name (no parens at all, or all parens were
+            # annotations and got stripped).
+            entries.append((cleaned, cleaned))
+    return entries
+
+
+# ── Provider inference (tms#96) ──────────────────────────────────
+
+_PROVIDER_MAP = {
+    'deepseek': ['deepseek'],
+    'minimax': ['minimax'],
+    'anthropic': ['claude', 'anthropic'],
+}
+
+
+def _model_to_provider(model):
+    """Infer the provider name from a model identifier.
+
+    Uses case-insensitive substring matching against known provider
+    patterns. Falls back to ``'unknown'``.
+    """
+    if not model:
+        return 'unknown'
+    lower = model.lower()
+    for provider, keywords in _PROVIDER_MAP.items():
+        for kw in keywords:
+            if kw in lower:
+                return provider
+    return 'unknown'
+
+
+# ── Verdict-to-rows conversion (tms#96) ──────────────────────────
+
+def _verdict_to_rows(repo, pr_number, verdict):
+    """Convert a parsed verdict dict into a list of reviewer_runs row dicts.
+
+    One row per reviewer in the panel. Verdicts without a panel field
+    (empty or missing reviewer list) return an empty list — we can't
+    create rows without knowing who reviewed.
+    """
+    panel_text = verdict.get('panel', '')
+    entries = _parse_panel_entries(panel_text)
+    if not entries:
+        return []
+    rows = []
+    for agent, model in entries:
+        rows.append({
+            'repo': repo,
+            'pr_number': pr_number,
+            'review_round': verdict.get('rounds', 0),
+            'reviewer_agent': agent,
+            'model': model,
+            'provider_used': _model_to_provider(model),
+            'diff_sha_reviewed': verdict.get('sha', ''),
+            'p0': verdict.get('p0', 0),
+            'p1': verdict.get('p1', 0),
+            'p2': verdict.get('p2', 0),
+            'wall_time_ms': None,
+            'findings': None,
+            'input_tokens': None,
+            'output_tokens': None,
+            'specialist_composition': [],
+        })
+    return rows
+
+
+# ── Verdict capture (tms#96) ─────────────────────────────────────
+
+# -- Verdict-line parser (consumes the pi-dotfiles contract) ───────
 #
 # The marker is ``<<REVIEW-VERDICT: STATE ...>>``. Fields after STATE are
 # key=value tokens in unspecified order: sha (hex), p0, p1, rounds, panel.
@@ -216,6 +356,60 @@ def _classify_skip(comments, head_oid):
 
 # ── External-call wrappers (thin, monkeypatchable) ────────────────
 
+def _capture_verdict(repo, pr_number, verdict):
+    """Insert reviewer_runs rows for a single verdict, with dedup.
+
+    Dedup key: (repo, pr_number, diff_sha_reviewed, reviewer_agent).
+    If any row for the same (repo, pr_number, sha, reviewer) already
+    exists, that row is skipped. Returns the number of rows inserted.
+    """
+    rows = _verdict_to_rows(repo, pr_number, verdict)
+    if not rows:
+        return 0
+    inserted = 0
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            for row in rows:
+                # Dedup: skip if this exact (repo, pr, sha, agent) exists.
+                cur.execute(
+                    """SELECT 1 FROM tms_review.reviewer_runs
+                       WHERE repo = %s AND pr_number = %s
+                         AND diff_sha_reviewed = %s
+                         AND reviewer_agent = %s
+                       LIMIT 1""",
+                    (row['repo'], row['pr_number'],
+                     row['diff_sha_reviewed'], row['reviewer_agent']),
+                )
+                if cur.fetchone():
+                    continue
+                import uuid
+                import json as _json
+                cur.execute(
+                    """INSERT INTO tms_review.reviewer_runs
+                       (run_id, repo, pr_number, review_round,
+                        reviewer_agent, model, provider_used,
+                        diff_sha_reviewed, p0, p1, p2, wall_time_ms,
+                        findings, input_tokens, output_tokens,
+                        specialist_composition)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+                               %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        str(uuid.uuid4()),
+                        row['repo'], row['pr_number'], row['review_round'],
+                        row['reviewer_agent'], row['model'],
+                        row['provider_used'], row['diff_sha_reviewed'],
+                        row['p0'], row['p1'], row['p2'],
+                        row['wall_time_ms'],
+                        _json.dumps(row['findings']) if row['findings'] is not None else None,
+                        row['input_tokens'], row['output_tokens'],
+                        _json.dumps(row['specialist_composition']),
+                    ),
+                )
+                inserted += 1
+        conn.commit()
+    return inserted
+
+
 def _run(cmd, timeout=15):
     """Run a subprocess, return stripped stdout. Empty string on error."""
     try:
@@ -308,6 +502,22 @@ def _pr_comment_bodies(gh_repo, number):
     return [c.get('body', '') for c in data.get('comments', [])], True
 
 
+def _fetch_pr_reviews(gh_repo, number):
+    """Fetch PR review bodies (GH Reviews API, not issue comments).
+
+    Returns a list of review body strings. Returns empty list on error.
+    This is the dual-surface complement to ``_pr_comment_bodies`` — some
+    verdicts (e.g. tms#88) are posted as PR reviews rather than issue
+    comments and would be systematically missed without this path.
+    """
+    data = _gh_json([
+        'api', f'repos/{gh_repo}/pulls/{number}/reviews',
+    ])
+    if not isinstance(data, list):
+        return []
+    return [r.get('body', '') for r in data if r.get('body')]
+
+
 def _pr_still_open(gh_repo, number):
     """Re-check a PR is still open right before dispatching (orphan guard).
 
@@ -391,6 +601,82 @@ def _fetch_pr_diff(gh_repo, pr_number):
         print(f'WARNING: gh pr diff {gh_repo}#{pr_number} returned empty '
               f'(timeout, auth error, or rate limit)', file=sys.stderr)
     return out if out else ''
+
+
+def _scan_prs_for_verdicts(gh_repo, state='merged', since=None):
+    """Scan merged/closed PRs for verdict markers in both comments
+    and reviews. Yields dicts with {number, headRefOid, verdicts}
+    where ``verdicts`` is a list of parsed verdict dicts.
+
+    For each PR that has at least one verdict marker (in either
+    comments or reviews), yields its metadata and ALL parsed verdicts.
+    PRs without any verdict marker are silently skipped.
+
+    Args:
+        gh_repo: GitHub repo (bogocat/tms, etc.)
+        state: PR state filter (merged, closed, all)
+        since: ISO date string for --search merged:>=DATE filter
+    """
+    # Build gh pr list args
+    list_args = [
+        'pr', 'list', '--repo', gh_repo, '--state', state,
+        '--json', 'number,headRefOid,mergedAt', '--limit', '100',
+    ]
+    if since:
+        list_args[4:4] = ['--search', f'merged:>={since}']
+    prs = _gh_json(list_args)
+    if not isinstance(prs, list):
+        return
+    for pr in prs:
+        number = pr.get('number')
+        if not number:
+            continue
+        # Fetch both comments and reviews
+        comments, _ = _pr_comment_bodies(gh_repo, number)
+        review_bodies = _fetch_pr_reviews(gh_repo, number)
+        all_bodies = comments + review_bodies
+        # Parse verdicts from all bodies
+        verdicts = []
+        for body in all_bodies:
+            v = parse_verdict_line(body)
+            if v is not None:
+                verdicts.append(v)
+        if verdicts:
+            yield {
+                'number': number,
+                'headRefOid': pr.get('headRefOid', ''),
+                'verdicts': verdicts,
+            }
+
+
+def capture_verdicts(repo_filter=None, backfill=False, since=None):
+    """Scan the repo registry and capture verdict markers into
+    ``tms_review.reviewer_runs``.
+
+    In normal mode (``backfill=False``), scans open PRs for verdicts
+    and captures them. In backfill mode (``backfill=True``), scans
+    merged PRs since ``since``.
+
+    Returns a list of result dicts:
+    ``{repo, gh_repo, pr, verdicts_found, rows_inserted}``.
+    """
+    results = []
+    state = 'merged' if backfill else 'open'
+    for short, gh_repo in _repo_registry(repo_filter=repo_filter):
+        for pr_info in _scan_prs_for_verdicts(gh_repo, state=state,
+                                               since=since):
+            number = pr_info['number']
+            total_inserted = 0
+            for verdict in pr_info['verdicts']:
+                total_inserted += _capture_verdict(short, number, verdict)
+            results.append({
+                'repo': short,
+                'gh_repo': gh_repo,
+                'pr': number,
+                'verdicts_found': len(pr_info['verdicts']),
+                'rows_inserted': total_inserted,
+            })
+    return results
 
 
 def _classify_pr(gh_repo, pr_number):
@@ -652,25 +938,10 @@ def _format_report(results):
     print("Summary: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
 
 
-def main():
-    """Entry point for ``python3 -m tms.review_poll``.
-
-      scan-reviews [--dispatch] [--repo <short>] [--max-dispatch <n>]
-    """
+def _main_scan_reviews(args):
+    """CLI handler for ``scan-reviews`` subcommand."""
     import sys
 
-    args = sys.argv[1:]
-    if not args or args[0] in ('-h', '--help'):
-        print("usage: python3 -m tms.review_poll scan-reviews "
-              "[--dispatch] [--repo <short>] [--max-dispatch <n>]")
-        sys.exit(0)
-
-    subcmd = args[0]
-    if subcmd != 'scan-reviews':
-        print(f"unknown subcommand: {subcmd}", file=sys.stderr)
-        sys.exit(1)
-
-    # Check for --help/-h anywhere in the remaining args (not just position 0)
     if '--help' in args or '-h' in args:
         print("usage: tms events scan-reviews "
               "[--dispatch] [--repo <short>] [--max-dispatch <n>]")
@@ -706,6 +977,81 @@ def main():
     results = scan_repos(dispatch=dispatch, repo_filter=repo_filter,
                          max_dispatch=max_dispatch)
     _format_report(results)
+
+
+def _format_capture_report(results):
+    """Pretty-print the verdict capture results."""
+    if not results:
+        print("No verdict markers found.")
+        return
+    total_verdicts = sum(r['verdicts_found'] for r in results)
+    total_rows = sum(r['rows_inserted'] for r in results)
+    print(f"Captured {total_verdicts} verdict(s) → {total_rows} reviewer_runs row(s):")
+    for r in results:
+        print(f"  {r['gh_repo']}#{r['pr']}: "
+              f"{r['verdicts_found']} verdict(s) → "
+              f"{r['rows_inserted']} row(s)")
+
+
+def _main_capture_verdicts(args):
+    """CLI handler for ``capture-verdicts`` subcommand."""
+    import sys
+
+    if '--help' in args or '-h' in args:
+        print("usage: tms review_poll capture-verdicts "
+              "[--backfill] [--since DATE] [--repo SHORT]")
+        print()
+        print("  Scan PR comments and reviews for <<REVIEW-VERDICT>> markers")
+        print("  and capture them into tms_review.reviewer_runs.")
+        print()
+        print("  --backfill   Scan merged PRs (instead of open)")
+        print("  --since DATE  Only PRs merged on/after DATE (ISO format)")
+        print("  --repo SHORT  Restrict scan to one registered repo")
+        sys.exit(0)
+
+    backfill = '--backfill' in args
+    repo_filter = None
+    since = None
+
+    i = 1
+    while i < len(args):
+        if args[i] == '--repo' and i + 1 < len(args):
+            repo_filter = args[i + 1]
+            i += 2
+        elif args[i] == '--since' and i + 1 < len(args):
+            since = args[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    results = capture_verdicts(repo_filter=repo_filter, backfill=backfill,
+                               since=since)
+    _format_capture_report(results)
+
+
+def main():
+    """Entry point for ``python3 -m tms.review_poll``.
+
+      scan-reviews [--dispatch] [--repo <short>] [--max-dispatch <n>]
+      capture-verdicts [--backfill] [--since DATE] [--repo SHORT]
+    """
+    import sys
+
+    args = sys.argv[1:]
+    if not args or args[0] in ('-h', '--help'):
+        print("usage: python3 -m tms.review_poll "
+              "<scan-reviews|capture-verdicts> [...]")
+        sys.exit(0)
+
+    subcmd = args[0]
+    if subcmd not in ('scan-reviews', 'capture-verdicts'):
+        print(f"unknown subcommand: {subcmd}", file=sys.stderr)
+        sys.exit(1)
+
+    if subcmd == 'scan-reviews':
+        _main_scan_reviews(args)
+    elif subcmd == 'capture-verdicts':
+        _main_capture_verdicts(args)
 
 
 if __name__ == '__main__':
