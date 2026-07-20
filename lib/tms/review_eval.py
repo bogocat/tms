@@ -862,7 +862,7 @@ def compute_review_stats():
         entry["total_p0"] += rr.get("p0", 0)
         entry["total_p1"] += rr.get("p1", 0)
         entry["total_p2"] += rr.get("p2", 0)
-        entry["total_wall_time_ms"] += rr.get("wall_time_ms", 0)
+        entry["total_wall_time_ms"] += rr.get("wall_time_ms") or 0
         if rr.get("findings"):
             findings = rr["findings"]
             if isinstance(findings, str):
@@ -940,7 +940,7 @@ def compute_review_stats():
             per_specialist[key]["total_p0"] += rr.get("p0", 0)
             per_specialist[key]["total_p1"] += rr.get("p1", 0)
             per_specialist[key]["total_p2"] += rr.get("p2", 0)
-            per_specialist[key]["total_wall_time_ms"] += rr.get("wall_time_ms", 0)
+            per_specialist[key]["total_wall_time_ms"] += rr.get("wall_time_ms") or 0
         else:
             for specialist in composition:
                 if specialist not in per_specialist:
@@ -953,7 +953,7 @@ def compute_review_stats():
                 per_specialist[specialist]["total_p0"] += rr.get("p0", 0)
                 per_specialist[specialist]["total_p1"] += rr.get("p1", 0)
                 per_specialist[specialist]["total_p2"] += rr.get("p2", 0)
-                per_specialist[specialist]["total_wall_time_ms"] += rr.get("wall_time_ms", 0)
+                per_specialist[specialist]["total_wall_time_ms"] += rr.get("wall_time_ms") or 0
 
     # --- Panel uniqueness ---
     panel_uniqueness = {}
