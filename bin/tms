@@ -631,22 +631,29 @@ fetch_repo_issues() {
     local short=$1 gh_repo=$2
     local tmp=/tmp/tms-issues-$$-$short
     local page_limit=100
-    local search_extra
+    local search_extra iter
 
     # ── Paginate gh issue list ──────────────────────────────────
-    # gh returns newest-first; we paginate backward via --search
-    # "created:<oldest_on_page>".  If >100 issues share the same
-    # createdAt second, the boundary could miss some — but that
-    # requires >100 issues created in the same second, which won't
-    # happen in practice.  See tms#51.
+    # Default sort is newest-first, but --search resets to relevance
+    # sort, so every --search must include sort:created-desc.
+    # Cursor: created:<oldest_on_page> (strictly older).  Boundary
+    # caveat: if >100 issues share the same createdAt second some
+    # could be missed — requires mass-creation, won't happen in
+    # practice.  See tms#51.
     > "$tmp.issues"
     search_extra=()
+    iter=0
     while true; do
+        (( iter++ )) || true
+        if (( iter > 50 )); then
+            echo "tms: pagination runaway on $gh_repo issues, stopping" >&2
+            break
+        fi
         local page
         page=$(gh issue list --repo "$gh_repo" --state open \
             --limit "$page_limit" \
             --json number,title,labels,url,createdAt,updatedAt \
-            "${search_extra[@]}" 2>/dev/null) || { echo '[]' > "$tmp.issues"; break; }
+            "${search_extra[@]}" 2>/dev/null) || break
 
         local count
         count=$(echo "$page" | jq '. | length' 2>/dev/null || echo 0)
@@ -659,7 +666,7 @@ fetch_repo_issues() {
         local oldest
         oldest=$(echo "$page" | jq -r '.[-1].createdAt' 2>/dev/null)
         [[ -z "$oldest" || "$oldest" == "null" ]] && break
-        search_extra=(--search "created:<$oldest")
+        search_extra=(--search "sort:created-desc created:<$oldest")
     done
 
     # Merge pages into a single JSON array
@@ -671,15 +678,21 @@ fetch_repo_issues() {
     fi
 
     # ── Paginate gh pr list ─────────────────────────────────────
-    # Same pattern as issues, but includes createdAt for the cursor
+    # Same pattern as issues; createdAt in --json is for the cursor
     > "$tmp.prs"
     search_extra=()
+    iter=0
     while true; do
+        (( iter++ )) || true
+        if (( iter > 50 )); then
+            echo "tms: pagination runaway on $gh_repo PRs, stopping" >&2
+            break
+        fi
         local pr_page
         pr_page=$(gh pr list --repo "$gh_repo" --state open \
             --limit "$page_limit" \
             --json number,title,body,headRefName,reviewDecision,url,createdAt \
-            "${search_extra[@]}" 2>/dev/null) || { echo '[]' > "$tmp.prs"; break; }
+            "${search_extra[@]}" 2>/dev/null) || break
 
         local pr_count
         pr_count=$(echo "$pr_page" | jq '. | length' 2>/dev/null || echo 0)
@@ -691,7 +704,7 @@ fetch_repo_issues() {
         local pr_oldest
         pr_oldest=$(echo "$pr_page" | jq -r '.[-1].createdAt' 2>/dev/null)
         [[ -z "$pr_oldest" || "$pr_oldest" == "null" ]] && break
-        search_extra=(--search "created:<$pr_oldest")
+        search_extra=(--search "sort:created-desc created:<$pr_oldest")
     done
 
     # Merge PR pages
