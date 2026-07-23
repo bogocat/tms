@@ -88,12 +88,13 @@ def _acquire_lock(lock_path=None):
     """Acquire an exclusive flock on the lock file. Returns fd or None."""
     p = lock_path or LOCK_PATH
     os.makedirs(os.path.dirname(p), exist_ok=True)
+    fd = None
     try:
         fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o644)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return fd
     except (BlockingIOError, OSError):
-        if 'fd' in dir():
+        if fd is not None:
             try:
                 os.close(fd)
             except OSError:
