@@ -1351,3 +1351,340 @@ def test_main_stats_by_blocked_class_flag(test_db, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "BLOCKED by class" in out
     assert "ambiguous-ac" in out
+
+
+# ── Per-class stats (issue #112) ──────────────────────────────────
+
+
+def _seed_class_fixtures(test_db):
+    """Insert fixtures covering all 4 AC scenarios for --by-class.
+
+    Classes:
+      tms:feature — 3 dispatches (1 merged-in-1-round, 1 merged-in-3-rounds,
+                   1 blocked)
+      tms:fix     — 1 dispatch (never reached terminal = never-dispatched)
+      distillery:feature — 1 dispatch (merged, no reviewer_runs)
+
+    encoded_cwd transform test: worktree /root/wt-tms-112 →
+    meta->>'encoded_cwd' = '--root-wt-tms-112--'
+    """
+    import json
+    conn = test_db()
+    cur = conn.cursor()
+
+    # ── Dispatch events ──────────────────────────────────────────
+    _insert_fixture_events(test_db, [
+        # tms:feature — merged in 1 round (aoe=aaa)
+        {"event_type": "dispatch", "timestamp": "2026-07-01T10:00:00+00:00",
+         "repo": "tms", "issue": 100, "agent": "pi",
+         "provider": "minimax", "model": "MiniMax-M3",
+         "dispatch_type": "feature", "worktree": "/root/wt-tms-100",
+         "session": "feat-tms#100", "aoe_id_prefix": "aaa"},
+        {"event_type": "transition", "timestamp": "2026-07-01T11:00:00+00:00",
+         "session": "feat-tms#100", "aoe_id_prefix": "aaa",
+         "from_status": "WORKING", "to_status": "MERGE-READY"},
+        # tms:feature — merged in 3 rounds (aoe=bbb)
+        {"event_type": "dispatch", "timestamp": "2026-07-02T10:00:00+00:00",
+         "repo": "tms", "issue": 101, "agent": "pi",
+         "provider": "deepseek", "model": "deepseek-v4-pro",
+         "dispatch_type": "feature", "worktree": "/root/wt-tms-101",
+         "session": "feat-tms#101", "aoe_id_prefix": "bbb"},
+        {"event_type": "transition", "timestamp": "2026-07-02T12:00:00+00:00",
+         "session": "feat-tms#101", "aoe_id_prefix": "bbb",
+         "from_status": "PR-REVIEW", "to_status": "WORKING"},
+        {"event_type": "transition", "timestamp": "2026-07-02T14:00:00+00:00",
+         "session": "feat-tms#101", "aoe_id_prefix": "bbb",
+         "from_status": "PR-REVIEW", "to_status": "WORKING"},
+        {"event_type": "transition", "timestamp": "2026-07-02T16:00:00+00:00",
+         "session": "feat-tms#101", "aoe_id_prefix": "bbb",
+         "from_status": "WORKING", "to_status": "MERGE-READY"},
+        # tms:feature — blocked (aoe=ccc)
+        {"event_type": "dispatch", "timestamp": "2026-07-03T10:00:00+00:00",
+         "repo": "tms", "issue": 102, "agent": "pi",
+         "provider": "minimax", "model": "MiniMax-M3",
+         "dispatch_type": "feature", "worktree": "/root/wt-tms-102",
+         "session": "feat-tms#102", "aoe_id_prefix": "ccc"},
+        {"event_type": "transition", "timestamp": "2026-07-03T11:00:00+00:00",
+         "session": "feat-tms#102", "aoe_id_prefix": "ccc",
+         "from_status": "WORKING", "to_status": "BLOCKED",
+         "reason": "AC is ambiguous", "blocked_class": "ambiguous-ac"},
+        # tms:fix — never reached terminal (aoe=ddd)
+        {"event_type": "dispatch", "timestamp": "2026-07-04T10:00:00+00:00",
+         "repo": "tms", "issue": 200, "agent": "pi",
+         "provider": "deepseek", "model": "deepseek-v4-pro",
+         "dispatch_type": "fix", "worktree": "/root/wt-tms-200",
+         "session": "fix-tms#200", "aoe_id_prefix": "ddd"},
+        # distillery:feature — merged (aoe=eee)
+        {"event_type": "dispatch", "timestamp": "2026-07-05T10:00:00+00:00",
+         "repo": "distillery", "issue": 300, "agent": "pi",
+         "provider": "minimax", "model": "MiniMax-M3",
+         "dispatch_type": "feature", "worktree": "/root/wt-distillery-300",
+         "session": "feat-distillery#300", "aoe_id_prefix": "eee"},
+        {"event_type": "transition", "timestamp": "2026-07-05T11:00:00+00:00",
+         "session": "feat-distillery#300", "aoe_id_prefix": "eee",
+         "from_status": "WORKING", "to_status": "MERGE-READY"},
+    ])
+
+    # ── dispatch_outcomes ────────────────────────────────────────
+    for row in [
+        ("aaa", "tms", 100, "merged", "gh_pr_list",
+         "2026-07-01T12:00:00+00:00", "2026-07-01T10:00:00+00:00"),
+        ("bbb", "tms", 101, "merged", "gh_pr_list",
+         "2026-07-03T10:00:00+00:00", "2026-07-02T10:00:00+00:00"),
+        ("ccc", "tms", 102, "open", "gh_pr_list",
+         "2026-07-03T12:00:00+00:00", "2026-07-03T10:00:00+00:00"),
+        ("ddd", "tms", 200, "open", "gh_pr_list",
+         "2026-07-04T12:00:00+00:00", "2026-07-04T10:00:00+00:00"),
+        ("eee", "distillery", 300, "merged", "gh_pr_list",
+         "2026-07-05T12:00:00+00:00", "2026-07-05T10:00:00+00:00"),
+    ]:
+        cur.execute(
+            "INSERT INTO dispatch_outcomes "
+            "(aoe_id_prefix, repo, issue, outcome, derived_via, "
+            " derived_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)", row)
+
+    # ── reviewer_runs ────────────────────────────────────────────
+    # tms: 1 PR with 1 round, 1 PR with 3 rounds, 1 PR with 2 rounds
+    # distillery: 1 PR with 1 round
+    for row in [
+        # issue 100 → PR 500, 1 round
+        ("r1", "2026-07-01T11:00:00+00:00", "tms", 500, 1,
+         "reviewer", "deepseek-v4-pro", "deepseek", "abc123",
+         0, 0, 0, None, "[]", None, None, "[]"),
+        # issue 101 → PR 501, 3 rounds (3 separate reviewer_runs rows)
+        ("r2a", "2026-07-02T12:30:00+00:00", "tms", 501, 1,
+         "reviewer", "deepseek-v4-pro", "deepseek", "def456",
+         2, 1, 0, None, "[]", None, None, "[]"),
+        ("r2b", "2026-07-02T14:30:00+00:00", "tms", 501, 2,
+         "reviewer-m3", "MiniMax-M3", "minimax", "def456",
+         1, 0, 0, None, "[]", None, None, "[]"),
+        ("r2c", "2026-07-02T16:30:00+00:00", "tms", 501, 3,
+         "reviewer", "deepseek-v4-pro", "deepseek", "def456",
+         0, 0, 0, None, "[]", None, None, "[]"),
+        # extra PR for tms (unrelated to issues 100-102,200)
+        ("r3", "2026-07-06T10:00:00+00:00", "tms", 600, 2,
+         "reviewer", "deepseek-v4-pro", "deepseek", "ghi789",
+         1, 1, 0, None, "[]", None, None, "[]"),
+        # distillery PR
+        ("r4", "2026-07-05T11:30:00+00:00", "distillery", 700, 1,
+         "reviewer", "deepseek-v4-pro", "deepseek", "jkl012",
+         0, 0, 0, None, "[]", None, None, "[]"),
+    ]:
+        cur.execute(
+            "INSERT INTO reviewer_runs "
+            "(run_id, created_at, repo, pr_number, review_round, "
+            " reviewer_agent, model, provider_used, diff_sha_reviewed, "
+            " p0, p1, p2, wall_time_ms, findings, "
+            " input_tokens, output_tokens, specialist_composition) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", row)
+
+    # ── llm_call_log (cost) ──────────────────────────────────────
+    # Matches the encoded_cwd pattern: --root-wt-<repo>-<issue>--
+    for row in [
+        # tms#100: total cost $1.50
+        (1, "etl-pi", None, "minimax", "MiniMax-M3", "subscription",
+         5000, 2000, 0, 0, 1.50, 8.00, 30000, 1, None,
+         '{"encoded_cwd":"--root-wt-tms-100--"}',
+         "2026-07-01T10:30:00+00:00"),
+        # tms#101: total cost $4.00
+        (2, "etl-pi", None, "deepseek", "deepseek-v4-pro", "api",
+         10000, 5000, 0, 0, 4.00, 4.00, 60000, 1, None,
+         '{"encoded_cwd":"--root-wt-tms-101--"}',
+         "2026-07-02T15:00:00+00:00"),
+        # tms#102 (blocked): total cost $0.75
+        (3, "etl-pi", None, "minimax", "MiniMax-M3", "subscription",
+         2000, 1000, 0, 0, 0.75, 4.00, 15000, 1, None,
+         '{"encoded_cwd":"--root-wt-tms-102--"}',
+         "2026-07-03T10:30:00+00:00"),
+        # distillery#300: total cost $2.00
+        (4, "etl-pi", None, "minimax", "MiniMax-M3", "subscription",
+         8000, 3000, 0, 0, 2.00, 10.00, 45000, 1, None,
+         '{"encoded_cwd":"--root-wt-distillery-300--"}',
+         "2026-07-05T10:30:00+00:00"),
+    ]:
+        cur.execute(
+            "INSERT INTO llm_call_log "
+            "(id, caller, caller_ref, provider, model, billing, "
+            " input_tokens, output_tokens, cache_read_tokens, "
+            " cache_write_tokens, cost_usd, cost_usd_api_equiv, "
+            " duration_ms, success, error, meta, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", row)
+
+    conn.commit()
+
+
+class TestComputeStatsByClass:
+    """Per-class stats: --by-class aggregates (issue #112)."""
+
+    def test_by_class_outputs_per_class_rows(self, test_db):
+        """Each (repo, dispatch_type) is a separate row."""
+        _seed_class_fixtures(test_db)
+        from tms.events import compute_stats_by_class
+
+        stats = compute_stats_by_class()
+
+        # Expected classes:
+        # tms:feature (3 dispatches), tms:fix (1), distillery:feature (1)
+        assert len(stats) == 3
+        classes = {(r["repo"], r["dispatch_type"]) for r in stats}
+        assert ("tms", "feature") in classes
+        assert ("tms", "fix") in classes
+        assert ("distillery", "feature") in classes
+
+    def test_merged_in_one_round(self, test_db):
+        """tms:feature has 2 merged out of 3 dispatches, median rounds=2."""
+        _seed_class_fixtures(test_db)
+        from tms.events import compute_stats_by_class
+
+        stats = compute_stats_by_class()
+        tms_feat = [r for r in stats
+                    if r["repo"] == "tms" and r["dispatch_type"] == "feature"][0]
+
+        assert tms_feat["dispatches"] == 3
+        assert tms_feat["merged"] == 2
+        assert tms_feat["blocked"] == 1
+        # pass_rate = merged / dispatches = 2/3
+        assert tms_feat["pass_rate"] == pytest.approx(2 / 3, abs=0.01)
+
+    def test_review_rounds_median(self, test_db):
+        """Median review rounds computed from reviewer_runs per repo."""
+        _seed_class_fixtures(test_db)
+        from tms.events import compute_stats_by_class
+
+        stats = compute_stats_by_class()
+        tms_feat = [r for r in stats
+                    if r["repo"] == "tms" and r["dispatch_type"] == "feature"][0]
+
+        # reviewer_runs for tms: PRs with rounds [1, 3, 2] → median = 2
+        assert tms_feat["repo_median_rounds"] == 2.0
+
+    def test_never_dispatched_class(self, test_db):
+        """tms:fix has 1 dispatch, 0 merged, 0 blocked, rounds from repo."""
+        _seed_class_fixtures(test_db)
+        from tms.events import compute_stats_by_class
+
+        stats = compute_stats_by_class()
+        tms_fix = [r for r in stats
+                   if r["repo"] == "tms" and r["dispatch_type"] == "fix"][0]
+
+        assert tms_fix["dispatches"] == 1
+        assert tms_fix["merged"] == 0
+        assert tms_fix["blocked"] == 0
+        # Rounds from reviewer_runs at repo level (not per-class)
+        assert tms_fix["repo_median_rounds"] == 2.0  # same repo-level median
+
+    def test_cost_join_via_encoded_cwd(self, test_db):
+        """Cost joined via encoded_cwd, NULL when no match."""
+        _seed_class_fixtures(test_db)
+        from tms.events import compute_stats_by_class
+
+        stats = compute_stats_by_class()
+
+        # tms:feature has 2 merged dispatches with costs: 1.50 + 4.00
+        tms_feat = [r for r in stats
+                    if r["repo"] == "tms" and r["dispatch_type"] == "feature"][0]
+        # median of [1.50, 4.00] = 2.75
+        assert tms_feat["median_cost"] == pytest.approx(2.75, abs=0.01)
+
+        # tms:fix has 0 merged → median_cost is None
+        tms_fix = [r for r in stats
+                   if r["repo"] == "tms" and r["dispatch_type"] == "fix"][0]
+        assert tms_fix["median_cost"] is None
+
+    def test_cost_null_when_no_encoded_cwd_match(self, test_db):
+        """When llm_call_log has no matching row, cost is NULL (never 0)."""
+        _seed_class_fixtures(test_db)
+        from tms.events import compute_stats_by_class
+
+        stats = compute_stats_by_class()
+        # distillery:feature has 1 merged dispatch, cost = 2.00
+        dist_feat = [r for r in stats
+                     if r["repo"] == "distillery"
+                     and r["dispatch_type"] == "feature"][0]
+        assert dist_feat["median_cost"] == 2.00
+
+    def test_blocked_class_distribution(self, test_db):
+        """Blocked-class distribution per class."""
+        _seed_class_fixtures(test_db)
+        from tms.events import compute_stats_by_class
+
+        stats = compute_stats_by_class()
+        tms_feat = [r for r in stats
+                    if r["repo"] == "tms" and r["dispatch_type"] == "feature"][0]
+
+        blocked_dist = tms_feat["blocked_class_distribution"]
+        assert blocked_dist.get("ambiguous-ac") == 1
+        assert blocked_dist.get("mechanical", 0) == 0
+
+    def test_format_by_class_json(self, test_db, capsys):
+        """--by-class --json outputs valid JSON array."""
+        _seed_class_fixtures(test_db)
+        from tms.events import compute_stats_by_class, format_stats_by_class
+
+        stats = compute_stats_by_class()
+        format_stats_by_class(stats, as_json=True)
+        out = capsys.readouterr().out
+        parsed = json.loads(out)
+        assert isinstance(parsed, list)
+        assert len(parsed) == 3
+        # Each row has expected keys
+        for row in parsed:
+            assert "class" in row
+            assert "dispatches" in row
+            assert "merged" in row
+            assert "pass_rate" in row
+            assert "repo_median_rounds" in row
+            assert "blocked_class_distribution" in row
+            assert "median_cost" in row
+
+    def test_format_by_class_text(self, test_db, capsys):
+        """--by-class text mode prints readable table."""
+        _seed_class_fixtures(test_db)
+        from tms.events import compute_stats_by_class, format_stats_by_class
+
+        stats = compute_stats_by_class()
+        format_stats_by_class(stats, as_json=False)
+        out = capsys.readouterr().out
+        assert "Per-class breakdown" in out
+        assert "tms:feature" in out
+        assert "tms:fix" in out
+        assert "distillery:feature" in out
+
+    def test_main_stats_by_class_flag(self, test_db, monkeypatch, capsys):
+        """`tms events stats --by-class` works end-to-end."""
+        import sys
+        from tms import events
+
+        _seed_class_fixtures(test_db)
+        monkeypatch.setattr(
+            sys, "argv", ["tms.events", "stats", "--by-class"])
+        events.main()
+        out = capsys.readouterr().out
+        assert "Per-class breakdown" in out
+
+    def test_main_stats_by_class_json(self, test_db, monkeypatch, capsys):
+        """`tms events stats --by-class --json` outputs valid JSON."""
+        import sys
+        from tms import events
+
+        _seed_class_fixtures(test_db)
+        monkeypatch.setattr(
+            sys, "argv", ["tms.events", "stats", "--by-class", "--json"])
+        events.main()
+        out = capsys.readouterr().out
+        parsed = json.loads(out)
+        assert isinstance(parsed, list)
+
+    def test_encoded_cwd_transform(self, test_db):
+        """Worktree /root/wt-tms-112 → encoded_cwd --root-wt-tms-112--."""
+        from tms.events import _worktree_to_encoded_cwd
+
+        assert _worktree_to_encoded_cwd("/root/wt-tms-112") \
+            == "--root-wt-tms-112--"
+        assert _worktree_to_encoded_cwd("/root/wt-distillery-300") \
+            == "--root-wt-distillery-300--"
+        # Edge cases
+        assert _worktree_to_encoded_cwd("/not/a/worktree") is None
+        assert _worktree_to_encoded_cwd("") is None
+        assert _worktree_to_encoded_cwd(None) is None

@@ -80,6 +80,8 @@ tms events transitions    poll aoe + tmux panes, emit state-transition events
 tms events stats           compute and print aggregate metrics report
 tms events stats --json    machine-readable JSON output
 tms events stats --since YYYY-MM-DD   filter from date
+tms events stats --by-class          per-class (repo:dispatch_type) with rounds & cost (#112)
+tms events stats --by-class --json   machine-readable per-class JSON (#112)
 tms events scan-reviews    list open PRs lacking reviewer verdicts (#57)
 tms events scan-reviews --dispatch    spawn tmq review for never-reviewed PRs
 ```
@@ -93,6 +95,8 @@ markers change. `tms events stats` reads the event log and computes:
 - BLOCKED frequency vs clean MERGE-READY
 - Plan-gate fast-path rate
 - Per-model outcome rates
+- Per-class breakdown (`--by-class`): dispatches, pass-rate, median rounds,
+  blocked-class distribution, median cost per merged PR (tms#112)
 
 See [docs/events-format.md](docs/events-format.md) for the event log schema
 and consumer guide.

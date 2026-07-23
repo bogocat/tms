@@ -1551,6 +1551,7 @@ Usage:
 Stats options:
   --since YYYY-MM-DD         filter events from this date onward
   --json                     output as JSON (machine-readable)
+  --by-class                 per-class breakdown (repo:dispatch_type) with rounds & cost (#112)
   --by-label                 per-label breakdown (merge/block rates, latency)
   --by-area                  per-area breakdown (from area:* labels)
   --by-point                 per-point-estimate breakdown (from point:N labels)

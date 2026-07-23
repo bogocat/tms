@@ -192,14 +192,64 @@ transition at the exact same second.
 {"event_type":"transition","timestamp":"2026-07-10T18:00:00.000000+00:00","session":"","aoe_id_prefix":"abc12345","from_status":"MERGE-READY","to_status":"terminal"}
 ```
 
+## Class taxonomy (`--by-class`, tms#112)
+
+Per-class stats aggregate dispatch events by `repo:dispatch_type` so
+sprint-planning tools (pi-dotfiles#54) can assess fleet reliability
+without composing SQL. The class key is `<repo>:<dispatch_type>` —
+a short repo name and the dispatch type (`feature`, `fix`, `chore`,
+`review`).
+
+### Per-class fields
+
+| Field | Source | Notes |
+|-------|--------|-------|
+| `dispatches` | `tms_review.events` (event_type=dispatch) | Counted per (repo, dispatch_type) |
+| `merged` | `tms_review.dispatch_outcomes` | Joined via aoe_id_prefix |
+| `blocked` | `tms_review.events` (transition, to_status=BLOCKED) | Per issue within class |
+| `pass_rate` | computed | merged / dispatches |
+| `repo_median_rounds` | `tms_review.reviewer_runs` | Per-repo median (issue→PR mapping not directly available; rounds are at repo granularity, not per-class) |
+| `blocked_class_distribution` | `tms_review.events.blocked_class` | Taxonomy breakdown per class |
+| `median_cost` | `bogocat.llm_call_log` via `meta->>'encoded_cwd'` | Per merged issue; NULL when worktree cannot be resolved or no cost data exists |
+
+### Limitations
+
+- **Review rounds are per-repo, not per-class.** The mapping from
+  `events.issue` (GitHub issue number) to `reviewer_runs.pr_number`
+  (GitHub PR number) is not directly available — GitHub assigns
+  distinct numbers to issues and PRs, even when a PR closes the issue.
+  The `dispatch_outcomes` table carries `aoe_id_prefix` and `issue`
+  but no `pr_number`. Rounds are computed from all `reviewer_runs`
+  rows in the repo and applied to every class within that repo.
+- **Cost is best-effort.** The worktree path (`/root/wt-<repo>-<issue>`)
+  is transformed to the `encoded_cwd` pattern
+  (`--root-wt-<repo>-<issue>--`) and matched against
+  `bogocat.llm_call_log.meta->>'encoded_cwd'`. If the worktree path
+  is non-standard or the ETL pipeline hasn't loaded the cost rows yet,
+  `median_cost` is `null` — never fabricated as zero.
+
+### Example output
+
+```
+=== Per-class breakdown (repo:dispatch_type) ===
+
+  Class                         Disp  Merged   Pass%  RepoRnd  Blocked       Cost
+  ──────────────────────────── ───── ─────── ─────── ──────── ──────── ──────────
+  distillery:feature               5       4     80%      2.0        1     $3.45
+  distillery:fix                   2       1     50%      2.0        1    $12.00
+  tms:feature                      8       6     75%      2.0        0     $1.80
+```
+
 ## Consumers
 
 | Consumer | How |
 |----------|-----|
 | `tms events stats` | Queries `tms_review.events` via `_read_events_from_db()`, computes aggregate metrics |
 | `tms events stats --json` | Outputs JSON for piping to downstream tools |
+| `tms events stats --by-class` | Per-class breakdown with rounds and cost (tms#112) |
 | tms#56 (staleness watchdog) | Queries transition events via postgres |
 | tower-fleet#193 (open questions) | Q2/Q7/Q10/Q11 all need this data as baseline |
+| pi-dotfiles#54 (sprint-planning) | Consumes `--by-class --json` output |
 | `scripts/backfill-events.py` | One-shot migration from legacy JSONL |
 
 ## Versioning

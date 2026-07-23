@@ -12,6 +12,28 @@ import pytest
 
 # -- events table schema (sqlite3-compatible) --
 
+_CREATE_REVIEWER_RUNS_TABLE = """
+CREATE TABLE IF NOT EXISTS reviewer_runs (
+    run_id               TEXT PRIMARY KEY,
+    created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    repo                 TEXT NOT NULL,
+    pr_number            INTEGER NOT NULL,
+    review_round         INTEGER NOT NULL,
+    reviewer_agent       TEXT NOT NULL,
+    model                TEXT NOT NULL,
+    provider_used        TEXT NOT NULL,
+    diff_sha_reviewed    TEXT NOT NULL,
+    p0                   INTEGER NOT NULL DEFAULT 0,
+    p1                   INTEGER NOT NULL DEFAULT 0,
+    p2                   INTEGER NOT NULL DEFAULT 0,
+    wall_time_ms         INTEGER,
+    findings             TEXT,
+    input_tokens         INTEGER,
+    output_tokens        INTEGER,
+    specialist_composition TEXT NOT NULL DEFAULT '[]'
+);
+"""
+
 _CREATE_EVENTS_TABLE = """
 CREATE TABLE IF NOT EXISTS events (
     id              TEXT PRIMARY KEY,
@@ -38,6 +60,62 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_unique
     ON events (event_type, aoe_id_prefix, event_timestamp);
+"""
+
+_CREATE_OUTCOMES_TABLE = """
+CREATE TABLE IF NOT EXISTS dispatch_outcomes (
+    aoe_id_prefix   TEXT PRIMARY KEY,
+    repo            TEXT NOT NULL,
+    issue           INTEGER NOT NULL,
+    outcome         TEXT NOT NULL,
+    derived_via     TEXT,
+    derived_at      TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+"""
+
+_CREATE_LLM_CALL_LOG_TABLE = """
+CREATE TABLE IF NOT EXISTS llm_call_log (
+    id              INTEGER PRIMARY KEY,
+    caller          TEXT NOT NULL,
+    caller_ref      TEXT,
+    provider        TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    billing         TEXT NOT NULL,
+    input_tokens    INTEGER,
+    output_tokens   INTEGER,
+    cache_read_tokens  INTEGER,
+    cache_write_tokens INTEGER,
+    cost_usd        REAL DEFAULT 0,
+    cost_usd_api_equiv REAL,
+    duration_ms     INTEGER,
+    success         INTEGER DEFAULT 1,
+    error           TEXT,
+    meta            TEXT NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL
+);
+"""
+
+_CREATE_REVIEWER_RUNS_TABLE = """
+CREATE TABLE IF NOT EXISTS reviewer_runs (
+    run_id              TEXT PRIMARY KEY,
+    created_at          TEXT NOT NULL,
+    repo                TEXT NOT NULL,
+    pr_number           INTEGER NOT NULL,
+    review_round        INTEGER NOT NULL,
+    reviewer_agent      TEXT NOT NULL,
+    model               TEXT NOT NULL,
+    provider_used       TEXT NOT NULL,
+    diff_sha_reviewed   TEXT NOT NULL,
+    p0                  INTEGER NOT NULL DEFAULT 0,
+    p1                  INTEGER NOT NULL DEFAULT 0,
+    p2                  INTEGER NOT NULL DEFAULT 0,
+    wall_time_ms        INTEGER,
+    findings            TEXT,
+    input_tokens        INTEGER,
+    output_tokens       INTEGER,
+    specialist_composition TEXT NOT NULL DEFAULT '[]'
+);
 """
 
 
@@ -67,10 +145,12 @@ def test_db(monkeypatch):
         _orig_dm = None
 
     _conn = sqlite3.connect(":memory:")
-    for stmt in _CREATE_EVENTS_TABLE.split(";"):
-        stmt = stmt.strip()
-        if stmt:
-            _conn.execute(stmt)
+    for schema_sql in [_CREATE_EVENTS_TABLE, _CREATE_OUTCOMES_TABLE,
+                       _CREATE_REVIEWER_RUNS_TABLE, _CREATE_LLM_CALL_LOG_TABLE]:
+        for stmt in schema_sql.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                _conn.execute(stmt)
     _conn.commit()
 
     class _SharedCursor:
@@ -80,6 +160,7 @@ def test_db(monkeypatch):
         def execute(self, sql, params=None):
             import re
             sql = sql.replace("tms_review.", "")
+            sql = sql.replace("bogocat.", "")
             # psycopg2 pyformat (%(name)s) → sqlite3 named (:name)
             sql = re.sub(r'%\(([^)]+)\)s', r':\1', sql)
             # psycopg2 format (%s) → sqlite3 positional (?)
@@ -123,11 +204,41 @@ def test_db(monkeypatch):
     def _make_conn():
         return _SharedConnection()
 
+    # Create reviewer_runs table for verdict-capture tests.
+    for stmt in _CREATE_REVIEWER_RUNS_TABLE.split(";"):
+        stmt = stmt.strip()
+        if stmt:
+            _conn.execute(stmt)
+    _conn.commit()
+
     monkeypatch.setattr(events_mod, "_get_conn", _make_conn)
     if dm_mod is not None:
         monkeypatch.setattr(dm_mod, "_get_conn", _make_conn)
+
+    # Also patch review_eval._get_conn (used by verdict capture via
+    # log_reviewer_run) and review_poll._get_conn (used for dedup queries).
+    try:
+        from tms import review_eval as re_mod
+        _orig_re = re_mod._get_conn
+        monkeypatch.setattr(re_mod, "_get_conn", _make_conn)
+    except ImportError:
+        _orig_re = None
+        re_mod = None
+    try:
+        from tms import review_poll as rp_mod
+        _orig_rp = rp_mod._get_conn
+        monkeypatch.setattr(rp_mod, "_get_conn", _make_conn)
+    except ImportError:
+        _orig_rp = None
+        rp_mod = None
+
     yield _make_conn
+
     monkeypatch.setattr(events_mod, "_get_conn", _orig_events)
     if dm_mod is not None:
         monkeypatch.setattr(dm_mod, "_get_conn", _orig_dm)
+    if re_mod is not None:
+        monkeypatch.setattr(re_mod, "_get_conn", _orig_re)
+    if rp_mod is not None:
+        monkeypatch.setattr(rp_mod, "_get_conn", _orig_rp)
     _conn.close()

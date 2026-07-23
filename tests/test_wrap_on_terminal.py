@@ -598,6 +598,52 @@ llm_calls: 42
         assert errors == []
 
 
+class TestAcquireLock:
+    """_acquire_lock: fd cleanup on os.open / flock failure paths."""
+
+    def test_acquire_lock_cleans_fd_on_flock_failure(self, monkeypatch, tmp_path):
+        """When os.open succeeds but flock raises, fd is closed before returning None."""
+        from tms.wrap_on_terminal import _acquire_lock
+
+        real_open = os.open
+        real_close = os.close
+        opened_fds = []
+        closed_fds = []
+
+        def fake_open(path, flags, mode=0o777):
+            fd = real_open(path, flags, mode)
+            opened_fds.append(fd)
+            return fd
+
+        def fake_close(fd):
+            closed_fds.append(fd)
+            real_close(fd)
+
+        # Patch flock to always raise BlockingIOError
+        monkeypatch.setattr("fcntl.flock", lambda fd, op: (_ for _ in ()).throw(BlockingIOError))
+        monkeypatch.setattr(os, "open", fake_open)
+        monkeypatch.setattr(os, "close", fake_close)
+
+        result = _acquire_lock(lock_path=str(tmp_path / "test.lock"))
+
+        assert result is None
+        # The fd that was opened must have been closed
+        assert len(opened_fds) == 1
+        assert opened_fds[0] in closed_fds
+
+    def test_acquire_lock_returns_none_on_os_open_failure(self, monkeypatch, tmp_path):
+        """When os.open itself raises OSError, _acquire_lock returns None cleanly."""
+        from tms.wrap_on_terminal import _acquire_lock
+
+        def fake_open(path, flags, mode=0o777):
+            raise OSError("Permission denied")
+
+        monkeypatch.setattr(os, "open", fake_open)
+
+        result = _acquire_lock(lock_path=str(tmp_path / "nonexistent" / "test.lock"))
+        assert result is None
+
+
 class TestFetchGhPrsInvocation:
     """Regression: gh search prs rejects an embedded repo: qualifier.
 

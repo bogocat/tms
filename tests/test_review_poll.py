@@ -726,3 +726,388 @@ class TestSpecialistRouting:
         results = review_poll.scan_repos(dispatch=False)
         assert results[0]["status"] == "would_dispatch"
         assert results[0]["specialists"] == []
+
+
+# ── Panel entry parsing (tms#96) ─────────────────────────────────
+
+class TestParsePanelEntries:
+    def test_agent_model_in_parens(self):
+        """panel=reviewer(deepseek-v4-pro),reviewer-m3(MiniMax-M3)"""
+        entries = review_poll._parse_panel_entries(
+            "reviewer(deepseek-v4-pro),reviewer-m3(MiniMax-M3)"
+        )
+        assert entries == [
+            ("reviewer", "deepseek-v4-pro"),
+            ("reviewer-m3", "MiniMax-M3"),
+        ]
+
+    def test_bare_model_names(self):
+        """panel=deepseek-v4-pro,minimax-m3"""
+        entries = review_poll._parse_panel_entries(
+            "deepseek-v4-pro,minimax-m3"
+        )
+        assert entries == [
+            ("deepseek-v4-pro", "deepseek-v4-pro"),
+            ("minimax-m3", "minimax-m3"),
+        ]
+
+    def test_mixed_formats(self):
+        """panel=reviewer(deepseek-v4-pro),minimax-m3"""
+        entries = review_poll._parse_panel_entries(
+            "reviewer(deepseek-v4-pro),minimax-m3"
+        )
+        assert entries == [
+            ("reviewer", "deepseek-v4-pro"),
+            ("minimax-m3", "minimax-m3"),
+        ]
+
+    def test_model_with_max_sub_suffix(self):
+        """panel=claude-sonnet(max-sub)"""
+        entries = review_poll._parse_panel_entries(
+            "claude-sonnet(max-sub)"
+        )
+        assert entries == [
+            ("claude-sonnet", "claude-sonnet"),
+        ]
+
+    def test_agent_model_with_max_sub(self):
+        """panel=reviewer-fast(claude-sonnet(max-sub))"""
+        entries = review_poll._parse_panel_entries(
+            "reviewer-fast(claude-sonnet(max-sub))"
+        )
+        assert entries == [
+            ("reviewer-fast", "claude-sonnet"),
+        ]
+
+    def test_single_entry(self):
+        """panel=MiniMax-M3"""
+        entries = review_poll._parse_panel_entries("MiniMax-M3")
+        assert entries == [("MiniMax-M3", "MiniMax-M3")]
+
+    def test_empty_panel(self):
+        assert review_poll._parse_panel_entries("") == []
+        assert review_poll._parse_panel_entries(None) == []
+
+    def test_whitespace_insensitive(self):
+        entries = review_poll._parse_panel_entries(
+            " reviewer(deepseek-v4-pro) , minimax-m3 "
+        )
+        assert entries == [
+            ("reviewer", "deepseek-v4-pro"),
+            ("minimax-m3", "minimax-m3"),
+        ]
+
+
+# ── Provider inference (tms#96) ───────────────────────────────────
+
+class TestModelToProvider:
+    def test_deepseek_model(self):
+        assert review_poll._model_to_provider("deepseek-v4-pro") == "deepseek"
+        assert review_poll._model_to_provider("deepseek-v4") == "deepseek"
+
+    def test_minimax_model(self):
+        assert review_poll._model_to_provider("MiniMax-M3") == "minimax"
+        assert review_poll._model_to_provider("minimax-m3") == "minimax"
+
+    def test_anthropic_model(self):
+        assert review_poll._model_to_provider("claude-sonnet") == "anthropic"
+        assert review_poll._model_to_provider("claude-sonnet-4.6") == "anthropic"
+
+    def test_unknown_fallback(self):
+        assert review_poll._model_to_provider("unknown-model") == "unknown"
+        assert review_poll._model_to_provider("") == "unknown"
+
+
+# ── Verdict-to-rows conversion (tms#96) ──────────────────────────
+
+class TestVerdictToRows:
+    def test_pass_with_panel_agent_model_format(self):
+        verdict = {
+            "state": "PASS",
+            "sha": "16e3ead7bb5b2303157e01817f2816004d5ae11a",
+            "p0": 0, "p1": 0, "p2": 0,
+            "rounds": 2,
+            "panel": "reviewer(deepseek-v4-pro),reviewer-m3(MiniMax-M3)",
+        }
+        rows = review_poll._verdict_to_rows("tms", 57, verdict)
+        assert len(rows) == 2
+        assert rows[0]["reviewer_agent"] == "reviewer"
+        assert rows[0]["model"] == "deepseek-v4-pro"
+        assert rows[0]["provider_used"] == "deepseek"
+        assert rows[0]["diff_sha_reviewed"] == \
+            "16e3ead7bb5b2303157e01817f2816004d5ae11a"
+        assert rows[0]["review_round"] == 2
+        assert rows[1]["reviewer_agent"] == "reviewer-m3"
+        assert rows[1]["model"] == "MiniMax-M3"
+        assert rows[1]["provider_used"] == "minimax"
+
+    def test_fail_with_p_counts(self):
+        verdict = {
+            "state": "FAIL",
+            "sha": "043b8958dab4ce34eb406dd3414b37d179e36d54",
+            "p0": 2, "p1": 4, "p2": 0,
+            "rounds": 1,
+            "panel": "deepseek-v4-pro",
+        }
+        rows = review_poll._verdict_to_rows("tms", 64, verdict)
+        assert len(rows) == 1
+        assert rows[0]["p0"] == 2
+        assert rows[0]["p1"] == 4
+        assert rows[0]["p2"] == 0
+
+    def test_no_panel_returns_empty(self):
+        verdict = {
+            "state": "PASS",
+            "sha": "3e4a68cf",
+            "p0": 0, "p1": 1, "p2": 0,
+            "rounds": 1,
+            "panel": "",
+        }
+        rows = review_poll._verdict_to_rows("oa", 53, verdict)
+        assert rows == []
+
+    def test_missing_rounds_defaults_zero(self):
+        verdict = {
+            "state": "PASS",
+            "sha": "abc123",
+            "p0": 0, "p1": 0, "p2": 0,
+            "rounds": 0,
+            "panel": "deepseek-v4-pro",
+        }
+        rows = review_poll._verdict_to_rows("tms", 1, verdict)
+        assert len(rows) == 1
+        assert rows[0]["review_round"] == 0
+
+    def test_all_rows_share_same_repo_pr_sha(self):
+        verdict = {
+            "state": "PASS",
+            "sha": "deadbeef",
+            "p0": 0, "p1": 0, "p2": 0,
+            "rounds": 1,
+            "panel": "a,b,c",
+        }
+        rows = review_poll._verdict_to_rows("tmq", 10, verdict)
+        assert len(rows) == 3
+        for r in rows:
+            assert r["repo"] == "tmq"
+            assert r["pr_number"] == 10
+            assert r["diff_sha_reviewed"] == "deadbeef"
+
+
+# ── Dual-surface verdict scan (comments + reviews) ───────────────
+
+class TestFetchPrReviews:
+    def test_returns_review_bodies(self, monkeypatch):
+        def fake_gh_json(args, timeout=15):
+            return [
+                {"body": "LGTM\n<<REVIEW-VERDICT: PASS sha=abc rounds=1 panel=x>>",
+                 "state": "COMMENTED"},
+            ]
+        monkeypatch.setattr(review_poll, "_gh_json", fake_gh_json)
+        bodies = review_poll._fetch_pr_reviews("bogocat/tms", 88)
+        assert len(bodies) == 1
+        assert "REVIEW-VERDICT" in bodies[0]
+
+    def test_empty_reviews(self, monkeypatch):
+        monkeypatch.setattr(review_poll, "_gh_json", lambda *a, **k: [])
+        bodies = review_poll._fetch_pr_reviews("bogocat/tms", 88)
+        assert bodies == []
+
+    def test_gh_error_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(review_poll, "_gh_json", lambda *a, **k: None)
+        bodies = review_poll._fetch_pr_reviews("bogocat/tms", 88)
+        assert bodies == []
+
+
+# ── Verdict capture + dedup (tms#96) ─────────────────────────────
+
+class TestCaptureVerdict:
+    HEAD = "16e3ead7bb5b2303157e01817f2816004d5ae11a"
+
+    def test_inserts_rows_for_panel(self, monkeypatch, test_db):
+        verdict = {
+            "state": "PASS",
+            "sha": self.HEAD,
+            "p0": 0, "p1": 0, "p2": 0,
+            "rounds": 2,
+            "panel": "reviewer(deepseek-v4-pro),reviewer-m3(MiniMax-M3)",
+        }
+        inserted = review_poll._capture_verdict("tms", 57, verdict)
+        assert inserted == 2
+        conn = test_db()
+        rows = conn.cursor().execute(
+            "SELECT reviewer_agent, model, provider_used, diff_sha_reviewed "
+            "FROM reviewer_runs"
+        ).fetchall()
+        assert len(rows) == 2
+        agents = {r[0] for r in rows}
+        assert agents == {"reviewer", "reviewer-m3"}
+
+    def test_dedup_same_sha_same_reviewer(self, monkeypatch, test_db):
+        verdict = {
+            "state": "PASS",
+            "sha": self.HEAD,
+            "p0": 0, "p1": 0, "p2": 0,
+            "rounds": 1,
+            "panel": "deepseek-v4-pro",
+        }
+        first = review_poll._capture_verdict("tms", 57, verdict)
+        assert first == 1
+        second = review_poll._capture_verdict("tms", 57, verdict)
+        assert second == 0  # dedup: no new rows
+        conn = test_db()
+        count = conn.cursor().execute(
+            "SELECT count(*) FROM reviewer_runs"
+        ).fetchone()[0]
+        assert count == 1
+
+    def test_different_sha_inserts_new_rows(self, monkeypatch, test_db):
+        v1 = {
+            "state": "PASS", "sha": "aaa",
+            "p0": 0, "p1": 0, "p2": 0,
+            "rounds": 1, "panel": "deepseek-v4-pro",
+        }
+        v2 = {
+            "state": "PASS", "sha": "bbb",
+            "p0": 0, "p1": 0, "p2": 0,
+            "rounds": 2, "panel": "deepseek-v4-pro",
+        }
+        assert review_poll._capture_verdict("tms", 57, v1) == 1
+        assert review_poll._capture_verdict("tms", 57, v2) == 1
+        conn = test_db()
+        count = conn.cursor().execute(
+            "SELECT count(*) FROM reviewer_runs"
+        ).fetchone()[0]
+        assert count == 2
+
+    def test_verdict_without_panel_inserts_nothing(self, monkeypatch, test_db):
+        verdict = {
+            "state": "PASS", "sha": "abc",
+            "p0": 0, "p1": 0, "p2": 0,
+            "rounds": 1, "panel": "",
+        }
+        assert review_poll._capture_verdict("oa", 53, verdict) == 0
+        conn = test_db()
+        count = conn.cursor().execute(
+            "SELECT count(*) FROM reviewer_runs"
+        ).fetchone()[0]
+        assert count == 0
+
+    def test_multiple_verdicts_same_pr_different_rounds(self, monkeypatch, test_db):
+        # Simulates tms#87 style: multiple verdicts on the same PR
+        # (different rounds with different shas).
+        v1 = {
+            "state": "FAIL", "sha": "sha_round1",
+            "p0": 0, "p1": 8, "p2": 0,
+            "rounds": 1, "panel": "deepseek-v4-pro,minimax-m3",
+        }
+        v2 = {
+            "state": "PASS", "sha": "sha_round2",
+            "p0": 0, "p1": 0, "p2": 0,
+            "rounds": 4, "panel": "reviewer(deepseek-v4-pro),reviewer-m3(MiniMax-M3),reviewer-fast(claude-sonnet)",
+        }
+        assert review_poll._capture_verdict("tms", 87, v1) == 2
+        assert review_poll._capture_verdict("tms", 87, v2) == 3
+        conn = test_db()
+        count = conn.cursor().execute(
+            "SELECT count(*) FROM reviewer_runs"
+        ).fetchone()[0]
+        assert count == 5
+
+    def test_specialist_composition_defaults_empty(self, monkeypatch, test_db):
+        verdict = {
+            "state": "PASS", "sha": self.HEAD,
+            "p0": 0, "p1": 0, "p2": 0,
+            "rounds": 1, "panel": "deepseek-v4-pro",
+        }
+        review_poll._capture_verdict("tms", 57, verdict)
+        conn = test_db()
+        sc = conn.cursor().execute(
+            "SELECT specialist_composition FROM reviewer_runs"
+        ).fetchone()[0]
+        assert sc == "[]"
+
+
+# ── Backfill scan (tms#96) ───────────────────────────────────────
+
+class TestScanPrsForVerdicts:
+    def test_scan_state_merged(self, monkeypatch):
+        captured_args = []
+        def fake_gh_json(args, timeout=15):
+            captured_args.append(args)
+            return []
+        monkeypatch.setattr(review_poll, "_gh_json", fake_gh_json)
+        monkeypatch.setattr(review_poll, "_fetch_pr_reviews",
+                            lambda gh, num: [])
+        list(review_poll._scan_prs_for_verdicts("bogocat/tms", state="merged"))
+        assert any("--state" in a and "merged" in a
+                   for a in captured_args)
+
+    def test_since_filter(self, monkeypatch):
+        captured_args = []
+        def fake_gh_json(args, timeout=15):
+            captured_args.append(list(args))
+            return []
+        monkeypatch.setattr(review_poll, "_gh_json", fake_gh_json)
+        monkeypatch.setattr(review_poll, "_fetch_pr_reviews",
+                            lambda gh, num: [])
+        list(review_poll._scan_prs_for_verdicts(
+            "bogocat/tms", state="merged", since="2026-07-19"))
+        flat = " ".join(str(a) for args in captured_args for a in args)
+        assert "merged:>=2026-07-19" in flat
+
+    def test_yields_prs_with_verdict_in_comments(self, monkeypatch):
+        gh_calls = []
+        def fake_gh(args, timeout=15):
+            gh_calls.append(args)
+            if "list" in args:
+                return [{"number": 85, "headRefOid": "sha85",
+                         "mergedAt": "2026-07-19T19:24:45Z"}]
+            if "view" in args:
+                return {"comments": [{"body": "<<REVIEW-VERDICT: PASS sha=abc rounds=1 panel=x>>"}]}
+            return None
+        monkeypatch.setattr(review_poll, "_gh_json", fake_gh)
+        monkeypatch.setattr(review_poll, "_fetch_pr_reviews",
+                            lambda gh, num: [])
+        prs = list(review_poll._scan_prs_for_verdicts(
+            "bogocat/tms", state="merged"))
+        assert len(prs) == 1
+        assert prs[0]["number"] == 85
+
+    def test_yields_prs_with_verdict_in_reviews(self, monkeypatch):
+        # tms#88 style: verdict in a PR review, not issue comment.
+        gh_calls = []
+        def fake_gh(args, timeout=15):
+            gh_calls.append(args)
+            if "list" in args:
+                return [{"number": 88, "headRefOid": "sha88",
+                         "mergedAt": "2026-07-19T19:24:25Z"}]
+            if "view" in args:
+                return {"comments": []}
+            return None
+        monkeypatch.setattr(review_poll, "_gh_json", fake_gh)
+        monkeypatch.setattr(review_poll, "_fetch_pr_reviews",
+            lambda gh, num: [
+                "<<REVIEW-VERDICT: PASS sha=abc rounds=2 panel=MiniMax-M3>>"
+            ])
+        prs = list(review_poll._scan_prs_for_verdicts(
+            "bogocat/tms", state="merged"))
+        assert len(prs) == 1
+        assert prs[0]["number"] == 88
+
+    def test_skips_prs_without_verdict(self, monkeypatch):
+        gh_calls = []
+        def fake_gh(args, timeout=15):
+            gh_calls.append(args)
+            if "list" in args:
+                return [{"number": 88, "headRefOid": "sha88",
+                         "mergedAt": "2026-07-19T19:24:25Z"}]
+            if "view" in args:
+                return {"comments": []}
+            return None
+        monkeypatch.setattr(review_poll, "_gh_json", fake_gh)
+        monkeypatch.setattr(review_poll, "_fetch_pr_reviews",
+                            lambda gh, num: [])
+        prs = list(review_poll._scan_prs_for_verdicts(
+            "bogocat/tms", state="merged"))
+        assert len(prs) == 0
