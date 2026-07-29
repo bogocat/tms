@@ -1688,3 +1688,87 @@ class TestComputeStatsByClass:
         assert _worktree_to_encoded_cwd("/not/a/worktree") is None
         assert _worktree_to_encoded_cwd("") is None
         assert _worktree_to_encoded_cwd(None) is None
+
+
+# ── Reviewer outcome rates (tms#71) ───────────────────────────────
+
+def _seed_reviewer_run(conn, agent, model, verdict, p0=0, p1=0,
+                       created_at="2026-07-29T00:00:00+00:00"):
+    import uuid as _uuid
+    conn.cursor().execute(
+        "INSERT INTO reviewer_runs (run_id, created_at, repo, pr_number, "
+        "review_round, reviewer_agent, model, provider_used, "
+        "diff_sha_reviewed, p0, p1, p2, verdict) "
+        "VALUES (?, ?, 'tms', 71, 1, ?, ?, 'x', 'sha', ?, ?, 0, ?)",
+        (str(_uuid.uuid4()), created_at, agent, model, p0, p1, verdict),
+    )
+    conn.commit()
+
+
+class TestReviewerOutcomeStats:
+    def test_per_reviewer_and_per_model_rates(self, test_db):
+        from tms import events
+
+        conn = test_db()
+        _seed_reviewer_run(conn, "reviewer", "deepseek-v4-pro", "PASS")
+        _seed_reviewer_run(conn, "reviewer", "deepseek-v4-pro", "FAIL",
+                           p0=1, p1=2)
+        _seed_reviewer_run(conn, "reviewer-m3", "MiniMax-M3", "PASS")
+
+        stats = events.compute_stats()
+        pr = stats["per_reviewer"]
+        assert pr["reviewer"]["runs"] == 2
+        assert pr["reviewer"]["pass"] == 1
+        assert pr["reviewer"]["fail"] == 1
+        assert pr["reviewer"]["pass_rate"] == 0.5
+        assert pr["reviewer"]["p0_total"] == 1
+        assert pr["reviewer-m3"]["pass_rate"] == 1.0
+
+        pm = stats["per_review_model"]
+        assert pm["deepseek-v4-pro"]["runs"] == 2
+        assert pm["MiniMax-M3"]["pass"] == 1
+
+    def test_legacy_rows_fall_back_to_p_counts(self, test_db):
+        from tms import events
+
+        conn = test_db()
+        # Legacy rows: verdict NULL (pre-migration-007 backfill).
+        _seed_reviewer_run(conn, "legacy", "m", None, p0=0, p1=0)
+        _seed_reviewer_run(conn, "legacy", "m", None, p0=2, p1=0)
+
+        stats = events.compute_stats()
+        d = stats["per_reviewer"]["legacy"]
+        assert d["pass"] == 1
+        assert d["fail"] == 1
+
+    def test_since_filters_reviewer_runs(self, test_db):
+        from tms import events
+
+        conn = test_db()
+        _seed_reviewer_run(conn, "old", "m", "PASS",
+                           created_at="2026-06-01T00:00:00+00:00")
+        _seed_reviewer_run(conn, "new", "m", "PASS",
+                           created_at="2026-07-29T00:00:00+00:00")
+
+        stats = events.compute_stats(since="2026-07-01")
+        assert "new" in stats["per_reviewer"]
+        assert "old" not in stats["per_reviewer"]
+
+    def test_empty_reviewer_runs_yields_empty_dicts(self, test_db):
+        from tms import events
+
+        stats = events.compute_stats()
+        assert stats["per_reviewer"] == {}
+        assert stats["per_review_model"] == {}
+
+    def test_report_renders_reviewer_section(self, test_db, capsys):
+        from tms import events
+
+        conn = test_db()
+        _seed_reviewer_run(conn, "reviewer", "deepseek-v4-pro", "PASS")
+        stats = events.compute_stats()
+        events.format_stats_report(stats)
+        out = capsys.readouterr().out
+        assert "Per-reviewer outcomes" in out
+        assert "Per-review-model outcomes" in out
+        assert "reviewer" in out

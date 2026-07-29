@@ -50,6 +50,19 @@ Dispatch events are distinguishable by the `source` field in the payload
 independent review poller, `tms events scan-reviews --dispatch`), or
 `manual` (operator running `tmq review` from a terminal).
 
+Review outcomes live in a separate table, `tms_review.reviewer_runs`
+(not the event log). Each `tms events scan-reviews` pass — the same
+5-minute cron entry — also captures `<<REVIEW-VERDICT: ...>>` markers
+from open-PR comments and reviews into `reviewer_runs`, one row per
+panel reviewer, deduped on `(repo, pr_number, diff_sha_reviewed,
+reviewer_agent)` (tms#71). Rows carry the parsed verdict state,
+p0/p1/p2 counts, and — when a matching review-dispatch event exists —
+`dispatch_session` / `aoe_id_prefix` join keys back to
+`tms_review.events`, so dispatch→review→cost is a single-join chain.
+Manual sweeps and backfill: `tms events capture-verdicts [--backfill
+--since DATE]`. Outcome rates surface in `tms events stats` under
+"Per-reviewer outcomes" / "Per-review-model outcomes".
+
 ## Field specifications
 
 ### `dispatch`

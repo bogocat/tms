@@ -135,6 +135,7 @@ _PROVIDER_MAP = {
     'deepseek': ['deepseek'],
     'minimax': ['minimax'],
     'anthropic': ['claude', 'anthropic'],
+    'zai': ['glm', 'zai'],
 }
 
 
@@ -185,6 +186,9 @@ def _verdict_to_rows(repo, pr_number, verdict):
             'input_tokens': None,
             'output_tokens': None,
             'specialist_composition': [],
+            # Verdict state (PASS|FAIL) so stats can compute outcome
+            # rates without deriving from p-counts (tms#71).
+            'verdict': verdict.get('state') or None,
         })
     return rows
 
@@ -219,9 +223,9 @@ def _search1_int(pattern, text):
 def parse_verdict_line(text):
     """Parse a verdict line from text (a full comment body is fine).
 
-    Returns ``{state, sha, p0, p1, rounds, panel}`` or ``None`` if no
-    verdict marker is present. ``p0``/``p1``/``rounds`` default to 0;
-    ``sha``/``panel`` default to ``''`` when absent.
+    Returns ``{state, sha, p0, p1, p2, rounds, panel}`` or ``None`` if no
+    verdict marker is present. ``p0``/``p1``/``p2``/``rounds`` default to
+    0; ``sha``/``panel`` default to ``''`` when absent.
     """
     m = REVIEW_VERDICT_RE.search(text or '')
     if not m:
@@ -233,6 +237,7 @@ def parse_verdict_line(text):
         'sha': _search1(_SHA_RE, rest),
         'p0': _search1_int(re.compile(_INT_RE_TEMPLATE % 'p0'), rest),
         'p1': _search1_int(re.compile(_INT_RE_TEMPLATE % 'p1'), rest),
+        'p2': _search1_int(re.compile(_INT_RE_TEMPLATE % 'p2'), rest),
         'rounds': _search1_int(re.compile(_INT_RE_TEMPLATE % 'rounds'), rest),
         'panel': _search1(_PANEL_RE, rest),
     }
@@ -356,6 +361,41 @@ def _classify_skip(comments, head_oid):
 
 # ── External-call wrappers (thin, monkeypatchable) ────────────────
 
+def _lookup_review_dispatch(cur, repo, pr_number):
+    """Resolve the dispatch join keys for a review of ``repo``#``pr_number``.
+
+    Looks up the most recent review-dispatch event for the same
+    (repo, pr) in ``tms_review.events`` — for review dispatches the
+    ``issue`` column carries the PR number. Returns
+    ``(dispatch_session, aoe_id_prefix)``; either may be ``None`` when
+    no dispatch event matched (in-session panels, human ad-hoc reviews)
+    or when the dispatch logged empty values (poller-sourced events).
+
+    Best-effort by design: with multiple review rounds the latest
+    dispatch wins. The (repo, pr_number) columns on the row remain the
+    coarse join; these keys make the dispatch→review→cost chain a
+    single equality join (issue #71 AC).
+    """
+    try:
+        cur.execute(
+            """SELECT session, aoe_id_prefix
+               FROM tms_review.events
+               WHERE event_type = 'dispatch'
+                 AND dispatch_type = 'review'
+                 AND repo = %s AND issue = %s
+               ORDER BY event_timestamp DESC
+               LIMIT 1""",
+            (repo, pr_number),
+        )
+        found = cur.fetchone()
+    except Exception:
+        # Join-key resolution must never block verdict capture.
+        return (None, None)
+    if not found:
+        return (None, None)
+    return (found[0] or None, found[1] or None)
+
+
 def _capture_verdict(repo, pr_number, verdict):
     """Insert reviewer_runs rows for a single verdict, with dedup.
 
@@ -369,6 +409,10 @@ def _capture_verdict(repo, pr_number, verdict):
     inserted = 0
     with _get_conn() as conn:
         with conn.cursor() as cur:
+            # Dispatch join keys (tms#71): same for every row of this
+            # verdict — resolve once per (repo, pr).
+            dispatch_session, aoe_id_prefix = _lookup_review_dispatch(
+                cur, repo, pr_number)
             for row in rows:
                 # Dedup: skip if this exact (repo, pr, sha, agent) exists.
                 cur.execute(
@@ -390,9 +434,11 @@ def _capture_verdict(repo, pr_number, verdict):
                         reviewer_agent, model, provider_used,
                         diff_sha_reviewed, p0, p1, p2, wall_time_ms,
                         findings, input_tokens, output_tokens,
-                        specialist_composition)
+                        specialist_composition,
+                        verdict, dispatch_session, aoe_id_prefix)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
-                               %s, %s, %s, %s, %s, %s, %s, %s)""",
+                               %s, %s, %s, %s, %s, %s, %s, %s,
+                               %s, %s, %s)""",
                     (
                         str(uuid.uuid4()),
                         row['repo'], row['pr_number'], row['review_round'],
@@ -403,6 +449,7 @@ def _capture_verdict(repo, pr_number, verdict):
                         _json.dumps(row['findings']) if row['findings'] is not None else None,
                         row['input_tokens'], row['output_tokens'],
                         _json.dumps(row['specialist_composition']),
+                        row['verdict'], dispatch_session, aoe_id_prefix,
                     ),
                 )
                 inserted += 1
@@ -944,15 +991,21 @@ def _main_scan_reviews(args):
 
     if '--help' in args or '-h' in args:
         print("usage: tms events scan-reviews "
-              "[--dispatch] [--repo <short>] [--max-dispatch <n>]")
+              "[--dispatch] [--repo <short>] [--max-dispatch <n>] "
+              "[--no-capture]")
         print()
         print("  Scan open PRs across the repo registry for those lacking a")
         print("  reviewer verdict (tms#57). Dry run by default; --dispatch")
         print("  spawns tmq review for never-reviewed PRs.")
         print()
+        print("  After the scan, verdict markers on open PRs are captured")
+        print("  into tms_review.reviewer_runs (tms#71) — same 5-min cron")
+        print("  pass, deduped on (repo, pr, sha, reviewer).")
+        print()
         print("  --dispatch        Spawn tmq review for PRs needing review")
         print("  --max-dispatch N  Cap dispatches per run (default 3; 0 = scan-only)")
         print("  --repo SHORT       Restrict scan to one registered repo")
+        print("  --no-capture      Skip the verdict-capture pass (tms#71)")
         sys.exit(0)
 
     dispatch = '--dispatch' in args
@@ -978,6 +1031,23 @@ def _main_scan_reviews(args):
                          max_dispatch=max_dispatch)
     _format_report(results)
 
+    # Verdict capture (tms#71): fold into the same 5-min cron pass so
+    # dispatched reviews land reviewer_runs rows without a crontab
+    # change. Idempotent across runs via the (repo, pr, sha, reviewer)
+    # dedup in _capture_verdict. Fail-soft: a capture failure (e.g. DB
+    # down) must not break the review-dispatch safety net.
+    if '--no-capture' in args:
+        return
+    try:
+        capture_results = capture_verdicts(repo_filter=repo_filter)
+    except Exception:
+        print('WARNING: verdict capture failed (scan-reviews unaffected):',
+              file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return
+    print()
+    _format_capture_report(capture_results)
+
 
 def _format_capture_report(results):
     """Pretty-print the verdict capture results."""
@@ -998,7 +1068,7 @@ def _main_capture_verdicts(args):
     import sys
 
     if '--help' in args or '-h' in args:
-        print("usage: tms review_poll capture-verdicts "
+        print("usage: tms events capture-verdicts "
               "[--backfill] [--since DATE] [--repo SHORT]")
         print()
         print("  Scan PR comments and reviews for <<REVIEW-VERDICT>> markers")
