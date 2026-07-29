@@ -70,11 +70,15 @@ CREATE TABLE IF NOT EXISTS dispatch_outcomes (
     aoe_id_prefix   TEXT PRIMARY KEY,
     repo            TEXT NOT NULL,
     issue           INTEGER NOT NULL,
-    outcome         TEXT NOT NULL,
+    outcome         TEXT NOT NULL CHECK (outcome IN (
+                        'merged', 'closed_unmerged', 'open', 'unknown'
+                    )),
     derived_via     TEXT,
     derived_at      TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_outcomes_repo_issue
+    ON dispatch_outcomes (repo, issue);
 """
 
 _CREATE_LLM_CALL_LOG_TABLE = """

@@ -84,6 +84,8 @@ tms events stats --by-class          per-class (repo:dispatch_type) with rounds 
 tms events stats --by-class --json   machine-readable per-class JSON (#112)
 tms events scan-reviews    list open PRs lacking reviewer verdicts (#57)
 tms events scan-reviews --dispatch    spawn tmq review for never-reviewed PRs
+tms events sync-outcomes   resolve dispatch outcomes from GitHub → dispatch_outcomes (#119)
+tms events sync-outcomes --since 7 --dry-run    bounded window, print-only
 ```
 
 Every `tmq` dispatch appends an event record to `tms_review.events`
