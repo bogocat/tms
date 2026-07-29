@@ -239,6 +239,7 @@ def log_dispatch_event(
     aoe_id_prefix: str = "",
     source: str = "author",
     issue_labels: list[str] | None = None,
+    installed_command: str = "",
 ) -> None:
     """Write a dispatch event record. Called by bin/tmq after spawn.
 
@@ -253,6 +254,11 @@ def log_dispatch_event(
     ``issue_labels`` (tms#76): GitHub labels from the issue, forwarded
     from the already-fetched gh issue view JSON in tmq. Extracted into
     point_estimate and area columns at write time.
+
+    ``installed_command`` (tms#117): the command aoe verifiably stored for
+    the session (read back post-add), not just the requested flags. Lands
+    in the payload JSON only — served-command provenance for audits of
+    the re-dispatch-reuses-stale-command failure class.
     """
     provider, model = _resolve_dispatch_model(provider, model)
     point_estimate, area = _extract_issue_metadata(issue_labels)
@@ -273,6 +279,7 @@ def log_dispatch_event(
         "issue_labels": issue_labels,
         "point_estimate": point_estimate,
         "area": area,
+        "installed_command": installed_command or None,
     }
     append_event(record)
 
@@ -1507,12 +1514,15 @@ def main():
                 issue_labels = json.loads(labels_raw)
             except (json.JSONDecodeError, ValueError):
                 pass
+        # Optional installed command (tms#117): what aoe verifiably stored.
+        installed_command = sys.argv[13] if len(sys.argv) > 13 else ""
         log_dispatch_event(
             repo=repo, issue=issue, agent=agent,
             provider=provider, model=model,
             dispatch_type=dispatch_type, worktree=worktree,
             session=session, aoe_id_prefix=aoe_id_prefix,
             source=source, issue_labels=issue_labels,
+            installed_command=installed_command,
         )
 
     elif subcmd == "dispatch-failed":
