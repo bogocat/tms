@@ -1,0 +1,72 @@
+name: verdict-gate
+
+# Mechanical merge gate for the fleet review loop.
+#
+# A PR is green only when its LATEST <<REVIEW-VERDICT: ...>> comment is a
+# PASS whose sha= matches the CURRENT head. Converts the verdict honor
+# system into a commit status:
+#   - no verdict comment   -> failure  (pd#44: stranded verdicts)
+#   - latest verdict FAIL  -> failure
+#   - PASS for a stale sha -> failure  (a verdict authorizes exactly the
+#                                       commit reviewed; a push invalidates)
+#
+# The result is posted as commit status context "verdict-gate" on the PR
+# head, so branch protection can require it regardless of which event
+# (push or verdict comment) triggered the evaluation. Short sha= prefixes
+# (>=7 hex chars) are accepted — real verdicts use both 8- and 40-char.
+#
+# This gate checks EXISTENCE + FRESHNESS, not reviewer independence —
+# author-vs-reviewer provenance stays with the foreman contract (A4/F8),
+# since all fleet comments post through the same GitHub user.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  verdict:
+    if: ${{ github.event_name == 'pull_request' || github.event.issue.pull_request }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate latest REVIEW-VERDICT against PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          head_sha=$(gh api "repos/$REPO/pulls/$PR_NUMBER" -q .head.sha)
+
+          verdict=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate -q '.[].body' \
+            | grep -oE '<<REVIEW-VERDICT: (PASS|FAIL)[^>]*>>' | tail -1 || true)
+
+          state=failure
+          if [[ -z "$verdict" ]]; then
+            desc="no REVIEW-VERDICT comment on this PR"
+          else
+            outcome=$(sed -E 's/^<<REVIEW-VERDICT: (PASS|FAIL).*/\1/' <<<"$verdict")
+            vsha=$(grep -oE 'sha=[0-9a-fA-F]+' <<<"$verdict" | head -1 | cut -d= -f2 || true)
+            if [[ "$outcome" == "FAIL" ]]; then
+              desc="latest verdict is FAIL"
+            elif [[ -z "$vsha" || ${#vsha} -lt 7 ]]; then
+              desc="verdict has no usable sha= (>=7 hex chars required)"
+            elif [[ "${head_sha,,}" == "${vsha,,}"* ]]; then
+              state=success
+              desc="PASS for head ${vsha:0:12}"
+            else
+              desc="stale PASS for ${vsha:0:12}; head is ${head_sha:0:12}"
+            fi
+          fi
+
+          gh api "repos/$REPO/statuses/$head_sha" \
+            -f state="$state" -f context=verdict-gate \
+            -f description="${desc:0:130}" >/dev/null
+          echo "verdict-gate: $state — $desc"
+          [[ "$state" == success ]]
