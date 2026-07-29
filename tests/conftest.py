@@ -96,29 +96,6 @@ CREATE TABLE IF NOT EXISTS llm_call_log (
 );
 """
 
-_CREATE_REVIEWER_RUNS_TABLE = """
-CREATE TABLE IF NOT EXISTS reviewer_runs (
-    run_id              TEXT PRIMARY KEY,
-    created_at          TEXT NOT NULL,
-    repo                TEXT NOT NULL,
-    pr_number           INTEGER NOT NULL,
-    review_round        INTEGER NOT NULL,
-    reviewer_agent      TEXT NOT NULL,
-    model               TEXT NOT NULL,
-    provider_used       TEXT NOT NULL,
-    diff_sha_reviewed   TEXT NOT NULL,
-    p0                  INTEGER NOT NULL DEFAULT 0,
-    p1                  INTEGER NOT NULL DEFAULT 0,
-    p2                  INTEGER NOT NULL DEFAULT 0,
-    wall_time_ms        INTEGER,
-    findings            TEXT,
-    input_tokens        INTEGER,
-    output_tokens       INTEGER,
-    specialist_composition TEXT NOT NULL DEFAULT '[]'
-);
-"""
-
-
 @pytest.fixture
 def test_db(monkeypatch):
     """Replace _get_conn() with sqlite3 in-memory, with events table.
