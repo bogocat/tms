@@ -738,7 +738,7 @@ create_worktree() {
         return
     fi
 
-    # Feature branch: create worktree
+    # Feature branch: try pool reuse first (tms#126)
     local issue_json title branch slug wt_path
     issue_json=$(fetch_issue "$repo" "$issue_num")
     title=$(echo "$issue_json" | jq -r '.title')
@@ -755,11 +755,43 @@ create_worktree() {
         return
     fi
 
+    # Try pool: find an idle worktree for this repo
+    local pool_entry
+    pool_entry=$(_pool_load | jq -r --arg repo "$repo" \
+        '.[] | select(.repo == $repo) | "\(.path)"' 2>/dev/null)
+    local reused=0
+    while IFS= read -r pool_path; do
+        [[ -z "$pool_path" ]] && continue
+        [[ ! -d "$pool_path" ]] && continue
+        if _wt_is_claimed "$pool_path"; then continue; fi
+        if _wt_is_dirty "$pool_path"; then
+            echo "  pool: skipping dirty worktree $pool_path" >&2
+            continue
+        fi
+        # Reuse: reset to new branch (keeps node_modules warm)
+        echo "Reusing pooled worktree: $pool_path" >&2
+        echo "  branch: $branch" >&2
+        git -C "$path" fetch origin >/dev/null 2>&1 || true
+        _wt_reset "$pool_path" "$branch" "$path"
+        # Register as claimed in pool
+        local now
+        now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        local new_pool
+        new_pool=$(_pool_load | jq --arg path "$pool_path" --arg repo "$repo" --arg now "$now" \
+            '[.[] | select(.path != $path)] + [{"repo":$repo,"path":$path,"last_used":$now}]' 2>/dev/null)
+        echo "$new_pool" | _pool_save
+        TMQ_CWD="$pool_path"
+        reused=1
+        echo "$pool_path"
+        return
+    done <<< "$pool_entry"
+
+    # No idle pool worktree: create fresh
     echo "Creating worktree: $wt_path" >&2
     echo "  branch: $branch" >&2
 
     # Ensure main is clean (silence all output to stderr or null)
-    git -C "$path" fetch origin >/dev/null 2>&1
+    git -C "$path" fetch origin >/dev/null 2>&1 || true
     git -C "$path" checkout main >/dev/null 2>&1 || true
     git -C "$path" pull --ff-only origin main >/dev/null 2>&1 || true
 
@@ -772,6 +804,14 @@ create_worktree() {
         echo "  installing deps..." >&2
         (cd "$wt_path" && bun install --frozen-lockfile >/dev/null 2>&1 || bun install >/dev/null 2>&1) &
     fi
+
+    # Register in pool for future reuse
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local new_pool
+    new_pool=$(_pool_load | jq --arg path "$wt_path" --arg repo "$repo" --arg now "$now" \
+        '[.[] | select(.path != $path)] + [{"repo":$repo,"path":$path,"last_used":$now}]' 2>/dev/null)
+    echo "$new_pool" | _pool_save
 
     TMQ_CWD="$wt_path"
     echo "$wt_path"
@@ -812,6 +852,166 @@ _check_reviewer_overlap() {
         local remaining=$((total - overlap_count))
         echo "warn: author model $model is also $reviewer_list -- panel independence reduced to $remaining reviewers" >&2
     fi
+}
+
+# ── worktree pool (tms#126) ────────────────────────────────────
+# Pool state: /root/.tmq/pool.json — JSON array of
+# {"repo":"<short>","path":"<wt_path>","last_used":"<ISO>"}
+# _wt_root and _pool_file are overridable functions so tests can
+# redirect pool state + worktree creation to tmp_path.
+
+_wt_root() { echo "/root"; }
+
+_pool_file() { echo "$(_wt_root)/.tmq/pool.json"; }
+
+_pool_load() {
+    local pf
+    pf=$(_pool_file)
+    if [[ -f "$pf" ]]; then cat "$pf"; else echo '[]'; fi
+}
+
+_pool_save() {
+    local tmp
+    mkdir -p "$(dirname "$(_pool_file)")"
+    tmp="$(_pool_file).tmp.$$"
+    cat - > "$tmp"
+    mv "$tmp" "$(_pool_file)"
+}
+
+_wt_is_claimed() {
+    local path=$1
+    # A worktree is claimed if any live tmux pane has it as cwd
+    if ! command -v tmux &>/dev/null; then return 1; fi
+    tmux list-panes -a -F '#{pane_current_path}' 2>/dev/null | grep -Fxq "$path"
+}
+
+_wt_is_dirty() {
+    local path=$1
+    [[ -d "$path" ]] || return 1
+    git -C "$path" status --porcelain 2>/dev/null | grep -q .
+}
+
+_wt_reset() {
+    local wt_path=$1 branch=$2 repo_path=$3
+    (
+        cd "$wt_path" || return 1
+        git fetch origin >/dev/null 2>&1 || true
+        # Remove any old branch of the same name, then create fresh
+        git branch -D "$branch" >/dev/null 2>&1 || true
+        git switch -c "$branch" origin/main >/dev/null 2>&1
+    )
+}
+
+wt_usage() {
+    cat <<'EOF'
+Usage:
+  tmq wt status              list pool worktrees (claimed/idle)
+  tmq wt claim <repo>        claim an idle worktree (or create)
+  tmq wt release <path>      release a worktree back to the pool
+EOF
+    exit 1
+}
+
+wt_status() {
+    local pool
+    pool=$(_pool_load)
+    printf "%-45s %-8s %-30s %-15s %-5s %s\n" \
+        "PATH" "STATUS" "BRANCH" "REPO" "DIRTY" "LAST"
+    printf "%s\n" "────────────────────────────────────────────────────────────────────────────────"
+
+    if [[ "$pool" == "[]" ]]; then
+        echo "(pool empty)"
+        return
+    fi
+
+    echo "$pool" | jq -r '.[] | "\(.path)\t\(.repo)\t\(.last_used // "")"' 2>/dev/null | \
+    while IFS=$'\t' read -r path repo last_used; do
+        local status="idle"
+        local branch="" dirty="no"
+
+        if _wt_is_claimed "$path"; then status="claimed"; fi
+        if _wt_is_dirty "$path"; then dirty="YES"; fi
+        branch=$(git -C "$path" branch --show-current 2>/dev/null || echo "<detached>")
+
+        local last=""
+        if [[ -n "$last_used" ]]; then
+            last=$(date -d "$last_used" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$last_used")
+        fi
+
+        printf "%-45s %-8s %-30s %-15s %-5s %s\n" \
+            "$path" "$status" "${branch:0:30}" "$repo" "$dirty" "$last"
+    done
+}
+
+wt_claim() {
+    local repo=$1
+    if [[ -z "${REPO_PATH[$repo]:-}" ]]; then
+        echo "Unknown repo: $repo" >&2
+        echo "Known repos: ${!REPO_PATH[*]}" >&2
+        exit 1
+    fi
+
+    local branch="pool-${repo}-$(date +%s)"
+    local claimed_path=""
+
+    # Try to find an idle worktree for this repo
+    local pool
+    pool=$(_pool_load)
+    while IFS=$'\t' read -r path repo_short last_used; do
+        [[ -z "$path" ]] && continue
+        [[ "$repo_short" != "$repo" ]] && continue
+        [[ ! -d "$path" ]] && continue
+        if _wt_is_claimed "$path"; then continue; fi
+        if _wt_is_dirty "$path"; then
+            echo "  skipping dirty worktree: $path" >&2
+            continue
+        fi
+        claimed_path="$path"
+        break
+    done < <(echo "$pool" | jq -r '.[] | "\(.path)\t\(.repo)\t\(.last_used // "")"' 2>/dev/null)
+
+    if [[ -n "$claimed_path" ]]; then
+        # Reuse: reset to new branch from origin/main
+        echo "Claiming worktree: $claimed_path" >&2
+        local main_path="${REPO_PATH[$repo]}"
+        git -C "$main_path" fetch origin >/dev/null 2>&1 || true
+        _wt_reset "$claimed_path" "$branch" "$main_path"
+    else
+        # Create fresh worktree
+        local slug="${repo}-$(date +%s)"
+        claimed_path="$(_wt_root)/wt-${slug}"
+        echo "Creating worktree: $claimed_path" >&2
+
+        local main_path="${REPO_PATH[$repo]}"
+        git -C "$main_path" fetch origin >/dev/null 2>&1 || true
+        git -C "$main_path" checkout main >/dev/null 2>&1 || true
+        git -C "$main_path" pull --ff-only origin main >/dev/null 2>&1 || true
+        git -C "$main_path" branch "$branch" main >/dev/null 2>&1 || true
+        git -C "$main_path" worktree add "$claimed_path" "$branch" >/dev/null 2>&1 || true
+    fi
+
+    # Register in pool (upsert)
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local new_pool
+    new_pool=$(echo "$pool" | jq --arg path "$claimed_path" --arg repo "$repo" --arg now "$now" \
+        '[.[] | select(.path != $path)] + [{"repo":$repo,"path":$path,"last_used":$now}]' 2>/dev/null)
+    echo "$new_pool" | _pool_save
+
+    echo "$claimed_path"
+}
+
+wt_release() {
+    local path=$1
+    local pool
+    pool=$(_pool_load)
+
+    # Remove from pool (the worktree can be reclaimed later)
+    local new_pool
+    new_pool=$(echo "$pool" | jq --arg path "$path" \
+        '[.[] | select(.path != $path)]' 2>/dev/null)
+    echo "$new_pool" | _pool_save
+    echo "Released: $path"
 }
 
 # ── main ─────────────────────────────────────────────────────────
@@ -985,6 +1185,15 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             shift
             main "${@}" --type review
             exit $?
+            ;;
+        wt)
+            shift
+            case "${1:-}" in
+                status)  wt_status ;;
+                claim)   shift; wt_claim "${1:-}" ;;
+                release) shift; wt_release "${1:-}" ;;
+                *)       wt_usage ;;
+            esac
             ;;
         -h|--help)
             usage
