@@ -10,6 +10,7 @@ code-review skill (pi-dotfiles). Real-world fixture lines below are
 copied from live PRs (tms#69 PASS, tms#64 FAIL, tms#62 minimal).
 """
 
+import datetime
 import json
 
 import pytest
@@ -251,8 +252,8 @@ class TestListOpenPrs:
 
 class TestLiveReviewSessions:
     def test_detects_review_sessions(self, monkeypatch):
-        # aoe session titled review-tms#57 + a feat session → only the
-        # review session counts.
+        # aoe session titled review-tms#57 with a live pane + a feat
+        # session → only the review session counts.
         monkeypatch.setattr(
             review_poll, "_run_aoe_list_json",
             lambda: [
@@ -260,22 +261,69 @@ class TestLiveReviewSessions:
                 {"id": "fedcba9876543210", "title": "feat-tms#57", "path": "/root/wt-tms-57", "tool": "pi"},
             ],
         )
-        monkeypatch.setattr(review_poll, "_tmux_session_names", lambda: [])
+        monkeypatch.setattr(review_poll, "_tmux_pane_liveness",
+                            lambda: {"aoe_review-tms_57_abcdef12": True})
         live = review_poll.live_review_sessions()
         assert "tms#57" in live
         # feat sessions must NOT block a review dispatch (different loop).
         assert live == {"tms#57"}
 
+    def test_zombie_aoe_session_does_not_block(self, monkeypatch):
+        # Registered aoe review session whose pane is DEAD (agent crashed
+        # or exited; remain-on-exit keeps the tmux session) must not count
+        # as live — otherwise the PR is never re-dispatched.
+        monkeypatch.setattr(
+            review_poll, "_run_aoe_list_json",
+            lambda: [{"id": "abcdef1234567890", "title": "review-tms#57",
+                      "path": "/root/tms", "tool": "pi",
+                      "created_at": "2026-07-29T14:20:00.000000Z"}],
+        )
+        monkeypatch.setattr(review_poll, "_tmux_pane_liveness",
+                            lambda: {"aoe_review-tms_57_abcdef12": False})
+        assert review_poll.live_review_sessions() == set()
+
+    def test_fresh_aoe_session_without_pane_counts(self, monkeypatch):
+        # Registered seconds ago, no tmux session yet → mid-spawn; must
+        # count as live so the poller doesn't double-dispatch.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        monkeypatch.setattr(
+            review_poll, "_run_aoe_list_json",
+            lambda: [{"id": "abcdef1234567890", "title": "review-tms#57",
+                      "path": "/root/tms", "tool": "pi",
+                      "created_at": now.isoformat()}],
+        )
+        monkeypatch.setattr(review_poll, "_tmux_pane_liveness", lambda: {})
+        assert review_poll.live_review_sessions() == {"tms#57"}
+
+    def test_stale_aoe_session_without_pane_does_not_block(self, monkeypatch):
+        # Registered long ago, no tmux session at all → long dead (e.g.
+        # aoe daemon restarted and dropped the tmux side); must not block.
+        monkeypatch.setattr(
+            review_poll, "_run_aoe_list_json",
+            lambda: [{"id": "abcdef1234567890", "title": "review-tms#57",
+                      "path": "/root/tms", "tool": "pi",
+                      "created_at": "2026-07-20T14:20:00.000000Z"}],
+        )
+        monkeypatch.setattr(review_poll, "_tmux_pane_liveness", lambda: {})
+        assert review_poll.live_review_sessions() == set()
+
     def test_tmq_named_session_also_detected(self, monkeypatch):
-        # Fallback tmux session named review-distillery#547-oc.
+        # Fallback tmux session named review-distillery#547-oc, live pane.
         monkeypatch.setattr(review_poll, "_run_aoe_list_json", lambda: [])
-        monkeypatch.setattr(review_poll, "_tmux_session_names", lambda: ["review-distillery#547-oc"])
+        monkeypatch.setattr(review_poll, "_tmux_pane_liveness",
+                            lambda: {"review-distillery#547-oc": True})
         live = review_poll.live_review_sessions()
         assert "distillery#547" in live
 
+    def test_dead_tmq_named_session_does_not_block(self, monkeypatch):
+        monkeypatch.setattr(review_poll, "_run_aoe_list_json", lambda: [])
+        monkeypatch.setattr(review_poll, "_tmux_pane_liveness",
+                            lambda: {"review-distillery#547-oc": False})
+        assert review_poll.live_review_sessions() == set()
+
     def test_no_sessions(self, monkeypatch):
         monkeypatch.setattr(review_poll, "_run_aoe_list_json", lambda: [])
-        monkeypatch.setattr(review_poll, "_tmux_session_names", lambda: [])
+        monkeypatch.setattr(review_poll, "_tmux_pane_liveness", lambda: {})
         assert review_poll.live_review_sessions() == set()
 
     def test_descriptive_titles_ignored(self, monkeypatch):
@@ -285,8 +333,23 @@ class TestLiveReviewSessions:
             review_poll, "_run_aoe_list_json",
             lambda: [{"id": "12345678abcdef00", "title": "tms issue filing", "path": "/root/tms", "tool": "pi"}],
         )
-        monkeypatch.setattr(review_poll, "_tmux_session_names", lambda: [])
+        monkeypatch.setattr(review_poll, "_tmux_pane_liveness", lambda: {})
         assert review_poll.live_review_sessions() == set()
+
+
+def test_aoe_session_fresh_missing_or_unparseable_is_fresh():
+    assert review_poll._aoe_session_fresh(None)
+    assert review_poll._aoe_session_fresh("")
+    assert review_poll._aoe_session_fresh("not-a-date")
+
+
+def test_aoe_session_fresh_window():
+    now = datetime.datetime(2026, 7, 29, 15, 0,
+                            tzinfo=datetime.timezone.utc)
+    inside = (now - datetime.timedelta(minutes=3)).isoformat()
+    outside = (now - datetime.timedelta(minutes=30)).isoformat()
+    assert review_poll._aoe_session_fresh(inside, now=now)
+    assert not review_poll._aoe_session_fresh(outside, now=now)
 
 
 # ── scan_repos orchestration ──────────────────────────────────────
