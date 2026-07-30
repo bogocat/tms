@@ -106,6 +106,32 @@ def test_wt_is_dirty_function_exists():
     assert '_wt_is_dirty' in src, "no _wt_is_dirty function"
 
 
+def test_pool_lock_function_exists():
+    src = _tmq_src()
+    assert '_pool_lock' in src, "no _pool_lock function"
+    assert 'flock' in src, "_pool_lock must use flock for advisory locking"
+
+
+def test_pool_unlock_function_exists():
+    src = _tmq_src()
+    assert '_pool_unlock' in src, "no _pool_unlock function"
+
+
+def test_wt_install_deps_function_exists():
+    src = _tmq_src()
+    assert '_wt_install_deps' in src, "no _wt_install_deps function"
+
+
+def test_wt_reset_accepts_two_args_only():
+    """_wt_reset should take only (wt_path, branch) after dead param removal."""
+    src = _tmq_src()
+    # repo_path ($3) should not appear in the function signature
+    m = __import__('re').search(r'_wt_reset\(\)\s*\{.*?^\}', src, __import__('re').S | __import__('re').M)
+    assert m, "_wt_reset function not found"
+    body = m.group(0)
+    assert 'repo_path' not in body, "_wt_reset still references unused repo_path param"
+
+
 # ── Behavioral: wt_status ───────────────────────────────────────
 
 def test_wt_status_empty_pool(tmp_path):
@@ -333,8 +359,8 @@ def test_wt_claim_skips_claimed_worktree(tmp_path):
 
 # ── Behavioral: wt_release ──────────────────────────────────────
 
-def test_wt_release_removes_from_pool(tmp_path):
-    """wt_release removes a worktree from the pool."""
+def test_wt_release_returns_to_pool(tmp_path):
+    """wt_release returns a worktree to the idle pool (does not remove it)."""
     pool_dir = tmp_path / "root" / ".tmq"
     pool_dir.mkdir(parents=True)
     wt_path = tmp_path / "root" / "wt-distillery-108"
@@ -360,8 +386,29 @@ def test_wt_release_removes_from_pool(tmp_path):
     assert r.returncode == 0, f"wt_release failed: {r.stderr}"
     assert "Released" in r.stdout, f"missing Released confirmation: {r.stdout}"
 
+    # Pool should still contain the entry (returned to idle, not removed)
     pool_after = json.loads((pool_dir / "pool.json").read_text())
-    assert pool_after == [], f"pool not empty after release: {pool_after}"
+    assert len(pool_after) == 1, f"pool should still have entry after release: {pool_after}"
+    assert pool_after[0]["path"] == str(wt_path)
+
+
+def test_wt_release_unknown_path_fails(tmp_path):
+    """wt_release on an unregistered path must fail."""
+    pool_dir = tmp_path / "root" / ".tmq"
+    pool_dir.mkdir(parents=True)
+    (pool_dir / "pool.json").write_text("[]")
+
+    env = dict(os.environ, HOME=str(tmp_path / "root"))
+    script = (
+        f'source "{TMQ}"; '
+        f'_pool_file() {{ echo "{pool_dir / "pool.json"}"; }}; '
+        f'wt_release "/nonexistent/path"'
+    )
+    r = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True, text=True, env=env, cwd=str(tmp_path),
+    )
+    assert r.returncode != 0, "wt_release with unknown path must exit non-zero"
 
 
 # ── AC: create_worktree wires pool reuse ────────────────────────
