@@ -427,3 +427,98 @@ def test_overlap_check_called_from_main_gated_on_pi():
     assert re.search(r'"\$agent"\s*==\s*"pi"', body) \
         or re.search(r'\$agent\s*==\s*"pi"', body), \
         "overlap check must be gated on $agent == \"pi\""
+
+
+# ── #128: plan-artifact UI detection + trigger injection ─────────
+# tms#128: build_prompt must detect UI-shaped issues (area:ui label,
+# UI keywords in title/body) and inject a plan-artifact trigger
+# instruction into the dispatch prompt. This is the tms-side wiring;
+# the skill file itself lives in pi-dotfiles (companion PR #70).
+
+
+def _build_prompt_body():
+    """Return the non-review branch body of build_prompt."""
+    src = BIN_TMQ.read_text()
+    # The non-review branch is the `else` arm of `if [[ "$type" == "review" ]]`
+    m = re.search(
+        r'build_prompt\(\).*?else\s*\n(.*?)\n\s*fi\s*\n\}',
+        src, re.S,
+    )
+    assert m, "build_prompt non-review branch not found"
+    return m.group(1)
+
+
+def test_ui_detection_function_exists():
+    """A _detect_ui_shaped function (or equivalent) must exist that checks
+    labels for area:ui and title/body for UI keywords."""
+    src = BIN_TMQ.read_text()
+    # Detection must reference area:ui label check
+    assert 'area:ui' in src, \
+        "no area:ui label check found in bin/tmq — UI detection missing"
+    # Detection must check UI keywords in title or body
+    ui_keywords = ['component', 'layout', 'tailwind', 'css', 'render', 'button', 'modal']
+    found_kw = [kw for kw in ui_keywords if kw in src.lower()]
+    assert len(found_kw) >= 2, \
+        f"UI keyword detection sparse: found {found_kw}, expected at least 2 of {ui_keywords}"
+
+
+def test_plan_artifact_trigger_in_prompt_template():
+    """The plan-artifact trigger instruction must appear in the prompt
+    template (between scope-refinement and the type_instruction)."""
+    body = _build_prompt_body()
+    assert 'plan-artifact' in body or 'plan_artifact' in body, \
+        "plan-artifact trigger not found in build_prompt prompt template"
+
+
+def test_plan_artifact_gated_on_ui_detection():
+    """The plan-artifact instruction must be conditionally included — it
+    must NOT appear unconditionally in the prompt (only when UI-shaped)."""
+    body = _build_prompt_body()
+    # The injection must be via a variable (e.g. $plan_artifact_instruction)
+    # that is populated conditionally, not raw text in the heredoc.
+    # Look for a variable reference in the prompt section
+    prompt_section = re.search(r'cat <<PROMPT\n(.*?)PROMPT', body, re.S)
+    assert prompt_section, "cat <<PROMPT heredoc not found in build_prompt"
+    prompt_text = prompt_section.group(1)
+    # The trigger must be a variable expansion (conditional), not raw text
+    if 'plan-artifact' in prompt_text or 'plan_artifact' in prompt_text:
+        # If present, must be via variable reference preceded by $
+        assert re.search(r'\$\{?plan_artifact', prompt_text), \
+            "plan-artifact appears as raw text, not a conditional variable — would fire on every dispatch"
+
+
+def test_ui_detection_checks_labels():
+    """The UI detection must check issue labels for area:ui."""
+    src = BIN_TMQ.read_text()
+    # The detection logic must reference $labels (the labels variable
+    # populated from the issue JSON)
+    # Look for the detection function or inline check near where labels is set
+    m = re.search(r'labels=\$.*jq.*labels', src)
+    assert m, "labels extraction from issue JSON not found"
+    # The detection must consume labels somewhere
+    labels_line = m.group(0)
+    # After labels is set, there must be a UI check consuming it
+    # (either in a _detect_ui_shaped call or an inline grep)
+    post_labels = src[src.find(labels_line):]
+    # Within ~50 lines after labels extraction, must find area:ui check
+    post_50 = '\n'.join(post_labels.split('\n')[:50])
+    assert 'area:ui' in post_50, \
+        "area:ui check not found within 50 lines of labels extraction"
+
+
+def test_backend_shaped_prompt_omits_plan_artifact():
+    """The detection must be gated — when no UI signal is present,
+    plan-artifact must NOT appear in the prompt template unconditionally."""
+    body = _build_prompt_body()
+    prompt_section = re.search(r'cat <<PROMPT\n(.*?)PROMPT', body, re.S)
+    assert prompt_section, "cat <<PROMPT heredoc not found in build_prompt"
+    prompt_text = prompt_section.group(1)
+    # The base prompt (without variable substitution) must not contain
+    # plan-artifact as a literal string — it must only exist as a
+    # variable that gets expanded conditionally.
+    raw_text_lines = [l for l in prompt_text.split('\n')
+                      if 'plan-artifact' in l.lower() or 'plan_artifact' in l.lower()]
+    for line in raw_text_lines:
+        # Each occurrence must be a variable reference, not a literal
+        assert '$' in line, \
+            f"plan-artifact appears as literal text (no $ prefix) — would fire on every dispatch: {line.strip()}"
