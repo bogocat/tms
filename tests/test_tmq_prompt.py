@@ -456,10 +456,12 @@ def test_ui_detection_function_exists():
     assert 'area:ui' in src, \
         "no area:ui label check found in bin/tmq — UI detection missing"
     # Detection must check UI keywords in title or body
-    ui_keywords = ['component', 'layout', 'tailwind', 'css', 'render', 'button', 'modal']
+    # Keywords from the refined list (P1 fix: dropped render/design/component/layout;
+    # added animation, card, toast, dropdown, etc.). Verify at least 3 are present.
+    ui_keywords = ['tailwind', 'css', 'animation', 'card', 'toast', 'dropdown', 'dialog', 'navbar', 'sidebar', 'widget', 'button', 'modal', 'form', 'grid', 'style']
     found_kw = [kw for kw in ui_keywords if kw in src.lower()]
-    assert len(found_kw) >= 2, \
-        f"UI keyword detection sparse: found {found_kw}, expected at least 2 of {ui_keywords}"
+    assert len(found_kw) >= 3, \
+        f"UI keyword detection sparse: found {found_kw}, expected at least 3 of {ui_keywords}"
 
 
 def test_plan_artifact_trigger_in_prompt_template():
@@ -522,3 +524,75 @@ def test_backend_shaped_prompt_omits_plan_artifact():
         # Each occurrence must be a variable reference, not a literal
         assert '$' in line, \
             f"plan-artifact appears as literal text (no $ prefix) — would fire on every dispatch: {line.strip()}"
+
+
+# ── Behavioral tests for _detect_ui_shaped (#128 P1 fix) ────────
+# These actually source bin/tmq and call the function with sample
+# inputs, verifying correct classification on real issue shapes.
+
+
+def _run_detect_ui_shaped(labels, title, body):
+    """Source bin/tmq and call _detect_ui_shaped, return True/False."""
+    import subprocess
+    # Escape single quotes in inputs for the bash -c command
+    def esc(s):
+        return s.replace("'", "'\\''")
+    result = subprocess.run(
+        ['bash', '-c',
+         f'source "{BIN_TMQ}" && _detect_ui_shaped \'{esc(labels)}\' \'{esc(title)}\' \'{esc(body)}\' && echo TRUE || echo FALSE'],
+        capture_output=True, text=True, timeout=5)
+    return 'TRUE' in result.stdout
+
+
+def test_detect_ui_label_triggers():
+    """area:ui label alone should trigger detection."""
+    assert _run_detect_ui_shaped("area:ui enhancement", "Fix login bug", "Some body"), \
+        "area:ui label must trigger UI detection"
+
+
+def test_detect_ui_keyword_button_triggers():
+    """UI keyword in title should trigger even without area:ui label."""
+    assert _run_detect_ui_shaped("bug", "Add button to toolbar", ""), \
+        "button keyword in title must trigger UI detection"
+
+
+def test_detect_backend_issue_skips():
+    """Pure backend issue with no UI signals must NOT trigger."""
+    assert not _run_detect_ui_shaped("bug", "Fix database connection pool timeout", "The connection pool does not recycle"), \
+        "backend issue must NOT trigger UI detection"
+
+
+def test_detect_false_positive_design_skips():
+    """'design' keyword was dropped — 'design the database schema' must NOT trigger."""
+    assert not _run_detect_ui_shaped("", "Design the database schema", ""), \
+        "design keyword was dropped; must NOT trigger on schema design"
+
+
+def test_detect_false_positive_render_skips():
+    """'render' keyword was dropped — 'render the template' must NOT trigger."""
+    assert not _run_detect_ui_shaped("", "Render markdown to HTML", ""), \
+        "render keyword was dropped; must NOT trigger on server-side rendering"
+
+
+def test_detect_ui_card_animation_triggers():
+    """New keywords card + animation should trigger on UI issues."""
+    assert _run_detect_ui_shaped("", "Fix card hover animation", ""), \
+        "card + animation keywords must trigger UI detection"
+
+
+def test_detect_ui_dark_mode_triggers():
+    """color + style keywords should catch dark mode / theming issues."""
+    assert _run_detect_ui_shaped("", "Add dark mode color scheme", ""), \
+        "color keyword must trigger UI detection"
+
+
+def test_detect_ui_form_modal_triggers():
+    """form + modal keywords should trigger on UI dialog work."""
+    assert _run_detect_ui_shaped("", "Fix modal form validation", ""), \
+        "modal + form keywords must trigger UI detection"
+
+
+def test_detect_empty_input_skips():
+    """Empty inputs must not crash and must return false."""
+    assert not _run_detect_ui_shaped("", "", ""), \
+        "empty inputs must return false without crashing"

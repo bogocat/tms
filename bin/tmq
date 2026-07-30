@@ -246,8 +246,9 @@ _detect_ui_shaped() {
     # Keyword check in title/body (case-insensitive).
     # These keywords mirror the dispatch-loop trigger rule's UI-detection
     # heuristic — keep in sync with pi-dotfiles#70 (companion PR).
+    # Deliberately omitted as too broad: render, design, component, layout.
     local combined="${title,,} ${body,,}"
-    if [[ "$combined" =~ (component|layout|tailwind|css|render|button|modal|sidebar|widget|grid|design) ]]; then
+    if [[ "$combined" =~ (tailwind|css|animation|responsive|viewport|flexbox|typography|font|icon|badge|card|toast|dropdown|tooltip|dialog|navbar|sidebar|widget|button|modal|form|grid|style|spacing|color) ]]; then
         return 0
     fi
 
@@ -375,7 +376,7 @@ PROMPT
    design choices. Before writing implementation code, use the `plan-artifact`
    skill to generate a self-contained static HTML artifact rendering each
    design option side-by-side, styled with the target app's Tailwind tokens.
-   Save to `/tmp/plan-artifact-<repo>#<num>.html`. Record the chosen option
+   Save to \`/tmp/plan-artifact-${repo}#${number}.html\`. Record the chosen option
    and artifact path on the issue before the plan-gate passes.
 PLAN_ARTIFACT
 )"
