@@ -297,7 +297,7 @@ $body
 3. Classify issues as P0 (must fix), P1 (should fix), P2 (nice to have)
 4. Focus on logic errors and design flaws over style nits
 5. Output a structured review: Summary / P0 Issues / P1 Issues / P2 Notes / Overall
-6. **Evidence check (tms#127):** Before issuing a PASS verdict, verify the PR body \`## Verification\` section contains concrete evidence artifacts (command transcripts, test output, log excerpts) backing each claimed AC — not just prose claims. A checked AC with no evidence artifact is a **P0 finding ('missing evidence')**, not a pass. If evidence files exist at \`~/.tms/evidence/<dispatch-id>/\`, cross-reference them with the PR claims.
+6. **Evidence check (tms#127):** Before issuing a PASS verdict, verify the PR body \`## Verification\` section contains concrete evidence artifacts (command transcripts, test output, log excerpts) backing each claimed AC — not just prose claims. A checked AC with no evidence artifact is a **P0 finding ('missing evidence')**, not a pass. The feature agent records evidence paths in that section; derive the dispatch-id from there rather than guessing. If the PR has no \`## Verification\` section at all, that is an automatic P0 — do not issue PASS.
 7. $fixup_step
 PROMPT
     else
@@ -360,6 +360,10 @@ PROMPT
                 ;;
         esac
 
+        # Compute session prefix matching main()'s session_name convention
+        local session_prefix="$type"
+        [[ "$type" == "feature" ]] && session_prefix="feat"
+
         cat <<PROMPT
 ## $type: ${REPO_GH[$repo]}#$number
 
@@ -386,8 +390,9 @@ $loop_instruction
    remaining work.
 $type_instruction
 $lifecycle_instruction
-5. **Evidence-first verification (tms#127):** Before opening the PR, record concrete evidence for each acceptance criterion:
-   - Create \`~/.tms/evidence/${type}-${repo}#${number}/\` (your session name; derived from type/repo/issue).
+### Evidence-first verification (tms#127)
+Before opening the PR, record concrete evidence for each acceptance criterion:
+   - Create \`~/.tms/evidence/${session_prefix}-${repo}#${number}/\` (your session name).
    - For each AC, write one evidence file (e.g. \`ac1-test-output.txt\`, \`ac2-command-transcript.txt\`) containing the **actual command transcript, test output, or log excerpt** — not prose describing it.
    - Paste text evidence inline in the PR body \`## Verification\` section, mapping each AC → artifact path. For screenshots: \`gh pr comment --body "## AC<n> evidence" <screenshot>\`.
    - Evidence lives outside the worktree, so it survives cleanup.
