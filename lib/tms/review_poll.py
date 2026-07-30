@@ -553,12 +553,60 @@ def _tmux_session_names():
     return [s for s in out.splitlines() if s]
 
 
+def _tmux_pane_liveness():
+    """Map tmux session name -> True if any pane has a live process.
+
+    aoe creates panes with remain-on-exit, so a session whose agent
+    crashed or finished stays registered with a dead pane. Session
+    existence alone is therefore not evidence of liveness — under the
+    old name-only check, zombie sessions blocked review re-dispatch
+    forever (skip_live_session on every poll).
+    """
+    out = _run(['tmux', 'list-panes', '-a', '-F',
+                '#{session_name} #{pane_dead}'], timeout=3)
+    live = {}
+    for line in out.splitlines():
+        name, sep, dead = line.rpartition(' ')
+        if not sep or not name:
+            continue
+        live[name] = live.get(name, False) or dead.strip() != '1'
+    return live
+
+
+# Spawn grace: an aoe session registered but with no tmux pane yet is
+# probably mid-spawn; treat it as live for this long so the poller
+# doesn't double-dispatch against an in-flight spawn.
+_SPAWN_GRACE_MINUTES = 10
+
+
+def _aoe_session_fresh(created_at, now=None):
+    """True when created_at is within the spawn grace window.
+
+    Missing/unparseable → True (conservative: preserves the pre-liveness
+    behavior rather than risking a double dispatch).
+    """
+    if not created_at:
+        return True
+    try:
+        created = datetime.datetime.fromisoformat(
+            created_at.replace('Z', '+00:00'))
+    except ValueError:
+        return True
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return (now - created) <= datetime.timedelta(minutes=_SPAWN_GRACE_MINUTES)
+
+
 def live_review_sessions():
     """Return the set of ``"repo#pr"`` keys with a live review session.
 
-    Sources (both checked, either suffices to block a dispatch):
-      - aoe sessions whose title parses as ``review-<repo>#<pr>``
-      - tmux sessions named ``review-<repo>#<pr>[-cc|-oc]`` (fallback spawn)
+    Liveness (not just registration) is required — a session counts only
+    when its tmux pane has a running process:
+      - aoe sessions whose title parses as ``review-<repo>#<pr>``, matched
+        to their aoe tmux session by id[..8] suffix, count when that tmux
+        session has a live pane. No tmux session at all counts only within
+        the spawn grace window (mid-spawn); older = long dead.
+      - tmux sessions named ``review-<repo>#<pr>[-cc|-oc]`` (fallback
+        spawn) count when they have a live pane.
 
     feat/fix/chore sessions do NOT count (different loop). Descriptive
     titles (e.g. "tms issue filing") are ignored — mirrors the
@@ -566,6 +614,7 @@ def live_review_sessions():
     """
     from tms.session_map import parse_issue_title, parse_tmq_session_name
 
+    liveness = _tmux_pane_liveness()
     live = set()
     for s in _run_aoe_list_json():
         title = s.get('title', '') or ''
@@ -573,10 +622,21 @@ def live_review_sessions():
         if parsed is None:
             continue
         _type, repo, num = parsed
-        if _type == 'review':
+        if _type != 'review':
+            continue
+        sid = (s.get('id') or '')[:8]
+        panes = [n for n in liveness if sid and n.rsplit('_', 1)[-1] == sid]
+        if panes:
+            if any(liveness[n] for n in panes):
+                live.add(f'{repo}#{num}')
+            # else: zombie — dead pane(s) only; must not block re-dispatch.
+        elif _aoe_session_fresh(s.get('created_at')):
+            # Registered but no tmux session yet: mid-spawn.
             live.add(f'{repo}#{num}')
 
-    for name in _tmux_session_names():
+    for name, is_live in liveness.items():
+        if not is_live:
+            continue
         parsed = parse_tmq_session_name(name)
         if parsed is None:
             continue

@@ -144,6 +144,25 @@ slugify() {
     echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
 }
 
+# Newest installed nvm node >= 22 as an inline PATH prefix for agent panes.
+#
+# Panes spawned from cron or the long-lived aoe daemon can inherit a PATH
+# where /usr/bin/node (distro v20) precedes nvm — and pi is a node script
+# with a `#!/usr/bin/env node` shebang whose bundled undici crashes on
+# Node 20 at startup (webidl.util.markAsUncloneable), killing dispatched
+# reviewers seconds after spawn. Prepending the newest nvm node >= 22
+# makes the pane deterministic regardless of inherited PATH ordering.
+# Best-effort: no nvm install → empty prefix → inherited PATH (previous
+# behavior). Prints e.g.: PATH='/root/.nvm/versions/node/v22.19.0/bin':"$PATH" 
+tmq_node22_prefix() {
+    local vdir="${NVM_DIR:-$HOME/.nvm}/versions/node" best
+    [[ -d "$vdir" ]] || return 0
+    best=$(ls -d "$vdir"/v2[2-9].* "$vdir"/v[3-9][0-9].* 2>/dev/null | sort -V | tail -1 || true)
+    if [[ -n "$best" && -x "$best/bin/node" ]]; then
+        printf "PATH='%s/bin':\"\$PATH\" " "$best"
+    fi
+}
+
 next_scratch_name() {
     local prefix=$1
     local max=-1
@@ -441,10 +460,11 @@ spawn_agent() {
         # a permission prompt with no human attached (issue #30). Worktree-isolated.
         # --provider/--model forward to pi when set (#37); empty = pi default.
         pi)
-            local pi_extra=""
+            local pi_extra="" node_prefix
+            node_prefix=$(tmq_node22_prefix)
             [[ -n "$PI_PROVIDER" ]] && pi_extra+=" --provider $PI_PROVIDER"
             [[ -n "$PI_MODEL" ]]    && pi_extra+=" --model $PI_MODEL"
-            cmd_override="PI_DISPATCH_AUTOAPPROVE=1 pi${pi_extra} @$prompt_file; echo; echo '--- PI DONE ---'; exec bash"
+            cmd_override="${node_prefix}PI_DISPATCH_AUTOAPPROVE=1 pi${pi_extra} @$prompt_file; echo; echo '--- PI DONE ---'; exec bash"
             ;;
         oc) cmd_override="cat '$prompt_file' | opencode 2>&1; echo; echo '--- OPENCODE DONE ---'; exec bash" ;;
     esac
