@@ -427,3 +427,172 @@ def test_overlap_check_called_from_main_gated_on_pi():
     assert re.search(r'"\$agent"\s*==\s*"pi"', body) \
         or re.search(r'\$agent\s*==\s*"pi"', body), \
         "overlap check must be gated on $agent == \"pi\""
+
+
+# ── #128: plan-artifact UI detection + trigger injection ─────────
+# tms#128: build_prompt must detect UI-shaped issues (area:ui label,
+# UI keywords in title/body) and inject a plan-artifact trigger
+# instruction into the dispatch prompt. This is the tms-side wiring;
+# the skill file itself lives in pi-dotfiles (companion PR #70).
+
+
+def _build_prompt_body():
+    """Return the non-review branch body of build_prompt."""
+    src = BIN_TMQ.read_text()
+    # The non-review branch is the `else` arm of `if [[ "$type" == "review" ]]`
+    m = re.search(
+        r'build_prompt\(\).*?else\s*\n(.*?)\n\s*fi\s*\n\}',
+        src, re.S,
+    )
+    assert m, "build_prompt non-review branch not found"
+    return m.group(1)
+
+
+def test_ui_detection_function_exists():
+    """A _detect_ui_shaped function (or equivalent) must exist that checks
+    labels for area:ui and title/body for UI keywords."""
+    src = BIN_TMQ.read_text()
+    # Detection must reference area:ui label check
+    assert 'area:ui' in src, \
+        "no area:ui label check found in bin/tmq — UI detection missing"
+    # Detection must check UI keywords in title or body
+    # Keywords from the refined list (P1 fix: dropped render/design/component/layout;
+    # added animation, card, toast, dropdown, etc.). Verify at least 3 are present.
+    ui_keywords = ['tailwind', 'css', 'animation', 'card', 'toast', 'dropdown', 'dialog', 'navbar', 'sidebar', 'widget', 'button', 'modal', 'form', 'grid', 'style']
+    found_kw = [kw for kw in ui_keywords if kw in src.lower()]
+    assert len(found_kw) >= 3, \
+        f"UI keyword detection sparse: found {found_kw}, expected at least 3 of {ui_keywords}"
+
+
+def test_plan_artifact_trigger_in_prompt_template():
+    """The plan-artifact trigger instruction must appear in the prompt
+    template (between scope-refinement and the type_instruction)."""
+    body = _build_prompt_body()
+    assert 'plan-artifact' in body or 'plan_artifact' in body, \
+        "plan-artifact trigger not found in build_prompt prompt template"
+
+
+def test_plan_artifact_gated_on_ui_detection():
+    """The plan-artifact instruction must be conditionally included — it
+    must NOT appear unconditionally in the prompt (only when UI-shaped)."""
+    body = _build_prompt_body()
+    # The injection must be via a variable (e.g. $plan_artifact_instruction)
+    # that is populated conditionally, not raw text in the heredoc.
+    # Look for a variable reference in the prompt section
+    prompt_section = re.search(r'cat <<PROMPT\n(.*?)PROMPT', body, re.S)
+    assert prompt_section, "cat <<PROMPT heredoc not found in build_prompt"
+    prompt_text = prompt_section.group(1)
+    # The trigger must be a variable expansion (conditional), not raw text
+    if 'plan-artifact' in prompt_text or 'plan_artifact' in prompt_text:
+        # If present, must be via variable reference preceded by $
+        assert re.search(r'\$\{?plan_artifact', prompt_text), \
+            "plan-artifact appears as raw text, not a conditional variable — would fire on every dispatch"
+
+
+def test_ui_detection_checks_labels():
+    """The UI detection must check issue labels for area:ui."""
+    src = BIN_TMQ.read_text()
+    # The detection logic must reference $labels (the labels variable
+    # populated from the issue JSON)
+    # Look for the detection function or inline check near where labels is set
+    m = re.search(r'labels=\$.*jq.*labels', src)
+    assert m, "labels extraction from issue JSON not found"
+    # The detection must consume labels somewhere
+    labels_line = m.group(0)
+    # After labels is set, there must be a UI check consuming it
+    # (either in a _detect_ui_shaped call or an inline grep)
+    post_labels = src[src.find(labels_line):]
+    # Within ~50 lines after labels extraction, must find area:ui check
+    post_50 = '\n'.join(post_labels.split('\n')[:50])
+    assert 'area:ui' in post_50, \
+        "area:ui check not found within 50 lines of labels extraction"
+
+
+def test_backend_shaped_prompt_omits_plan_artifact():
+    """The detection must be gated — when no UI signal is present,
+    plan-artifact must NOT appear in the prompt template unconditionally."""
+    body = _build_prompt_body()
+    prompt_section = re.search(r'cat <<PROMPT\n(.*?)PROMPT', body, re.S)
+    assert prompt_section, "cat <<PROMPT heredoc not found in build_prompt"
+    prompt_text = prompt_section.group(1)
+    # The base prompt (without variable substitution) must not contain
+    # plan-artifact as a literal string — it must only exist as a
+    # variable that gets expanded conditionally.
+    raw_text_lines = [l for l in prompt_text.split('\n')
+                      if 'plan-artifact' in l.lower() or 'plan_artifact' in l.lower()]
+    for line in raw_text_lines:
+        # Each occurrence must be a variable reference, not a literal
+        assert '$' in line, \
+            f"plan-artifact appears as literal text (no $ prefix) — would fire on every dispatch: {line.strip()}"
+
+
+# ── Behavioral tests for _detect_ui_shaped (#128 P1 fix) ────────
+# These actually source bin/tmq and call the function with sample
+# inputs, verifying correct classification on real issue shapes.
+
+
+def _run_detect_ui_shaped(labels, title, body):
+    """Source bin/tmq and call _detect_ui_shaped, return True/False."""
+    import subprocess
+    # Escape single quotes in inputs for the bash -c command
+    def esc(s):
+        return s.replace("'", "'\\''")
+    result = subprocess.run(
+        ['bash', '-c',
+         f'source "{BIN_TMQ}" && _detect_ui_shaped \'{esc(labels)}\' \'{esc(title)}\' \'{esc(body)}\' && echo TRUE || echo FALSE'],
+        capture_output=True, text=True, timeout=5)
+    return 'TRUE' in result.stdout
+
+
+def test_detect_ui_label_triggers():
+    """area:ui label alone should trigger detection."""
+    assert _run_detect_ui_shaped("area:ui enhancement", "Fix login bug", "Some body"), \
+        "area:ui label must trigger UI detection"
+
+
+def test_detect_ui_keyword_button_triggers():
+    """UI keyword in title should trigger even without area:ui label."""
+    assert _run_detect_ui_shaped("bug", "Add button to toolbar", ""), \
+        "button keyword in title must trigger UI detection"
+
+
+def test_detect_backend_issue_skips():
+    """Pure backend issue with no UI signals must NOT trigger."""
+    assert not _run_detect_ui_shaped("bug", "Fix database connection pool timeout", "The connection pool does not recycle"), \
+        "backend issue must NOT trigger UI detection"
+
+
+def test_detect_false_positive_design_skips():
+    """'design' keyword was dropped — 'design the database schema' must NOT trigger."""
+    assert not _run_detect_ui_shaped("", "Design the database schema", ""), \
+        "design keyword was dropped; must NOT trigger on schema design"
+
+
+def test_detect_false_positive_render_skips():
+    """'render' keyword was dropped — 'render the template' must NOT trigger."""
+    assert not _run_detect_ui_shaped("", "Render markdown to HTML", ""), \
+        "render keyword was dropped; must NOT trigger on server-side rendering"
+
+
+def test_detect_ui_card_animation_triggers():
+    """New keywords card + animation should trigger on UI issues."""
+    assert _run_detect_ui_shaped("", "Fix card hover animation", ""), \
+        "card + animation keywords must trigger UI detection"
+
+
+def test_detect_ui_dark_mode_triggers():
+    """color + style keywords should catch dark mode / theming issues."""
+    assert _run_detect_ui_shaped("", "Add dark mode color scheme", ""), \
+        "color keyword must trigger UI detection"
+
+
+def test_detect_ui_form_modal_triggers():
+    """form + modal keywords should trigger on UI dialog work."""
+    assert _run_detect_ui_shaped("", "Fix modal form validation", ""), \
+        "modal + form keywords must trigger UI detection"
+
+
+def test_detect_empty_input_skips():
+    """Empty inputs must not crash and must return false."""
+    assert not _run_detect_ui_shaped("", "", ""), \
+        "empty inputs must return false without crashing"

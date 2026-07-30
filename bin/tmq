@@ -232,6 +232,29 @@ resolve_pr_number() {
 
 # ── prompt construction ──────────────────────────────────────────
 
+# Detect whether an issue is UI-shaped (tms#128).
+# Checks labels for area:ui and title/body for UI keywords.
+# Returns 0 (true) when UI-shaped — triggers the plan-artifact gate.
+_detect_ui_shaped() {
+    local labels="$1" title="$2" body="$3"
+
+    # Label check: area:ui
+    if [[ "$labels" == *"area:ui"* ]]; then
+        return 0
+    fi
+
+    # Keyword check in title/body (case-insensitive).
+    # These keywords mirror the dispatch-loop trigger rule's UI-detection
+    # heuristic — keep in sync with pi-dotfiles#70 (companion PR).
+    # Deliberately omitted as too broad: render, design, component, layout.
+    local combined="${title,,} ${body,,}"
+    if [[ "$combined" =~ (tailwind|css|animation|responsive|viewport|flexbox|typography|font|icon|badge|card|toast|dropdown|tooltip|dialog|navbar|sidebar|widget|button|modal|form|grid|style|spacing|color) ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
 build_prompt() {
     local repo=$1 number=$2 type=$3 agent=${4:-pi}
 
@@ -342,6 +365,23 @@ PROMPT
         if [[ -f "${TMQ_CWD}/AGENTS.md" ]]; then
             agents_md_ptr="**Read and follow \`AGENTS.md\`** in the repo root — the in-session loop: \`<<AGENT-STATE: ...>>\` markers + plan-gate / TDD-first / AC-verify."
         fi
+        # ── plan-artifact detection (#128) ──────────────────────
+        # Trigger: issue has area:ui label, or title/body matches
+        # UI keywords. The skill file itself lives in pi-dotfiles
+        # (companion PR #70); this is the tms-side wiring.
+        local plan_artifact_instruction=""
+        if _detect_ui_shaped "$labels" "$title" "$body"; then
+            plan_artifact_instruction="$(cat <<PLAN_ARTIFACT
+2.5. **UI-shaped feature — plan-artifact gate.** This issue involves visual
+   design choices. Before writing implementation code, use the \`plan-artifact\`
+   skill to generate a self-contained static HTML artifact rendering each
+   design option side-by-side, styled with the target app's Tailwind tokens.
+   Save to \`/tmp/plan-artifact-${repo}#${number}.html\`. Record the chosen option
+   and artifact path on the issue before the plan-gate passes.
+PLAN_ARTIFACT
+)"
+        fi
+
         local loop_instruction=""
         case "$agent" in
             pi)
@@ -383,6 +423,7 @@ $loop_instruction
      the current state of the codebase)
 2. **Refine the scope**, report discrepancies, then proceed with the actual
    remaining work.
+$plan_artifact_instruction
 $type_instruction
 $lifecycle_instruction
 
