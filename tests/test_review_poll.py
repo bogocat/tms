@@ -1174,3 +1174,202 @@ class TestScanPrsForVerdicts:
         prs = list(review_poll._scan_prs_for_verdicts(
             "bogocat/tms", state="merged"))
         assert len(prs) == 0
+
+
+# ── tms#71: wired verdict capture (writer for reviewer_runs) ──────
+
+class TestParseVerdictP2:
+    def test_p2_parsed(self):
+        v = review_poll.parse_verdict_line(
+            "<<REVIEW-VERDICT: FAIL sha=abc p0=1 p1=2 p2=3 rounds=1 "
+            "panel=deepseek-v4-pro>>")
+        assert v["p2"] == 3
+
+    def test_p2_defaults_zero(self):
+        v = review_poll.parse_verdict_line(LIVE_PASS)
+        assert v["p2"] == 0
+
+
+class TestZaiProvider:
+    def test_glm_model_maps_to_zai(self):
+        assert review_poll._model_to_provider("glm-5.2") == "zai"
+
+
+class TestCaptureVerdictJoinKeys:
+    """Verdict state + dispatch join keys on captured rows (tms#71)."""
+
+    def test_verdict_state_stored(self, monkeypatch, test_db):
+        verdict = {
+            "state": "FAIL", "sha": "abc123",
+            "p0": 1, "p1": 2, "p2": 0,
+            "rounds": 1, "panel": "deepseek-v4-pro",
+        }
+        assert review_poll._capture_verdict("tms", 71, verdict) == 1
+        conn = test_db()
+        row = conn.cursor().execute(
+            "SELECT verdict, p0, p1 FROM reviewer_runs"
+        ).fetchone()
+        assert row == ("FAIL", 1, 2)
+
+    def test_join_keys_from_dispatch_event(self, monkeypatch, test_db):
+        # Seed a review-dispatch event for the same (repo, pr).
+        from tms.events import log_dispatch_event
+        log_dispatch_event(
+            repo="tms", issue=71, agent="pi",
+            provider="deepseek", model="deepseek-v4-pro",
+            dispatch_type="review", worktree="",
+            session="review-tms#71", aoe_id_prefix="abcd1234",
+        )
+        verdict = {
+            "state": "PASS", "sha": "def456",
+            "p0": 0, "p1": 0, "p2": 0,
+            "rounds": 1, "panel": "reviewer(deepseek-v4-pro)",
+        }
+        assert review_poll._capture_verdict("tms", 71, verdict) == 1
+        conn = test_db()
+        row = conn.cursor().execute(
+            "SELECT dispatch_session, aoe_id_prefix FROM reviewer_runs"
+        ).fetchone()
+        assert row == ("review-tms#71", "abcd1234")
+
+    def test_join_keys_null_without_dispatch_event(self, monkeypatch, test_db):
+        verdict = {
+            "state": "PASS", "sha": "aaa111",
+            "p0": 0, "p1": 0, "p2": 0,
+            "rounds": 1, "panel": "deepseek-v4-pro",
+        }
+        assert review_poll._capture_verdict("tms", 99, verdict) == 1
+        conn = test_db()
+        row = conn.cursor().execute(
+            "SELECT dispatch_session, aoe_id_prefix FROM reviewer_runs"
+        ).fetchone()
+        assert row == (None, None)
+
+    def test_latest_dispatch_event_wins(self, monkeypatch, test_db):
+        # Two review dispatches for the same PR: latest one's keys win.
+        conn = test_db()
+        cur = conn.cursor()
+        for i, (sess, aoe, ts) in enumerate([
+            ("review-tms#71", "old11111", "2026-07-28T00:00:00+00:00"),
+            ("review-tms#71", "new22222", "2026-07-29T00:00:00+00:00"),
+        ]):
+            cur.execute(
+                "INSERT INTO events (id, created_at, event_type, "
+                "event_timestamp, repo, issue, dispatch_type, session, "
+                "aoe_id_prefix, payload) "
+                "VALUES (?, ?, 'dispatch', ?, 'tms', 71, 'review', ?, ?, '{}')",
+                (f"id-{i}", ts, ts, sess, aoe),
+            )
+        conn.commit()
+        verdict = {
+            "state": "PASS", "sha": "bbb222",
+            "p0": 0, "p1": 0, "p2": 0,
+            "rounds": 2, "panel": "deepseek-v4-pro",
+        }
+        assert review_poll._capture_verdict("tms", 71, verdict) == 1
+        row = test_db().cursor().execute(
+            "SELECT aoe_id_prefix FROM reviewer_runs"
+        ).fetchone()
+        assert row[0] == "new22222"
+
+
+class TestDispatchedReviewProducesRow:
+    """AC (tms#71): after a dispatched review posts its verdict, the
+    scheduled scan pass produces a reviewer_runs row."""
+
+    def _fake_registry(self, monkeypatch):
+        monkeypatch.setattr(
+            review_poll, "_run_tmq_list_machine",
+            lambda: "tms\t/root/tms\tbogocat/tms\t1")
+
+    def test_capture_verdicts_end_to_end(self, monkeypatch, test_db):
+        self._fake_registry(monkeypatch)
+
+        def fake_gh(args, timeout=15):
+            if "list" in args:
+                return [{"number": 71, "headRefOid": "16e3ead7aa"}]
+            if "view" in args:
+                return {"comments": [{"body":
+                    "Review round 2.\n"
+                    "<<REVIEW-VERDICT: FAIL sha=16e3ead7aa p0=1 p1=3 "
+                    "rounds=2 panel=reviewer(deepseek-v4-pro),"
+                    "reviewer-m3(MiniMax-M3)>>"}]}
+            return None
+        monkeypatch.setattr(review_poll, "_gh_json", fake_gh)
+        monkeypatch.setattr(review_poll, "_fetch_pr_reviews",
+                            lambda gh, num: [])
+
+        conn = test_db()
+        before = conn.cursor().execute(
+            "SELECT count(*) FROM reviewer_runs").fetchone()[0]
+        results = review_poll.capture_verdicts()
+        after = conn.cursor().execute(
+            "SELECT count(*) FROM reviewer_runs").fetchone()[0]
+
+        assert after == before + 2  # one row per panel reviewer
+        assert results == [{
+            "repo": "tms", "gh_repo": "bogocat/tms", "pr": 71,
+            "verdicts_found": 1, "rows_inserted": 2,
+        }]
+        rows = conn.cursor().execute(
+            "SELECT reviewer_agent, model, provider_used, verdict, "
+            "p0, p1, diff_sha_reviewed, review_round FROM reviewer_runs "
+            "ORDER BY reviewer_agent").fetchall()
+        assert rows[0] == ("reviewer", "deepseek-v4-pro", "deepseek",
+                           "FAIL", 1, 3, "16e3ead7aa", 2)
+        assert rows[1] == ("reviewer-m3", "MiniMax-M3", "minimax",
+                           "FAIL", 1, 3, "16e3ead7aa", 2)
+
+    def test_rerun_is_idempotent(self, monkeypatch, test_db):
+        self._fake_registry(monkeypatch)
+
+        def fake_gh(args, timeout=15):
+            if "list" in args:
+                return [{"number": 71, "headRefOid": "abc"}]
+            if "view" in args:
+                return {"comments": [{"body":
+                    "<<REVIEW-VERDICT: PASS sha=abc rounds=1 "
+                    "panel=deepseek-v4-pro>>"}]}
+            return None
+        monkeypatch.setattr(review_poll, "_gh_json", fake_gh)
+        monkeypatch.setattr(review_poll, "_fetch_pr_reviews",
+                            lambda gh, num: [])
+
+        review_poll.capture_verdicts()
+        review_poll.capture_verdicts()  # second 5-min cron pass
+        count = test_db().cursor().execute(
+            "SELECT count(*) FROM reviewer_runs").fetchone()[0]
+        assert count == 1
+
+
+class TestScanReviewsFoldsCapture:
+    """The scan-reviews CLI pass runs verdict capture (tms#71)."""
+
+    def test_scan_reviews_invokes_capture(self, monkeypatch, capsys):
+        monkeypatch.setattr(review_poll, "scan_repos",
+                            lambda **kw: [])
+        called = {}
+        def fake_capture(repo_filter=None, backfill=False, since=None):
+            called["repo_filter"] = repo_filter
+            return []
+        monkeypatch.setattr(review_poll, "capture_verdicts", fake_capture)
+        review_poll._main_scan_reviews(["scan-reviews", "--repo", "tms"])
+        assert called == {"repo_filter": "tms"}
+
+    def test_no_capture_flag_skips(self, monkeypatch, capsys):
+        monkeypatch.setattr(review_poll, "scan_repos",
+                            lambda **kw: [])
+        def fake_capture(**kw):
+            raise AssertionError("capture should not run with --no-capture")
+        monkeypatch.setattr(review_poll, "capture_verdicts", fake_capture)
+        review_poll._main_scan_reviews(["scan-reviews", "--no-capture"])
+
+    def test_capture_failure_does_not_break_scan(self, monkeypatch, capsys):
+        monkeypatch.setattr(review_poll, "scan_repos",
+                            lambda **kw: [])
+        def fake_capture(**kw):
+            raise RuntimeError("db down")
+        monkeypatch.setattr(review_poll, "capture_verdicts", fake_capture)
+        # Must not raise.
+        review_poll._main_scan_reviews(["scan-reviews"])
+        assert "verdict capture failed" in capsys.readouterr().err

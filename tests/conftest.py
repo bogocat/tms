@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS reviewer_runs (
     findings             TEXT,
     input_tokens         INTEGER,
     output_tokens        INTEGER,
-    specialist_composition TEXT NOT NULL DEFAULT '[]'
+    specialist_composition TEXT NOT NULL DEFAULT '[]',
+    verdict              TEXT,
+    dispatch_session     TEXT,
+    aoe_id_prefix        TEXT
 );
 """
 

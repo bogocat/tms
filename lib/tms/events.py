@@ -726,6 +726,96 @@ def _read_events_from_db(since=None):
     return events
 
 
+def _read_reviewer_runs(since=None):
+    """Read reviewer_runs rows for outcome stats (tms#71).
+
+    Returns a list of dicts with {reviewer_agent, model, verdict,
+    p0, p1, p2}. Fail-soft: returns [] on any DB error (including a
+    live table that predates migration 007) so stats never crash.
+
+    Args:
+        since: optional ISO date string (YYYY-MM-DD) to filter rows
+               by created_at.
+    """
+    rows = []
+    cutoff = None
+    if since:
+        cutoff = since if "T" in since else since + "T00:00:00+00:00"
+    try:
+        with _get_conn() as conn:
+            with conn.cursor() as cur:
+                if cutoff:
+                    cur.execute(
+                        """SELECT reviewer_agent, model, verdict,
+                                  p0, p1, p2
+                           FROM tms_review.reviewer_runs
+                           WHERE created_at >= %s""",
+                        (cutoff,),
+                    )
+                else:
+                    cur.execute(
+                        """SELECT reviewer_agent, model, verdict,
+                                  p0, p1, p2
+                           FROM tms_review.reviewer_runs"""
+                    )
+                for r in cur.fetchall():
+                    rows.append({
+                        "reviewer_agent": r[0],
+                        "model": r[1],
+                        "verdict": r[2],
+                        "p0": r[3] or 0,
+                        "p1": r[4] or 0,
+                        "p2": r[5] or 0,
+                    })
+    except Exception:
+        return []
+    return rows
+
+
+def _reviewer_run_passed(row):
+    """True if a reviewer_runs row represents a PASS outcome.
+
+    Prefers the stored verdict state (migration 007). Legacy rows
+    (verdict NULL) fall back to the p-count derivation: a run with no
+    P0/P1 findings is treated as PASS.
+    """
+    verdict = (row.get("verdict") or "").upper()
+    if verdict:
+        return verdict == "PASS"
+    return row.get("p0", 0) == 0 and row.get("p1", 0) == 0
+
+
+def _compute_reviewer_outcomes(since=None):
+    """Aggregate reviewer_runs into per-reviewer / per-model outcome rates.
+
+    Returns {"per_reviewer": {...}, "per_review_model": {...}} where each
+    value maps key → {runs, pass, fail, pass_rate, p0_total, p1_total}.
+    Delivers the tms#53 metric unblocked by the tms#71 writer.
+    """
+    per_reviewer = {}
+    per_model = {}
+    for row in _read_reviewer_runs(since):
+        passed = _reviewer_run_passed(row)
+        for dim, key in ((per_reviewer, row["reviewer_agent"]),
+                         (per_model, row["model"])):
+            if not key:
+                key = "unknown"
+            if key not in dim:
+                dim[key] = {
+                    "runs": 0, "pass": 0, "fail": 0,
+                    "pass_rate": 0.0, "p0_total": 0, "p1_total": 0,
+                }
+            d = dim[key]
+            d["runs"] += 1
+            d["pass" if passed else "fail"] += 1
+            d["p0_total"] += row["p0"]
+            d["p1_total"] += row["p1"]
+    for dim in (per_reviewer, per_model):
+        for d in dim.values():
+            d["pass_rate"] = round(d["pass"] / d["runs"], 3) if d["runs"] else 0.0
+    return {"per_reviewer": per_reviewer, "per_review_model": per_model}
+
+
 def compute_stats(since=None):
     """Read events from postgres and compute aggregate dispatch metrics.
 
@@ -740,6 +830,8 @@ def compute_stats(since=None):
       - latency_p50_seconds, latency_p90_seconds
       - completed_sessions
       - per_model: {model: {dispatches, merged, blocked, avg_latency_seconds}}
+      - per_reviewer / per_review_model (tms#71): reviewer_runs outcome
+        rates {key: {runs, pass, fail, pass_rate, p0_total, p1_total}}
     """
     # Read all events from postgres (replaces JSONL file read)
     events = _read_events_from_db(since)
@@ -957,6 +1049,9 @@ def compute_stats(since=None):
     latency_p50 = _percentile(latencies, 50)
     latency_p90 = _percentile(latencies, 90)
 
+    # Reviewer outcome rates from reviewer_runs (tms#71 / tms#53 AC).
+    reviewer_outcomes = _compute_reviewer_outcomes(since)
+
     return {
         "total_dispatches": len(dispatches),
         "total_failed_dispatches": len(failed),
@@ -977,6 +1072,8 @@ def compute_stats(since=None):
         "per_area": per_area,
         "per_point": per_point,
         "per_blocked_class": per_blocked_class,
+        "per_reviewer": reviewer_outcomes["per_reviewer"],
+        "per_review_model": reviewer_outcomes["per_review_model"],
     }
 
 
@@ -1055,6 +1152,29 @@ def format_stats_report(stats, as_json=False, by_label=False,
                 f"{mstats.get('merged', 0):>7} "
                 f"{mstats.get('blocked', 0):>8} "
                 f"{_hms(mstats.get('avg_latency_seconds', 0)):>8}"
+            )
+
+    # Reviewer outcome rates from reviewer_runs (tms#71).
+    for section, dim_data in [
+        ("Per-reviewer outcomes", stats.get("per_reviewer", {})),
+        ("Per-review-model outcomes", stats.get("per_review_model", {})),
+    ]:
+        if not dim_data:
+            continue
+        print()
+        print(f"  {section} (reviewer_runs):")
+        print(f"  {'Key':<24} {'Runs':>5} {'Pass':>5} {'Fail':>5} "
+              f"{'Pass%':>6} {'P0':>4} {'P1':>4}")
+        print(f"  {'─'*24} {'─'*5} {'─'*5} {'─'*5} {'─'*6} {'─'*4} {'─'*4}")
+        for key, rstats in sorted(dim_data.items()):
+            print(
+                f"  {key:<24} "
+                f"{rstats['runs']:>5} "
+                f"{rstats['pass']:>5} "
+                f"{rstats['fail']:>5} "
+                f"{rstats['pass_rate']:>6.0%} "
+                f"{rstats['p0_total']:>4} "
+                f"{rstats['p1_total']:>4}"
             )
 
     # Per-class breakdowns (#76 PR B). Suppress cells with n<5.

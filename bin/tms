@@ -14,7 +14,8 @@
 #          --clear-cache  wipe cached issue data
 #   tms events transitions  poll aoe + tmux panes, emit transition events
 #   tms events stats [opts]  compute and print aggregate metrics report
-#   tms events scan-reviews   list open PRs lacking reviewer verdict (#57)
+#   tms events scan-reviews   list open PRs lacking reviewer verdict (#57) + capture verdicts (#71)
+#   tms events capture-verdicts  capture REVIEW-VERDICT markers into reviewer_runs (#71)
 #   tms wraps scan-wraps     scan terminal transitions, dispatch objective wraps (#82)
 #
 # Keybindings in fzf:
@@ -1527,9 +1528,20 @@ case "${1:-}" in
                 # Independent review poller (tms#57 Phase 2). Default is a
                 # read-only dry run; --dispatch spawns `tmq review` for PRs
                 # with no verdict (capped by --max-dispatch, default 3).
+                # After the scan, verdict markers on open PRs are captured
+                # into tms_review.reviewer_runs (tms#71).
                 shift 2
                 PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" \
                     python3 -m tms.review_poll scan-reviews "$@"
+                ;;
+            capture-verdicts)
+                # Verdict capture (tms#71): scan PR comments/reviews for
+                # <<REVIEW-VERDICT>> markers and insert reviewer_runs rows.
+                # Runs automatically as part of scan-reviews; this arm is
+                # for manual sweeps and backfill (--backfill --since DATE).
+                shift 2
+                PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" \
+                    python3 -m tms.review_poll capture-verdicts "$@"
                 ;;
             dispatch-monitor)
                 # Dispatch-failure SLO monitor (tms#84). Default is dry run;
@@ -1546,6 +1558,8 @@ Usage:
   tms events transitions [--session <name>]  poll aoe + tmux panes (sync flush with --session)
   tms events stats            compute and print aggregate metrics report
   tms events scan-reviews       list open PRs lacking a reviewer verdict (#57)
+                              + capture verdict markers into reviewer_runs (#71)
+  tms events capture-verdicts   capture REVIEW-VERDICT markers into reviewer_runs (#71)
   tms events dispatch-monitor   check dispatch_failed rate against SLO (#84)
 
 Stats options:
@@ -1566,13 +1580,19 @@ Scan-reviews options (tms#57):
                              (default: dry run, no dispatch)
   --max-dispatch <n>         cap dispatches per run (default 3; 0 = scan-only)
   --repo <short>             restrict scan to one registered repo
+  --no-capture               skip the verdict-capture pass (tms#71)
+
+Capture-verdicts options (tms#71):
+  --backfill                 scan merged PRs instead of open PRs
+  --since <YYYY-MM-DD>       only PRs merged on/after this date (with --backfill)
+  --repo <short>             restrict capture to one registered repo
 
 See docs/events-format.md for the event log schema.
 EOF
                 ;;
             *)
                 echo "tms events: unknown subcommand '${2:-}'" >&2
-                echo "Usage: tms events <transitions|stats|scan-reviews|dispatch-monitor>" >&2
+                echo "Usage: tms events <transitions|stats|scan-reviews|capture-verdicts|dispatch-monitor>" >&2
                 exit 1
                 ;;
         esac
