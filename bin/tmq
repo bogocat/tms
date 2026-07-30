@@ -371,9 +371,9 @@ PROMPT
         # (companion PR #70); this is the tms-side wiring.
         local plan_artifact_instruction=""
         if _detect_ui_shaped "$labels" "$title" "$body"; then
-            plan_artifact_instruction="$(cat <<'PLAN_ARTIFACT'
+            plan_artifact_instruction="$(cat <<PLAN_ARTIFACT
 2.5. **UI-shaped feature — plan-artifact gate.** This issue involves visual
-   design choices. Before writing implementation code, use the `plan-artifact`
+   design choices. Before writing implementation code, use the \`plan-artifact\`
    skill to generate a self-contained static HTML artifact rendering each
    design option side-by-side, styled with the target app's Tailwind tokens.
    Save to \`/tmp/plan-artifact-${repo}#${number}.html\`. Record the chosen option
