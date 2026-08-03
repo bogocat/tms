@@ -678,3 +678,27 @@ def test_detect_empty_input_skips():
     """Empty inputs must not crash and must return false."""
     assert not _run_detect_ui_shaped("", "", ""), \
         "empty inputs must return false without crashing"
+
+
+# ── review-prompt verdict contract (2026-08 incident) ────────────
+
+def test_review_prompt_teaches_review_verdict_contract():
+    """Review dispatches must instruct the REVIEW-VERDICT comment line.
+
+    The poller (tms events scan-reviews) parses ONLY
+    <<REVIEW-VERDICT: ...>> comment lines; the review prompt previously
+    taught only <<AGENT-STATE: ...>>, so reviewers posted AGENT-STATE
+    (or a bare GitHub PR review) and the poller waited forever — ~20
+    PRs sat with idle verdict-less reviewers for days (2026-07-30 →
+    2026-08-03).
+    """
+    src = Path(__file__).resolve().parents[1].joinpath("bin/tmq").read_text()
+    m = re.search(r'if \[\[ "\$type" == "review" \]\]; then(.*?)\nPROMPT\n', src, re.S)
+    assert m, "review branch of build_prompt not found"
+    block = m.group(1)
+    assert '<<REVIEW-VERDICT: PASS sha=' in block, \
+        "review prompt no longer teaches the PASS verdict line"
+    assert '<<REVIEW-VERDICT: FAIL sha=' in block, \
+        "review prompt no longer teaches the FAIL verdict line"
+    assert 'gh pr comment' in block, \
+        "review prompt must direct the verdict into a PR comment (PR reviews don't count)"
