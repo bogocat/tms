@@ -321,6 +321,17 @@ $body
 4. Focus on logic errors and design flaws over style nits
 5. Output a structured review: Summary / P0 Issues / P1 Issues / P2 Notes / Overall
 6. $fixup_step
+7. Post the review as a PR COMMENT ('gh pr comment'), and end the comment
+   with EXACTLY one machine-parseable verdict line. The fleet poller
+   (tms events scan-reviews) parses ONLY this line — a review without it
+   is invisible and the PR will be re-dispatched:
+
+     <<REVIEW-VERDICT: PASS sha=<pr-head-sha> rounds=<n> panel=<model,...>>>
+     <<REVIEW-VERDICT: FAIL sha=<pr-head-sha> p0=<n> p1=<n> rounds=<n> panel=<model,...>>>
+
+   sha= must be the PR head at review time ('gh pr view $number --json headRefOid').
+   A GitHub PR *review* (approve/request-changes) alone does NOT count —
+   the verdict line must be in a comment.
 PROMPT
     else
         local issue_json
