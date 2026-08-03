@@ -153,7 +153,11 @@ def test_fresh_dispatch_installs_and_starts(fake_aoe, tmp_path):
     env, state_dir, log_path = fake_aoe
     result = _spawn(env, tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (state_dir / SESSION).read_text() == _expected_cmd()
+    # Suffix, not equality: spawn_agent prepends the node22 PATH prefix
+    # (tms#125) ahead of the invariant pi command — the prefix varies by
+    # host, the suffix is the contract.
+    installed = (state_dir / SESSION).read_text()
+    assert installed.endswith(_expected_cmd()), installed
     assert "session start" in log_path.read_text()
 
 
