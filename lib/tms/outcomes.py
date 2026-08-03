@@ -48,6 +48,8 @@ import json
 import subprocess
 import sys
 
+import psycopg2
+
 # Delegate DB access to tms.events so the tests' sqlite shim
 # (conftest test_db patches events._get_conn) covers this module too.
 from tms import events as _events
@@ -55,6 +57,11 @@ from tms.wrap_on_terminal import REPO_TO_GH as _REPO_TO_GH_FALLBACK
 
 # Outcomes that never change again — skipped without a GitHub call.
 TERMINAL_OUTCOMES = frozenset({"merged", "closed_unmerged"})
+
+# 'unknown' (issue closed-as-completed, no PR link) is not terminal — a PR
+# link can appear retroactively — but re-querying it every 15-min cron run
+# forever is unbounded API cost (P1). Re-check at most once per this window.
+UNKNOWN_RECHECK_HOURS = 24
 
 DEFAULT_SINCE_DAYS = 30
 
@@ -73,9 +80,18 @@ def _run(cmd, timeout=15):
         return ""
 
 
-def _gh_graphql(query):
-    """Run ``gh api graphql``, return the parsed ``data`` dict or None."""
-    out = _run(["gh", "api", "graphql", "-f", f"query={query}"], timeout=30)
+def _gh_graphql(query, variables=None):
+    """Run ``gh api graphql``, return the parsed ``data`` dict or None.
+
+    ``variables`` are passed as ``-F`` flags so identifiers are never
+    string-interpolated into the query (P1: a quote in an org/repo name
+    would break the query syntax and silently return None).
+    """
+    argv = ["gh", "api", "graphql"]
+    for key, val in (variables or {}).items():
+        argv += ["-F", f"{key}={val}"]
+    argv += ["-f", f"query={query}"]
+    out = _run(argv, timeout=30)
     if not out:
         return None
     try:
@@ -130,12 +146,14 @@ def resolve_issue_outcome(gh_repo, issue):
         return None
     owner, name = split
     query = (
-        'query{repository(owner:"%s",name:"%s"){issue(number:%d){'
+        "query($owner:String!,$name:String!,$number:Int!)"
+        "{repository(owner:$owner,name:$name){issue(number:$number){"
         "state stateReason "
         "closedByPullRequestsReferences(first:20,includeClosedPrs:true)"
-        "{nodes{number state}}}}}" % (owner, name, int(issue))
+        "{nodes{number state}}}}}"
     )
-    data = _gh_graphql(query)
+    data = _gh_graphql(
+        query, {"owner": owner, "name": name, "number": int(issue)})
     if not data:
         return None
     issue_node = (data.get("repository") or {}).get("issue")
@@ -169,10 +187,12 @@ def resolve_pr_outcome(gh_repo, pr_number):
         return None
     owner, name = split
     query = (
-        'query{repository(owner:"%s",name:"%s"){pullRequest(number:%d){'
-        "state}}}" % (owner, name, int(pr_number))
+        "query($owner:String!,$name:String!,$number:Int!)"
+        "{repository(owner:$owner,name:$name){pullRequest(number:$number){"
+        "state}}}"
     )
-    data = _gh_graphql(query)
+    data = _gh_graphql(
+        query, {"owner": owner, "name": name, "number": int(pr_number)})
     if not data:
         return None
     pr_node = (data.get("repository") or {}).get("pullRequest")
@@ -191,16 +211,26 @@ def resolve_pr_outcome(gh_repo, pr_number):
 # ── DB access ─────────────────────────────────────────────────────
 
 def _load_existing_outcomes():
-    """Return {aoe_id_prefix: outcome} for all rows in dispatch_outcomes."""
+    """Return {aoe_id_prefix: (outcome, derived_at)} for all rows.
+
+    Fail-soft (P1): a DB error returns {} — the sync then treats every
+    dispatch as unknown-state and re-resolves, which is safe (UPSERT)
+    just not cheap. Matches the events.py DB-read pattern.
+    """
     existing = {}
-    with _events._get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT aoe_id_prefix, outcome "
-                "FROM tms_review.dispatch_outcomes"
-            )
-            for row in cur.fetchall():
-                existing[row[0]] = row[1]
+    try:
+        with _events._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT aoe_id_prefix, outcome, derived_at "
+                    "FROM tms_review.dispatch_outcomes"
+                )
+                for row in cur.fetchall():
+                    existing[row[0]] = (row[1], row[2])
+    except (psycopg2.OperationalError, psycopg2.DatabaseError, OSError) as exc:
+        print(f"  warn: could not load existing outcomes: {exc}",
+              file=sys.stderr)
+        return {}
     return existing
 
 
@@ -211,21 +241,29 @@ def _upsert_outcome(aoe_id_prefix, repo, issue, outcome, derived_via):
     created_at (works on both postgres and the sqlite test shim).
     """
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    with _events._get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO tms_review.dispatch_outcomes
-                   (aoe_id_prefix, repo, issue, outcome,
-                    derived_via, derived_at, created_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (aoe_id_prefix) DO UPDATE SET
-                       outcome = EXCLUDED.outcome,
-                       derived_via = EXCLUDED.derived_via,
-                       derived_at = EXCLUDED.derived_at""",
-                (aoe_id_prefix, repo, int(issue), outcome,
-                 derived_via, now, now),
-            )
-        conn.commit()
+    try:
+        with _events._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO tms_review.dispatch_outcomes
+                       (aoe_id_prefix, repo, issue, outcome,
+                        derived_via, derived_at, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (aoe_id_prefix) DO UPDATE SET
+                           outcome = EXCLUDED.outcome,
+                           derived_via = EXCLUDED.derived_via,
+                           derived_at = EXCLUDED.derived_at,
+                           repo = EXCLUDED.repo,
+                           issue = EXCLUDED.issue""",
+                    (aoe_id_prefix, repo, int(issue), outcome,
+                     derived_via, now, now),
+                )
+            conn.commit()
+    except (psycopg2.OperationalError, psycopg2.DatabaseError, OSError) as exc:
+        print(f"  warn: outcome upsert failed for {aoe_id_prefix}: {exc}",
+              file=sys.stderr)
+        return False
+    return True
 
 
 # ── Sync ──────────────────────────────────────────────────────────
@@ -271,11 +309,26 @@ def sync_outcomes(since_days=DEFAULT_SINCE_DAYS, dry_run=False):
         "skipped_unresolved": 0,
     }
 
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+
+    def _settled(prefix):
+        """Terminal, or a fresh 'unknown' inside its re-check window."""
+        prior = existing.get(prefix)
+        if prior is None:
+            return False
+        outcome, derived_at = prior
+        if outcome in TERMINAL_OUTCOMES:
+            return True
+        if outcome == "unknown" and derived_at:
+            try:
+                age = now_dt - datetime.datetime.fromisoformat(str(derived_at))
+                return age < datetime.timedelta(hours=UNKNOWN_RECHECK_HOURS)
+            except (ValueError, TypeError):
+                return False
+        return False
+
     for (repo, issue, is_review), prefixes in sorted(groups.items()):
-        pending = [
-            p for p in prefixes
-            if existing.get(p) not in TERMINAL_OUTCOMES
-        ]
+        pending = [p for p in prefixes if not _settled(p)]
         summary["skipped_terminal"] += len(prefixes) - len(pending)
         if not pending:
             continue
@@ -301,12 +354,13 @@ def sync_outcomes(since_days=DEFAULT_SINCE_DAYS, dry_run=False):
         outcome, derived_via = resolved
         summary["resolved"] += 1
         for prefix in pending:
+            prior = existing.get(prefix)
+            prior_outcome = prior[0] if prior else "-"
             if dry_run:
                 print(f"  [dry-run] {repo}#{issue} ({prefix}): "
-                      f"{existing.get(prefix, '-')} -> {outcome} "
+                      f"{prior_outcome} -> {outcome} "
                       f"[{derived_via}]")
-            else:
-                _upsert_outcome(prefix, repo, issue, outcome, derived_via)
+            elif _upsert_outcome(prefix, repo, issue, outcome, derived_via):
                 summary["written"] += 1
 
     return summary

@@ -117,40 +117,40 @@ class TestResolveIssueOutcome:
     def test_merged_closing_pr(self, monkeypatch):
         monkeypatch.setattr(
             outcomes, "_gh_graphql",
-            lambda q: _issue_data("CLOSED", "COMPLETED", ["MERGED"]))
+            lambda q, v=None: _issue_data("CLOSED", "COMPLETED", ["MERGED"]))
         assert outcomes.resolve_issue_outcome("bogocat/tms", 112) == \
             ("merged", "gh_closing_prs")
 
     def test_merged_wins_even_with_closed_siblings(self, monkeypatch):
         monkeypatch.setattr(
             outcomes, "_gh_graphql",
-            lambda q: _issue_data("CLOSED", "COMPLETED",
+            lambda q, v=None: _issue_data("CLOSED", "COMPLETED",
                                   ["CLOSED", "MERGED"]))
         assert outcomes.resolve_issue_outcome("bogocat/tms", 1)[0] == "merged"
 
     def test_open_issue_no_pr(self, monkeypatch):
         monkeypatch.setattr(
-            outcomes, "_gh_graphql", lambda q: _issue_data("OPEN"))
+            outcomes, "_gh_graphql", lambda q, v=None: _issue_data("OPEN"))
         assert outcomes.resolve_issue_outcome("bogocat/tms", 2) == \
             ("open", "gh_closing_prs")
 
     def test_open_issue_with_open_pr_still_open(self, monkeypatch):
         monkeypatch.setattr(
             outcomes, "_gh_graphql",
-            lambda q: _issue_data("OPEN", None, ["OPEN"]))
+            lambda q, v=None: _issue_data("OPEN", None, ["OPEN"]))
         assert outcomes.resolve_issue_outcome("bogocat/tms", 3)[0] == "open"
 
     def test_closed_with_unmerged_pr(self, monkeypatch):
         monkeypatch.setattr(
             outcomes, "_gh_graphql",
-            lambda q: _issue_data("CLOSED", "COMPLETED", ["CLOSED"]))
+            lambda q, v=None: _issue_data("CLOSED", "COMPLETED", ["CLOSED"]))
         assert outcomes.resolve_issue_outcome("bogocat/tms", 4) == \
             ("closed_unmerged", "gh_closing_prs")
 
     def test_closed_not_planned_no_pr(self, monkeypatch):
         monkeypatch.setattr(
             outcomes, "_gh_graphql",
-            lambda q: _issue_data("CLOSED", "NOT_PLANNED"))
+            lambda q, v=None: _issue_data("CLOSED", "NOT_PLANNED"))
         assert outcomes.resolve_issue_outcome("bogocat/tms", 5)[0] == \
             "closed_unmerged"
 
@@ -159,24 +159,24 @@ class TestResolveIssueOutcome:
         manual close — never fabricate 'merged'."""
         monkeypatch.setattr(
             outcomes, "_gh_graphql",
-            lambda q: _issue_data("CLOSED", "COMPLETED"))
+            lambda q, v=None: _issue_data("CLOSED", "COMPLETED"))
         assert outcomes.resolve_issue_outcome("bogocat/tms", 6)[0] == \
             "unknown"
 
     def test_gh_failure_returns_none(self, monkeypatch):
-        monkeypatch.setattr(outcomes, "_gh_graphql", lambda q: None)
+        monkeypatch.setattr(outcomes, "_gh_graphql", lambda q, v=None: None)
         assert outcomes.resolve_issue_outcome("bogocat/tms", 7) is None
 
     def test_missing_issue_node_returns_none(self, monkeypatch):
         monkeypatch.setattr(
             outcomes, "_gh_graphql",
-            lambda q: {"repository": {"issue": None}})
+            lambda q, v=None: {"repository": {"issue": None}})
         assert outcomes.resolve_issue_outcome("bogocat/tms", 8) is None
 
     def test_malformed_gh_repo_returns_none(self, monkeypatch):
         called = []
         monkeypatch.setattr(
-            outcomes, "_gh_graphql", lambda q: called.append(q))
+            outcomes, "_gh_graphql", lambda q, v=None: called.append(q))
         assert outcomes.resolve_issue_outcome("no-slash", 9) is None
         assert called == []
 
@@ -196,18 +196,18 @@ class TestResolvePrOutcome:
     ])
     def test_state_mapping(self, monkeypatch, state, expected):
         monkeypatch.setattr(
-            outcomes, "_gh_graphql", lambda q: _pr_data(state))
+            outcomes, "_gh_graphql", lambda q, v=None: _pr_data(state))
         assert outcomes.resolve_pr_outcome("bogocat/tms", 113) == \
             (expected, "gh_pr_state")
 
     def test_gh_failure_returns_none(self, monkeypatch):
-        monkeypatch.setattr(outcomes, "_gh_graphql", lambda q: None)
+        monkeypatch.setattr(outcomes, "_gh_graphql", lambda q, v=None: None)
         assert outcomes.resolve_pr_outcome("bogocat/tms", 113) is None
 
     def test_missing_pr_node_returns_none(self, monkeypatch):
         monkeypatch.setattr(
             outcomes, "_gh_graphql",
-            lambda q: {"repository": {"pullRequest": None}})
+            lambda q, v=None: {"repository": {"pullRequest": None}})
         assert outcomes.resolve_pr_outcome("bogocat/tms", 113) is None
 
 
@@ -372,6 +372,76 @@ class TestSyncOutcomes:
         summary = outcomes.sync_outcomes()
         assert summary["skipped_unresolved"] == 1
         assert _rows(test_db) == []
+
+    def test_gh_failure_preserves_prior_terminal_state(
+            self, test_db, monkeypatch, fixed_registry):
+        """The actual preservation guarantee (review P1-5): a prior
+        'merged' row survives a failed re-sync untouched — outcome AND
+        created_at."""
+        _dispatch("tms", 100, "aaa11111")
+        conn = test_db()
+        conn.cursor().execute(
+            "INSERT INTO dispatch_outcomes "
+            "(aoe_id_prefix, repo, issue, outcome, derived_via, "
+            " derived_at, created_at) "
+            "VALUES ('aaa11111', 'tms', 100, 'merged', 'gh_closing_prs', "
+            "        '2026-07-30T00:00:00+00:00', '2026-07-29T00:00:00+00:00')")
+        conn.commit()
+        monkeypatch.setattr(
+            outcomes, "resolve_issue_outcome", lambda gh, n: None)
+
+        summary = outcomes.sync_outcomes()
+
+        # Terminal row is skipped before any GitHub call, so nothing is
+        # even attempted — and the row is byte-identical afterwards.
+        assert summary["skipped_terminal"] == 1
+        rows = _rows(test_db)
+        assert len(rows) == 1
+        assert rows[0][3] == "merged"
+        assert rows[0][6] == "2026-07-29T00:00:00+00:00"
+
+    def test_fresh_unknown_not_rechecked_within_window(
+            self, test_db, monkeypatch, fixed_registry):
+        """P1-2: an 'unknown' derived <24h ago is not re-queried."""
+        _dispatch("tms", 100, "aaa11111")
+        import datetime as _dt
+        fresh = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        conn = test_db()
+        conn.cursor().execute(
+            "INSERT INTO dispatch_outcomes "
+            "(aoe_id_prefix, repo, issue, outcome, derived_via, "
+            " derived_at, created_at) "
+            f"VALUES ('aaa11111', 'tms', 100, 'unknown', 'gh_closing_prs', "
+            f"        '{fresh}', '{fresh}')")
+        conn.commit()
+        calls = []
+        monkeypatch.setattr(
+            outcomes, "resolve_issue_outcome",
+            lambda gh, n: calls.append((gh, n)) or ("unknown", "gh_closing_prs"))
+
+        outcomes.sync_outcomes()
+        assert calls == [], "fresh unknown must not trigger a GitHub call"
+
+    def test_stale_unknown_rechecked_after_window(
+            self, test_db, monkeypatch, fixed_registry):
+        """P1-2: an 'unknown' older than the window IS re-queried."""
+        _dispatch("tms", 100, "aaa11111")
+        conn = test_db()
+        conn.cursor().execute(
+            "INSERT INTO dispatch_outcomes "
+            "(aoe_id_prefix, repo, issue, outcome, derived_via, "
+            " derived_at, created_at) "
+            "VALUES ('aaa11111', 'tms', 100, 'unknown', 'gh_closing_prs', "
+            "        '2026-07-30T00:00:00+00:00', '2026-07-30T00:00:00+00:00')")
+        conn.commit()
+        calls = []
+        monkeypatch.setattr(
+            outcomes, "resolve_issue_outcome",
+            lambda gh, n: calls.append((gh, n)) or ("merged", "gh_closing_prs"))
+
+        outcomes.sync_outcomes()
+        assert calls == [("bogocat/tms", 100)]
+        assert _rows(test_db)[0][3] == "merged"
 
     def test_unmapped_repo_skipped(self, test_db, monkeypatch):
         _dispatch("mystery-repo", 1, "aaa11111")
