@@ -255,6 +255,26 @@ _detect_ui_shaped() {
     return 1
 }
 
+# ── session naming (tms#138) ─────────────────────────────────────
+# Single source of truth for dispatch session names:
+#   <prefix>-<repo>#<number>[-cc|-oc]     (prefix: feat|fix|chore|review)
+# Used by main() (aoe/tmux session name), the feature prompt (the
+# evidence dir must match the real session name) and the review prompt
+# (the self-close step needs the session's own name). Drift between
+# these means clobbered evidence dirs or a reviewer that can't tear
+# itself down.
+tmq_session_name() {
+    local repo=$1 number=$2 type=$3 agent=${4:-pi}
+    local prefix="$type"
+    [[ "$type" == "feature" ]] && prefix="feat"
+    local name="${prefix}-${repo}#${number}"
+    case "$agent" in
+        cc) name="${name}-cc" ;;
+        oc) name="${name}-oc" ;;
+    esac
+    printf '%s\n' "$name"
+}
+
 build_prompt() {
     local repo=$1 number=$2 type=$3 agent=${4:-pi}
 
@@ -303,6 +323,11 @@ build_prompt() {
    review findings for the human to apply."
         fi
 
+        # tms#138: the reviewer self-closes after posting its verdict —
+        # the prompt needs the session's own name for the teardown step.
+        local review_session
+        review_session=$(tmq_session_name "$repo" "$number" "$type" "$agent")
+
         cat <<PROMPT
 ## Code Review: ${REPO_GH[$repo]}#$number
 
@@ -333,6 +358,16 @@ $body
    sha= must be the PR head at review time ('gh pr view $number --json headRefOid').
    A GitHub PR *review* (approve/request-changes) alone does NOT count —
    the verdict line must be in a comment.
+9. **Lifecycle (tms#138):** you are a reviewer, not the author. Do NOT
+   print <<AGENT-STATE: ...>> markers — those are author-only signals,
+   and MERGE-READY in particular is never a reviewer's call (whether the
+   PR merges is the author/operator's decision after reading your
+   verdict). The verdict comment in step 8 is your only machine-readable
+   output. Once it is posted, your work is complete — self-close this
+   session as your ABSOLUTE FINAL action (it kills the session; nothing
+   you print afterwards will run or be seen):
+
+     aoe rm "$review_session" --purge 2>/dev/null || tmux kill-session -t "$review_session"
 PROMPT
     else
         local issue_json
@@ -411,16 +446,11 @@ PLAN_ARTIFACT
                 ;;
         esac
 
-        # Compute session name matching main()'s convention, including the
-        # agent suffix — the evidence dir must match the real session name or
-        # concurrent pi/cc/oc dispatches of the same issue clobber each other.
-        local session_prefix="$type"
-        [[ "$type" == "feature" ]] && session_prefix="feat"
-        local evidence_session="${session_prefix}-${repo}#${number}"
-        case "$agent" in
-            cc) evidence_session="${evidence_session}-cc" ;;
-            oc) evidence_session="${evidence_session}-oc" ;;
-        esac
+        # The evidence dir must match the real session name (via the shared
+        # tmq_session_name helper) or concurrent pi/cc/oc dispatches of the
+        # same issue clobber each other.
+        local evidence_session
+        evidence_session=$(tmq_session_name "$repo" "$number" "$type" "$agent")
 
         cat <<PROMPT
 ## $type: ${REPO_GH[$repo]}#$number
@@ -1349,21 +1379,9 @@ main() {
     local prompt
     prompt=$(build_prompt "$repo" "$number" "$type" "$agent")
 
-    # Determine session name
+    # Determine session name (shared naming helper — tms#138)
     local session_name
-    case "$type" in
-        review) session_name="review-${repo}#${number}" ;;
-        feature) session_name="feat-${repo}#${number}" ;;
-        fix) session_name="fix-${repo}#${number}" ;;
-        chore) session_name="chore-${repo}#${number}" ;;
-    esac
-
-    # Abbreviate agent in session name
-    case "$agent" in
-        cc) session_name="${session_name}-cc" ;;
-        pi) session_name="${session_name}" ;;     # default, no suffix
-        oc) session_name="${session_name}-oc" ;;
-    esac
+    session_name=$(tmq_session_name "$repo" "$number" "$type" "$agent")
 
     # Log dispatch_failed on cc-root-refusal (spawn_agent returns 1 fast).
     # Track the exit so we can log success/failure on the other path.
