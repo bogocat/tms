@@ -474,9 +474,11 @@ def test_feature_prompt_evidence_directory_per_dispatch():
     """Evidence instructions must reference a per-dispatch directory
     (not a single shared file) so evidence survives concurrent dispatches."""
     body = _build_prompt_feature_instructions()
-    # The evidence path must embed session_prefix/repo/number so it varies per dispatch
-    assert '${session_prefix}' in body and '${repo}' in body and '${number}' in body, \
-        "feature prompt evidence path must be per-dispatch (use session_prefix/repo/number vars)"
+    # The evidence path must embed evidence_session (built from
+    # session_prefix/repo/number + agent suffix) so it varies per dispatch
+    # AND per agent — see test_evidence.py for the suffix-mirror guards.
+    assert '${evidence_session}' in body, \
+        "feature prompt evidence path must be per-dispatch (use ${evidence_session})"
 
 
 def test_feature_prompt_evidence_pr_body_verification():

@@ -400,9 +400,16 @@ PLAN_ARTIFACT
                 ;;
         esac
 
-        # Compute session prefix matching main()'s session_name convention
+        # Compute session name matching main()'s convention, including the
+        # agent suffix — the evidence dir must match the real session name or
+        # concurrent pi/cc/oc dispatches of the same issue clobber each other.
         local session_prefix="$type"
         [[ "$type" == "feature" ]] && session_prefix="feat"
+        local evidence_session="${session_prefix}-${repo}#${number}"
+        case "$agent" in
+            cc) evidence_session="${evidence_session}-cc" ;;
+            oc) evidence_session="${evidence_session}-oc" ;;
+        esac
 
         cat <<PROMPT
 ## $type: ${REPO_GH[$repo]}#$number
@@ -433,9 +440,9 @@ $type_instruction
 $lifecycle_instruction
 ### Evidence-first verification (tms#127)
 Before opening the PR, record concrete evidence for each acceptance criterion:
-   - Create \`~/.tms/evidence/${session_prefix}-${repo}#${number}/\` (your session name).
+   - Create \`~/.tms/evidence/${evidence_session}/\` (your session name).
    - For each AC, write one evidence file (e.g. \`ac1-test-output.txt\`, \`ac2-command-transcript.txt\`) containing the **actual command transcript, test output, or log excerpt** — not prose describing it.
-   - Paste text evidence inline in the PR body \`## Verification\` section, mapping each AC → artifact path. For screenshots: \`gh pr comment --body "## AC<n> evidence" <screenshot>\`.
+   - Paste text evidence inline in the PR body \`## Verification\` section, mapping each AC → artifact path. Screenshots stay in the evidence dir; reference their path in the Verification table.
    - Evidence lives outside the worktree, so it survives cleanup.
 
 Repository: $repo (${REPO_PATH[$repo]})
