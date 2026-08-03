@@ -1550,6 +1550,13 @@ case "${1:-}" in
                 PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" \
                     python3 -m tms.dispatch_monitor check "$@"
                 ;;
+            sync-outcomes)
+                # Dispatch-outcomes writer (tms#119). Resolves outcomes
+                # from GitHub and upserts tms_review.dispatch_outcomes.
+                shift 2
+                PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" \
+                    python3 -m tms.outcomes sync "$@"
+                ;;
             -h|--help)
                 cat <<'EOF'
 tms events — fleet dispatch metrics (issue #53) + review poller (#57)
@@ -1561,6 +1568,8 @@ Usage:
                               + capture verdict markers into reviewer_runs (#71)
   tms events capture-verdicts   capture REVIEW-VERDICT markers into reviewer_runs (#71)
   tms events dispatch-monitor   check dispatch_failed rate against SLO (#84)
+  tms events sync-outcomes      resolve dispatch outcomes from GitHub, upsert
+                                tms_review.dispatch_outcomes (#119)
 
 Stats options:
   --since YYYY-MM-DD         filter events from this date onward
@@ -1587,12 +1596,17 @@ Capture-verdicts options (tms#71):
   --since <YYYY-MM-DD>       only PRs merged on/after this date (with --backfill)
   --repo <short>             restrict capture to one registered repo
 
+Sync-outcomes options (tms#119):
+  --since <days>             only consider dispatches from the last N days
+                             (default 30)
+  --dry-run                  print planned writes without touching the DB
+
 See docs/events-format.md for the event log schema.
 EOF
                 ;;
             *)
                 echo "tms events: unknown subcommand '${2:-}'" >&2
-                echo "Usage: tms events <transitions|stats|scan-reviews|capture-verdicts|dispatch-monitor>" >&2
+                echo "Usage: tms events <transitions|stats|scan-reviews|capture-verdicts|dispatch-monitor|sync-outcomes>" >&2
                 exit 1
                 ;;
         esac

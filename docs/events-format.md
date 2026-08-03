@@ -253,11 +253,55 @@ a short repo name and the dispatch type (`feature`, `fix`, `chore`,
   tms:feature                      8       6     75%      2.0        0     $1.80
 ```
 
+## Dispatch outcomes (`tms_review.dispatch_outcomes`, tms#119)
+
+Outcomes change over time (open → merged/closed), so they live in a
+mutable companion table (migration 004) keyed by `aoe_id_prefix` —
+not on the append-only events table (tms#53 contract). The writer is
+`tms events sync-outcomes` (`python3 -m tms.outcomes sync`), designed
+to be cron-driven every 15 minutes.
+
+### Outcome states (migration 004 CHECK constraint)
+
+| `outcome` | Meaning | Terminal |
+|-----------|---------|----------|
+| `merged` | A closing PR for the dispatched issue was merged (or, for review dispatches, the reviewed PR itself merged) | yes |
+| `closed_unmerged` | Issue closed with only unmerged closing PRs, closed as not-planned, or the reviewed PR closed without merging | yes |
+| `open` | Issue/PR still open — dispatch outcome pending | no |
+| `unknown` | Issue closed as completed with no linked closing PR (e.g. direct-to-main completion) — never fabricated as `merged` | no |
+
+### Derivation rules
+
+- `dispatch_type=review` — the event's `issue` field is a PR number;
+  outcome maps from PR state (`derived_via=gh_pr_state`).
+- Otherwise — GitHub closing-PR references for the dispatched issue
+  (GraphQL `closedByPullRequestsReferences`,
+  `derived_via=gh_closing_prs`): a merged closing PR wins; open issue
+  → `open`; closed issue without a merged closing PR →
+  `closed_unmerged` (or `unknown` when completed with no PR link).
+- gh/network failures skip the row — a transient error never
+  overwrites a previously derived outcome.
+
+### Bounding and idempotency
+
+Each run considers only dispatch events from the last N days
+(`--since DAYS`, default 30), skips rows already terminal before any
+GitHub call, and makes one GitHub call per (repo, issue) group even
+when the issue was re-dispatched. Writes are UPSERTs
+(`ON CONFLICT (aoe_id_prefix) DO UPDATE`) that refresh
+`outcome`/`derived_via`/`derived_at` and preserve `created_at`.
+`--dry-run` prints planned writes without touching the DB.
+
+The repo short-name → gh mapping is derived from
+`tmq list --machine` at run time (falling back to
+`wrap_on_terminal.REPO_TO_GH` for retired short names).
+
 ## Consumers
 
 | Consumer | How |
 |----------|-----|
 | `tms events stats` | Queries `tms_review.events` via `_read_events_from_db()`, computes aggregate metrics |
+| `tms events sync-outcomes` | Resolves dispatch outcomes from GitHub, upserts `tms_review.dispatch_outcomes` (tms#119) |
 | `tms events stats --json` | Outputs JSON for piping to downstream tools |
 | `tms events stats --by-class` | Per-class breakdown with rounds and cost (tms#112) |
 | tms#56 (staleness watchdog) | Queries transition events via postgres |
