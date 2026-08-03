@@ -168,6 +168,12 @@ def resolve_issue_outcome(gh_repo, issue):
         return ("merged", "gh_closing_prs")
     if issue_node.get("state") == "OPEN":
         return ("open", "gh_closing_prs")
+    # Round-4 P1: a full first page (== the first:20 cap) with no merged
+    # PR cannot prove closed_unmerged — the merged ref may be beyond the
+    # page. closed_unmerged is terminal and would never self-correct;
+    # 'unknown' is rechecked (24h window) and can.
+    if len(refs) >= 20 and issue_node.get("stateReason") != "NOT_PLANNED":
+        return ("unknown", "gh_closing_prs_capped")
     # Issue CLOSED with no merged closing PR:
     if refs or issue_node.get("stateReason") == "NOT_PLANNED":
         return ("closed_unmerged", "gh_closing_prs")
@@ -213,9 +219,11 @@ def resolve_pr_outcome(gh_repo, pr_number):
 def _load_existing_outcomes():
     """Return {aoe_id_prefix: (outcome, derived_at)} for all rows.
 
-    Fail-soft (P1): a DB error returns {} — the sync then treats every
-    dispatch as unknown-state and re-resolves, which is safe (UPSERT)
-    just not cheap. Matches the events.py DB-read pattern.
+    Returns None on DB error (round-4 P1: the earlier {} fallback made
+    the sync treat every row — including terminal ones — as unsettled,
+    re-resolving them and bumping derived_at; weaker than the
+    preservation guarantee the tests promise). The caller aborts the
+    sync and surfaces load_failed instead.
     """
     existing = {}
     try:
@@ -230,7 +238,7 @@ def _load_existing_outcomes():
     except (psycopg2.OperationalError, psycopg2.DatabaseError, OSError) as exc:
         print(f"  warn: could not load existing outcomes: {exc}",
               file=sys.stderr)
-        return {}
+        return None
     return existing
 
 
@@ -275,18 +283,34 @@ def sync_outcomes(since_days=DEFAULT_SINCE_DAYS, dry_run=False):
     skipped_unresolved}.
     """
     cutoff = (
-        datetime.date.today() - datetime.timedelta(days=since_days)
+        datetime.datetime.now(datetime.timezone.utc).date()
+        - datetime.timedelta(days=since_days)
     ).isoformat()
     events = _events._read_events_from_db(since=cutoff)
-    dispatches = [
-        e for e in events
-        if e.get("event_type") == "dispatch"
-        and e.get("aoe_id_prefix")
-        and e.get("repo")
-        and e.get("issue") is not None
-    ]
+    dispatches = []
+    for e in events:
+        if (e.get("event_type") != "dispatch" or not e.get("aoe_id_prefix")
+                or not e.get("repo") or e.get("issue") is None):
+            continue
+        # Round-4 P1: a single corrupt issue value must skip the row,
+        # not ValueError-abort the whole sync.
+        try:
+            e = dict(e, issue=int(e["issue"]))
+        except (ValueError, TypeError):
+            print(f"  warn: corrupt issue value {e.get('issue')!r} "
+                  f"({e.get('repo')}, {e.get('aoe_id_prefix')}) — skipped",
+                  file=sys.stderr)
+            continue
+        dispatches.append(e)
 
     existing = _load_existing_outcomes()
+    if existing is None:
+        # Round-4 P1: abort rather than re-resolve terminal rows blind.
+        print("  error: aborting sync — existing outcomes unreadable",
+              file=sys.stderr)
+        return {"checked": 0, "resolved": 0, "written": 0,
+                "skipped_terminal": 0, "skipped_unresolved": 0,
+                "load_failed": True}
 
     # Group by (repo, issue, is_review) so re-dispatches of the same
     # issue cost one GitHub call, then fan the outcome out to every
@@ -294,7 +318,7 @@ def sync_outcomes(since_days=DEFAULT_SINCE_DAYS, dry_run=False):
     groups = {}  # (repo, issue, is_review) -> [aoe_id_prefix, ...]
     for d in dispatches:
         is_review = d.get("dispatch_type") == "review"
-        key = (d["repo"], int(d["issue"]), is_review)
+        key = (d["repo"], d["issue"], is_review)
         prefixes = groups.setdefault(key, [])
         if d["aoe_id_prefix"] not in prefixes:
             prefixes.append(d["aoe_id_prefix"])

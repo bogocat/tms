@@ -443,6 +443,76 @@ class TestSyncOutcomes:
         assert calls == [("bogocat/tms", 100)]
         assert _rows(test_db)[0][3] == "merged"
 
+    def test_corrupt_issue_value_skipped_not_fatal(
+            self, test_db, monkeypatch, fixed_registry):
+        """Round-4 P1-2: one corrupt event must not abort the sync."""
+        _dispatch("tms", 100, "aaa11111")
+        conn = test_db()
+        conn.cursor().execute(
+            "UPDATE events SET issue = NULL, payload = payload "
+            "WHERE aoe_id_prefix = 'zzz99999'")
+        conn.commit()
+        import tms.events as ev
+        real_read = ev._read_events_from_db
+
+        def poisoned(since=None):
+            rows = real_read(since=since)
+            rows.append({"event_type": "dispatch", "aoe_id_prefix": "bad00001",
+                         "repo": "tms", "issue": "abc",
+                         "dispatch_type": "feature"})
+            return rows
+        monkeypatch.setattr(ev, "_read_events_from_db", poisoned)
+        monkeypatch.setattr(
+            outcomes, "resolve_issue_outcome",
+            lambda gh, n: ("merged", "gh_closing_prs"))
+
+        summary = outcomes.sync_outcomes()
+        assert summary["written"] == 1, "good row must still be processed"
+        assert all(r[0] != "bad00001" for r in _rows(test_db))
+
+    def test_load_failure_aborts_sync(self, test_db, monkeypatch,
+                                      fixed_registry):
+        """Round-4 P1-1: unreadable outcomes table aborts the sync
+        (never re-resolves terminal rows blind)."""
+        _dispatch("tms", 100, "aaa11111")
+        monkeypatch.setattr(
+            outcomes, "_load_existing_outcomes", lambda: None)
+        calls = []
+        monkeypatch.setattr(
+            outcomes, "resolve_issue_outcome",
+            lambda gh, n: calls.append(1) or ("merged", "x"))
+
+        summary = outcomes.sync_outcomes()
+        assert summary.get("load_failed") is True
+        assert calls == [], "no GitHub calls after a failed load"
+        assert _rows(test_db) == []
+
+    def test_full_closing_pr_page_degrades_to_unknown(
+            self, test_db, monkeypatch):
+        """Round-4 P1-3: 20 closing-PR refs (== page cap) with no merged
+        PR cannot prove closed_unmerged — degrade to re-checkable
+        unknown."""
+        data = {"repository": {"issue": {
+            "state": "CLOSED", "stateReason": "COMPLETED",
+            "closedByPullRequestsReferences": {
+                "nodes": [{"number": i, "state": "CLOSED"}
+                          for i in range(20)]}}}}
+        monkeypatch.setattr(
+            outcomes, "_gh_graphql", lambda q, v=None: data)
+        assert outcomes.resolve_issue_outcome("bogocat/tms", 1) == (
+            "unknown", "gh_closing_prs_capped")
+
+    def test_under_cap_closed_page_still_closed_unmerged(
+            self, test_db, monkeypatch):
+        data = {"repository": {"issue": {
+            "state": "CLOSED", "stateReason": "COMPLETED",
+            "closedByPullRequestsReferences": {
+                "nodes": [{"number": 1, "state": "CLOSED"}]}}}}
+        monkeypatch.setattr(
+            outcomes, "_gh_graphql", lambda q, v=None: data)
+        assert outcomes.resolve_issue_outcome("bogocat/tms", 1) == (
+            "closed_unmerged", "gh_closing_prs")
+
     def test_unmapped_repo_skipped(self, test_db, monkeypatch):
         _dispatch("mystery-repo", 1, "aaa11111")
         monkeypatch.setattr(outcomes, "load_registry", lambda: {})
