@@ -33,6 +33,13 @@ Valid states (this is the whole vocabulary — do not invent others):
 Three of these stop for a human: 🟡 read a plan, 🔴 answer a question, 🟢 merge.
 Everything else is autonomous. One line per transition — no more, no less.
 
+**These states are author-only.** If you were dispatched as a **reviewer**
+(`--type review` / a `review-…` session), this table is not your contract: you
+never print `<<AGENT-STATE: …>>` (MERGE-READY is never a reviewer's call). A
+reviewer's only machine-readable output is the `<<REVIEW-VERDICT: …>>` line at
+the end of its PR comment, and after posting it the reviewer self-closes its
+session — both are spelled out in the review dispatch prompt (tms#138).
+
 ## Step 0 — Plan gate (STOP for a human)
 
 1. Read the issue. Restate **Scope**, **Out of scope**, and **Acceptance

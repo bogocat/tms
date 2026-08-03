@@ -702,3 +702,78 @@ def test_review_prompt_teaches_review_verdict_contract():
         "review prompt no longer teaches the FAIL verdict line"
     assert 'gh pr comment' in block, \
         "review prompt must direct the verdict into a PR comment (PR reviews don't count)"
+
+
+# ── tms#138: reviewer lifecycle — one marker per role + self-close ──
+# Reviewers were emitting <<AGENT-STATE: MERGE-READY>> (an author-only
+# signal) and then idling at prompt forever — 22 verdict-posted sessions
+# parked in the Aug 3 2026 audit. The review prompt must (a) forbid
+# AGENT-STATE markers, (b) end with a self-close step so the session
+# tears itself down after the verdict comment is posted.
+
+
+def _review_branch_block():
+    """Return the review branch of build_prompt (up to the heredoc end)."""
+    src = BIN_TMQ.read_text()
+    m = re.search(r'if \[\[ "\$type" == "review" \]\]; then(.*?)\nPROMPT\n', src, re.S)
+    assert m, "review branch of build_prompt not found"
+    return m.group(1)
+
+
+def test_review_prompt_forbids_agent_state_markers():
+    """The review prompt must tell reviewers NOT to emit AGENT-STATE —
+    those states (MERGE-READY especially) are author-only signals."""
+    block = _review_branch_block()
+    assert re.search(r'(?:do|Do) NOT\s+(?:print|emit)\s+<<AGENT-STATE', block), \
+        "review prompt no longer forbids AGENT-STATE markers"
+    assert 'author-only' in block, \
+        "review prompt must say AGENT-STATE states are author-only"
+    assert 'MERGE-READY' in block, \
+        "review prompt must name MERGE-READY as never a reviewer's call"
+
+
+def test_review_prompt_self_closes_after_verdict():
+    """After posting the verdict comment the reviewer must tear down its
+    own session — aoe rm --purge with a tmux kill-session fallback."""
+    block = _review_branch_block()
+    assert 'aoe rm' in block and '--purge' in block, \
+        "review prompt lost the aoe rm --purge self-close step"
+    assert 'tmux kill-session' in block, \
+        "review prompt lost the tmux kill-session fallback (non-aoe spawns)"
+
+
+def test_review_self_close_uses_shared_session_name():
+    """The self-close command must interpolate the session's own name,
+    computed by the shared tmq_session_name helper (naming drift between
+    main() and the prompt = a reviewer that can't tear itself down)."""
+    block = _review_branch_block()
+    assert 'tmq_session_name' in block, \
+        "review branch no longer computes its session name via tmq_session_name"
+    assert '$review_session' in block, \
+        "self-close step does not interpolate the review session name"
+
+
+def test_review_self_close_keeps_worktree():
+    """aoe rm must NOT pass --delete-worktree — reviews may share the
+    feature agent's worktree, and teardown must never take it down."""
+    block = _review_branch_block()
+    assert '--delete-worktree' not in block, \
+        "review self-close passes --delete-worktree — would delete a shared worktree"
+
+
+def test_session_name_helper_is_single_source():
+    """tmq_session_name must exist and be the naming source for main()
+    (session name), the feature prompt (evidence dir) and the review
+    prompt (self-close) — no duplicated case-block naming logic."""
+    src = BIN_TMQ.read_text()
+    helper = re.search(r'tmq_session_name\(\)\s*\{.*?^\}', src, re.S | re.M)
+    assert helper, "tmq_session_name helper not found in bin/tmq"
+    body = helper.group(0)
+    assert re.search(r'cc\)\s*name="\$\{name\}-cc"', body), \
+        "tmq_session_name lost the -cc agent suffix"
+    assert re.search(r'oc\)\s*name="\$\{name\}-oc"', body), \
+        "tmq_session_name lost the -oc agent suffix"
+    m = re.search(r'^main\(\)\s*\{.*?^\}', src, re.S | re.M)
+    assert m, "main function not found"
+    assert 'session_name=$(tmq_session_name' in m.group(0), \
+        "main() no longer names sessions via tmq_session_name"

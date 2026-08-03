@@ -24,6 +24,17 @@ than 14 days are skipped as ``skip_stale``. This prevents the 3/run cap
 from burning dispatches on dead PRs that will never reach MERGE-READY.
 PRs with the ``keep-warm`` label are exempt from the staleness filter.
 
+Review-session lifecycle (tms#138, 2026-08-03): a review session ENDS at
+verdict-post. The reviewer's only machine-readable output is the
+REVIEW-VERDICT comment (never ``<<AGENT-STATE: ...>>`` — those are
+author-only), and the review prompt instructs it to self-close (``aoe rm
+--purge`` / ``tmux kill-session``) right after posting. Liveness beyond
+verdict-post is therefore not a re-dispatch blocker by design:
+:func:`live_review_sessions` already excludes ended sessions (dead pane,
+vanished tmux session past the spawn grace — tms#125), and under the V1
+policy verdict-posted PRs are skipped before the live-session check
+anyway.
+
 Public API:
   - REVIEW_VERDICT_RE            regex for the verdict line
   - parse_verdict_line(text)     -> dict | None

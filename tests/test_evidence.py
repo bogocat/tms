@@ -28,7 +28,7 @@ def _evidence_session_logic():
     """Extract the evidence_session computation preceding the prompt heredoc."""
     src = BIN_TMQ.read_text()
     m = re.search(
-        r'local evidence_session=.*?(?=\n\s*cat <<PROMPT)', src, re.S)
+        r'local evidence_session\b.*?(?=\n\s*cat <<PROMPT)', src, re.S)
     assert m, "evidence_session computation not found in bin/tmq"
     return m.group(0)
 
@@ -57,17 +57,23 @@ def test_evidence_dir_uses_full_session_name():
 
 
 def test_evidence_session_mirrors_main_agent_suffix():
-    """evidence_session must append the same per-agent suffixes main() uses
-    for session names (cc -> -cc, oc -> -oc, pi -> none)."""
+    """evidence_session must come from the same tmq_session_name helper
+    main() uses for session names (tms#138), so the per-agent suffixes
+    (cc -> -cc, oc -> -oc, pi -> none) can never drift apart."""
     logic = _evidence_session_logic()
-    assert re.search(r'cc\)\s*evidence_session="\$\{evidence_session\}-cc"', logic), \
-        "cc agent suffix missing from evidence_session"
-    assert re.search(r'oc\)\s*evidence_session="\$\{evidence_session\}-oc"', logic), \
-        "oc agent suffix missing from evidence_session"
-    # main() must still use the same suffix convention this mirrors
+    assert 'tmq_session_name' in logic, \
+        "evidence_session no longer computed via the shared tmq_session_name helper"
     src = BIN_TMQ.read_text()
-    assert re.search(r'cc\)\s*session_name="\$\{session_name\}-cc"', src), \
-        "main() cc suffix convention changed — update evidence_session to match"
+    m = re.search(r'tmq_session_name\(\)\s*\{.*?^\}', src, re.S | re.M)
+    assert m, "tmq_session_name helper not found in bin/tmq"
+    helper = m.group(0)
+    assert re.search(r'cc\)\s*name="\$\{name\}-cc"', helper), \
+        "cc agent suffix missing from tmq_session_name"
+    assert re.search(r'oc\)\s*name="\$\{name\}-oc"', helper), \
+        "oc agent suffix missing from tmq_session_name"
+    # main() must still name sessions via the same helper
+    assert 'session_name=$(tmq_session_name' in src, \
+        "main() no longer names sessions via tmq_session_name"
 
 
 def test_evidence_per_ac_artifact_instruction():
