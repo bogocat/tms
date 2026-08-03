@@ -368,6 +368,30 @@ def _tmq_src():
     return BIN_TMQ.read_text()
 
 
+def _build_prompt_body():
+    """Return the body of the build_prompt function."""
+    src = BIN_TMQ.read_text()
+    m = re.search(r'build_prompt\(\).*?^\}', src, re.S | re.M)
+    assert m, "build_prompt function not found in bin/tmq"
+    return m.group(0)
+
+
+def _build_prompt_review_instructions():
+    """Return the review branch instructions (between '### Review Instructions' and 'PROMPT')."""
+    body = _build_prompt_body()
+    m = re.search(r'### Review Instructions\n(.*?)(?=\nPROMPT)', body, re.S)
+    assert m, "Review Instructions block not found in build_prompt"
+    return m.group(1)
+
+
+def _build_prompt_feature_instructions():
+    """Return the feature branch instructions (between '### Instructions' and 'PROMPT')."""
+    body = _build_prompt_body()
+    m = re.search(r'### Instructions\n(.*?)(?=\nPROMPT)', body, re.S)
+    assert m, "Instructions block not found in build_prompt (feature branch)"
+    return m.group(1)
+
+
 def test_reviewer_panel_map_exists():
     """_reviewer_panel_map must define the hardcoded reviewer→model mapping.
     Maps model IDs to the reviewer agent names that use them. Sourced from
@@ -429,6 +453,64 @@ def test_overlap_check_called_from_main_gated_on_pi():
         "overlap check must be gated on $agent == \"pi\""
 
 
+# ── #127: evidence-first verification ────────────────────────────
+# build_prompt must inject evidence-capture instructions into feature
+# prompts and evidence-check instructions into review prompts, so the
+# AC-verify step produces concrete artifacts rather than prose claims.
+
+
+def test_feature_prompt_includes_evidence_capture():
+    """Feature dispatch prompts must instruct agents to write evidence
+    files to ~/.tms/evidence/<dispatch-id>/ and paste them in the PR
+    body Verification section."""
+    body = _build_prompt_feature_instructions()
+    assert '.tms/evidence' in body, \
+        "feature prompt missing ~/.tms/evidence path instruction"
+    assert 'evidence' in body.lower(), \
+        "feature prompt missing evidence-capture language"
+
+
+def test_feature_prompt_evidence_directory_per_dispatch():
+    """Evidence instructions must reference a per-dispatch directory
+    (not a single shared file) so evidence survives concurrent dispatches."""
+    body = _build_prompt_feature_instructions()
+    # The evidence path must embed evidence_session (built from
+    # session_prefix/repo/number + agent suffix) so it varies per dispatch
+    # AND per agent — see test_evidence.py for the suffix-mirror guards.
+    assert '${evidence_session}' in body, \
+        "feature prompt evidence path must be per-dispatch (use ${evidence_session})"
+
+
+def test_feature_prompt_evidence_pr_body_verification():
+    """Feature prompt must instruct agents to link evidence in the PR
+    body Verification section, not just store it on disk."""
+    body = _build_prompt_feature_instructions()
+    assert 'Verification' in body, \
+        "feature prompt missing PR body Verification section instruction"
+
+
+def test_review_prompt_includes_evidence_check():
+    """Review dispatch prompts must instruct reviewers to verify that
+    evidence artifacts exist for each AC before issuing a verdict."""
+    body = _build_prompt_review_instructions()
+    assert 'evidence' in body.lower(), \
+        "review prompt missing evidence-check instruction"
+    assert 'artifact' in body.lower() or '.tms/evidence' in body, \
+        "review prompt missing artifact/evidence path reference"
+
+
+def test_review_prompt_evidence_less_ac_is_p0():
+    """Review prompt must make clear that a checked AC with no
+    evidence artifact is a P0 finding, not a pass."""
+    body = _build_prompt_review_instructions()
+    # Must indicate that missing evidence is a P0-level issue
+    has_evidence_rule = (
+        ('evidence' in body.lower() and ('P0' in body or 'finding' in body.lower()))
+        or ('no artifact' in body.lower())
+        or ('missing evidence' in body.lower())
+    )
+    assert has_evidence_rule, \
+        "review prompt must classify evidence-less AC as P0/finding"
 # ── #128: plan-artifact UI detection + trigger injection ─────────
 # tms#128: build_prompt must detect UI-shaped issues (area:ui label,
 # UI keywords in title/body) and inject a plan-artifact trigger
