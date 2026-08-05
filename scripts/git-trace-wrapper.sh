@@ -55,11 +55,15 @@ case "$sub" in
                 (( depth++ ))
             done
             pcmd=$(tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null)
-            printf '%s\tcwd=%s\tchain=%s\ttmux=%s/%s\tparent=%.300s\targv=git' \
+            # Build the whole record in memory and append it with a single
+            # write: concurrent traced invocations are the norm during the
+            # episodes this exists to diagnose, and per-field appends would
+            # interleave records across processes.
+            printf -v rec '%s\tcwd=%s\tchain=%s\ttmux=%s/%s\tparent=%.300s\targv=git' \
                 "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" "$chain" \
-                "${TMUX:-}" "${TMUX_PANE:-}" "${pcmd:-?}" >> "$TRACE_LOG"
-            printf ' %q' "$@" >> "$TRACE_LOG"
-            printf '\n' >> "$TRACE_LOG"
+                "${TMUX:-}" "${TMUX_PANE:-}" "${pcmd:-?}"
+            printf -v rec_args ' %q' "$@"
+            printf '%s%s\n' "$rec" "$rec_args" >> "$TRACE_LOG"
         } 2>/dev/null || true
         ;;
 esac
