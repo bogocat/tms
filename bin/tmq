@@ -318,9 +318,11 @@ build_prompt() {
         else
             branch_section="**Worktree:** $TMQ_CWD (main checkout — no feat session to reuse)"
             pull_step="Check out the PR branch and review the diff."
-            fixup_step="Main-checkout case: do not push to the PR branch
-   directly — the PR branch is owned by whoever opened it. Surface
-   review findings for the human to apply."
+            fixup_step="Main-checkout case: you must NEVER run 'git push'
+   in this session — not to the PR branch, not anywhere (tms#137: a
+   reviewer force-advancing a PR branch corrupted it). The PR branch is
+   owned by whoever opened it. Surface review findings in your verdict
+   comment; the author applies them."
         fi
 
         # tms#138: the reviewer self-closes after posting its verdict —

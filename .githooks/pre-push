@@ -9,6 +9,13 @@
 
 set -euo pipefail
 
+# tms#137: git exports an absolute GIT_DIR (plus GIT_PREFIX etc.) to hooks.
+# pytest subprocesses inherit it, and every fixture `git init/commit` then
+# resolves to THIS repo family instead of its tmp target — the mechanism of
+# the recurring core.bare/'test init' clobber. Sanitize before running
+# anything. (Hooks start at the worktree top, so discovery still works.)
+unset "${!GIT_@}"
+
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 

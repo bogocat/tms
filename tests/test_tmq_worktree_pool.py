@@ -14,6 +14,9 @@ import json
 import os
 import pathlib
 import subprocess
+import tempfile
+
+import pytest
 
 TMQ = pathlib.Path(__file__).resolve().parents[1] / "bin" / "tmq"
 
@@ -38,7 +41,20 @@ def _source_tmq_and_run(tmp_path, function_call, env_overrides=None):
 
 
 def _make_test_repo(path):
-    """Create a minimal git repo with a main branch at `path`."""
+    """Create a minimal git repo with a main branch at `path`.
+
+    tms#137: this sequence (git init + empty 'test'-authored 'init'
+    commit) IS the clobber signature seen on the real repo family, so
+    the fixture refuses any target outside a throwaway temp directory —
+    it must be impossible to point at a real checkout.
+    """
+    resolved = pathlib.Path(path).resolve()
+    tmp_root = pathlib.Path(tempfile.gettempdir()).resolve()
+    if tmp_root != resolved and tmp_root not in resolved.parents:
+        raise RuntimeError(
+            f"_make_test_repo refuses non-temp target: {resolved} "
+            f"(must be under {tmp_root})"
+        )
     path.mkdir(parents=True, exist_ok=True)
     git_env = dict(os.environ, GIT_AUTHOR_NAME="test",
                    GIT_AUTHOR_EMAIL="test@test.com",
@@ -48,6 +64,12 @@ def _make_test_repo(path):
                    capture_output=True)
     subprocess.run(["git", "-C", str(path), "commit", "--allow-empty",
                     "-m", "init"], capture_output=True, env=git_env)
+
+
+def test_make_test_repo_refuses_non_temp_target():
+    # tms#137 AC-2: the fixture must be un-runnable against real repos.
+    with pytest.raises(RuntimeError, match="refuses non-temp"):
+        _make_test_repo(pathlib.Path("/root/definitely-not-a-temp-dir"))
 
 
 # ── AC: wt subcommand dispatch exists ────────────────────────────

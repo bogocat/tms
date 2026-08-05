@@ -5,9 +5,20 @@ sqlite3 in-memory connection — same pattern as test_review_eval.py.
 All tests within a module share the same in-memory database.
 """
 
+import os
 import sqlite3
 
 import pytest
+
+# tms#137: git exports an absolute GIT_DIR (plus GIT_PREFIX etc.) into hook
+# environments, and the pre-push hook runs this suite. Subprocesses inherit
+# it, and a git call with GIT_DIR set operates on the REAL repo family no
+# matter what cwd or -C path it is given — which is how the test fixtures
+# (git init + 'test'-authored 'init' commits + pool branches) got planted
+# onto the live repo on every hook run. Strip all GIT_* at import so the
+# suite is hermetic regardless of how it is invoked.
+for _k in [k for k in list(os.environ) if k.startswith("GIT_")]:
+    os.environ.pop(_k, None)
 
 
 # -- events table schema (sqlite3-compatible) --
