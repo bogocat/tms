@@ -1012,6 +1012,7 @@ claude	reviewer-fast
 claude	reviewer-claude
 anthropic/claude-sonnet-4.6	reviewer-fast-api
 glm-5.2	reviewer-zai
+k3	reviewer-kimi
 EOF
 }
 
