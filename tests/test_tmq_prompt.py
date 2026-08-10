@@ -417,6 +417,10 @@ def test_reviewer_panel_map_exists():
         "panel map missing reviewer-fast (claude model)"
     assert 'glm-5.2' in src, \
         "panel map missing reviewer-zai model glm-5.2"
+    assert 'k3' in map_body, \
+        "panel map missing reviewer-kimi model k3"
+    assert 'reviewer-kimi' in map_body, \
+        "panel map missing reviewer-kimi agent"
     assert 'reviewer-fast-api' in src, \
         "panel map missing reviewer-fast-api"
 
