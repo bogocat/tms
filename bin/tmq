@@ -2,7 +2,7 @@
 # tmq — tmux agent queue: spawn a coding agent on a GitHub issue
 #
 # Usage:
-#   tmq <repo> <issue-number> [--agent cc|pi|oc] [--type feature|fix|chore|review]
+#   tmq <repo> <issue-number> [--agent cc|pi|oc|dsh] [--type feature|fix|chore|review]
 #   tmq list                          list known repos
 #   tmq review <repo> <pr-number>     spawn a code review agent on a PR
 #
@@ -78,10 +78,10 @@ usage() {
 tmq — spawn a coding agent on a GitHub issue
 
 Usage:
-  tmq <repo> <issue> [--agent cc|pi|oc] [--type feature|fix|chore|review]
+  tmq <repo> <issue> [--agent cc|pi|oc|dsh] [--type feature|fix|chore|review]
                      [--provider <name>] [--model <id>]
   tmq list
-  tmq review <repo> <pr-number> [--agent cc|pi|oc]
+  tmq review <repo> <pr-number> [--agent cc|pi|oc|dsh]
 
 Examples:
   tmq distillery 245 --agent pi --model MiniMax-M3   # pi on a specific model
@@ -95,6 +95,7 @@ Agents:
   pi    Pi Coding Agent (default, auto mode)
   cc    Claude Code (auto mode)
   oc    Opencode
+  dsh   DeepSeek Harness (headless one-shot, unsandboxed — raw tmux)
 
 Model flags (pi only — forwarded to pi's --provider/--model):
   --provider <name>   Override pi's provider (e.g. minimax)
@@ -271,6 +272,7 @@ tmq_session_name() {
     case "$agent" in
         cc) name="${name}-cc" ;;
         oc) name="${name}-oc" ;;
+        dsh) name="${name}-dsh" ;;
     esac
     printf '%s\n' "$name"
 }
@@ -446,6 +448,9 @@ PLAN_ARTIFACT
             oc)
                 loop_instruction="$agents_md_ptr"
                 ;;
+            dsh)
+                loop_instruction="$agents_md_ptr"
+                ;;
         esac
 
         # The evidence dir must match the real session name (via the shared
@@ -588,8 +593,10 @@ spawn_agent() {
         oc) cmd_override="cat '$prompt_file' | opencode 2>&1; echo; echo '--- OPENCODE DONE ---'; exec bash" ;;
     esac
 
-    # Use Agent of Empires if available (session appears in aoe dashboard + web)
-    if command -v aoe &>/dev/null; then
+    # Use Agent of Empires if available (session appears in aoe dashboard + web).
+    # dsh is excluded: headless one-shot, and aoe rejects --cmd-override for
+    # custom agents (no built-in dsh tool), so dsh runs via the tmux fallback.
+    if command -v aoe &>/dev/null && [[ "$agent" != "dsh" ]]; then
         local wt_flag="" add_ok=0 start_ok=0
         [[ -n "$branch" ]] && wt_flag="-w $branch"
 
@@ -733,6 +740,14 @@ spawn_agent() {
             oc)
                 tmux new-session -d -s "$session_name" -c "$cwd" \
                     "cat '$prompt_file' | opencode 2>&1; echo; echo '--- OPENCODE DONE ---'; exec bash"
+                ;;
+            dsh)
+                local dsh_node_prefix; dsh_node_prefix=$(tmq_node22_prefix)
+                # DSH_PERMISSION_MODE=danger-full-access = unsandboxed + no
+                # approval (parity with pi/cc/oc dispatch; deliberate tradeoff).
+                # The API key resolves from ~/.dsh/.credentials.yaml, never env.
+                tmux new-session -d -s "$session_name" -c "$cwd" \
+                    "${dsh_node_prefix}DSH_PERMISSION_MODE=danger-full-access dsh --profile headless \"\$(cat '$prompt_file')\"; echo; echo '--- DSH DONE ---'; exec bash"
                 ;;
         esac
         echo "Spawned: $session_name ($agent in $cwd)"
@@ -1312,8 +1327,8 @@ main() {
 
     # Validate agent
     case "$agent" in
-        cc|pi|oc) ;;
-        *) echo "Unknown agent: $agent (use cc, pi, or oc)"; exit 1 ;;
+        cc|pi|oc|dsh) ;;
+        *) echo "Unknown agent: $agent (use cc, pi, oc, or dsh)"; exit 1 ;;
     esac
 
     # --provider/--model only mean something for pi (forwarded to pi's flags).
