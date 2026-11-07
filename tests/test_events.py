@@ -134,6 +134,7 @@ def test_log_dispatch_event_resolves_default_model(test_db):
         ("MiniMax-M3", "minimax"),
         ("MiniMax-M3.5", "minimax"),
         ("glm-5.2", "zai"),
+        ("k3.1-pro", "kimi-coding"),
     ],
 )
 def test_log_dispatch_event_resolves_provider_from_explicit_model(

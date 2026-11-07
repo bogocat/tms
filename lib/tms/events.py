@@ -158,6 +158,7 @@ MODEL_TO_PROVIDER = {
     "MiniMax-M3": "minimax",
     "MiniMax-M3.5": "minimax",
     "glm-5.2": "zai",
+    "k3.1-pro": "kimi-coding",
 }
 
 
