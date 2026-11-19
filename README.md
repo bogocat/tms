@@ -152,6 +152,38 @@ Event types: `dispatch` (tmq spawn), `dispatch_failed` (spawn failure),
 `transition` (AGENT-STATE marker change). Full schema and consumer guide
 in [docs/events-format.md](docs/events-format.md).
 
+## Defect register
+
+`tms_review.escaped_defects` is the fleet's defect register (revived in
+tms#156): **one row per `(repo, fingerprint)` forever**. A bug that comes
+back bumps `recurrence_count` — it never inserts a second row. Hand-filed
+pre-#156 rows carry a `manual:` fingerprint derived from
+`repo || defect_class || description`.
+
+`status` is **derived**, never written. It lives in `tms_review.defects_v`:
+
+| status | the fact the row proves |
+|---|---|
+| `regressed` | `regressed_at` — a detector saw the bug come back |
+| `verified` | `verified_at` — a detector passed against the deployed fix |
+| `fixed` | `merged_at` — a fix is merged |
+| `fix-proposed` | `fix_pr` names a fix PR; the merge is unproven |
+| `new` | discovery only |
+
+`detector` is nullable on purpose: a defect with no re-runnable check may not
+claim automatic regression detection, and the schema enforces the
+consequence (`regressed_at` requires `detector`). Detector naming lands with
+intake (#A2); verification is #A3.
+
+```bash
+# Apply (documented path)
+psql service=pg-superuser -f schema/migrations/008-defect-fingerprint.sql
+
+# What the register currently says
+psql service=bogocat_ro \
+  -c 'SELECT status, count(*) FROM tms_review.defects_v GROUP BY 1'
+```
+
 ## Dependencies
 
 - `tmux` — session substrate
