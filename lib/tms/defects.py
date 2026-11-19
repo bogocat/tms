@@ -74,12 +74,25 @@ Persistence: one psycopg2 connection per call, via
 ``review_eval._get_conn()`` (the tms module that owns ``tms_review`` DSN
 handling). Tests monkeypatch that connection for a sqlite3 in-memory shim, so
 the SQL is kept ANSI-shaped; the two postgres-only pieces (the partial-index
-conflict target and ``EXCLUDED``) are exercised against real postgres by the
-``TMS_TEST_PG_SERVICE`` integration test.
+conflict target and ``EXCLUDED``) are exercised against real postgres by
+``tests/test_defect_intake_pg.py`` (gated on ``TMS_TEST_PG_SERVICE``), which runs
+the four-call contract end to end on a throwaway database.
+
+Adopting a row this call did not create
+---------------------------------------
+A sighting by a detector of an existing row that has ``detector IS NULL`` fills
+the detector in (``COALESCE``) — that is what makes a hand-filed row sweepable
+by #159. ``discovery_source`` is **not** rewritten: it keeps the first-sight
+value, because the register records how the defect was first discovered, not who
+re-sighted it. So a row can legitimately read ``discovery_source='manual'`` with
+a detector id set; the live row ``3976ac52-…`` has exactly that shape (a human
+filed it through the CLI, then the detector sweeps adopted it). Pinned by
+``test_detector_adopts_a_row_it_did_not_file_and_keeps_the_first_sight_source``.
 
 CLI: ``tms defect --repo <r> --class <c> --fingerprint <f> --description <d>``
-(see ``main()``). The CLI is the escape hatch that keeps the register complete
-when a detector does not exist yet.
+(``main()`` lands with the CLI in #165; the verb routes to this module). The CLI
+is the escape hatch that keeps the register complete when a detector does not
+exist yet.
 """
 
 import datetime
@@ -310,20 +323,24 @@ _UPSERT_SQL = """
 def _classify(row, new_defect_id):
     """Which of the three things happened, stated, not inferred.
 
-    Two explicit facts about *this call* rather than arithmetic over counters
-    that other calls may have moved:
+    Two facts about *this call* rather than arithmetic over counters that other
+    calls may have moved:
 
     * the row's ``defect_id`` is the uuid this call generated, so this call is
-      what created the row. A legacy row that happens to carry
-      ``recurrence_count = 1`` (all four July rows do) cannot be mistaken for a
-      fresh insert: its id is not ours.
+      what created the row. This arm is exact: a legacy row that happens to
+      carry ``recurrence_count = 1`` (all four July rows do) cannot be mistaken
+      for a fresh insert, because its id is not ours.
     * ``regressed_now`` is computed in the statement as
-      ``regressed_at = <this call's sighting stamp>``. The ``DO UPDATE`` writes
-      exactly that stamp and never rewrites an existing ``regressed_at``, so a
-      true value can only mean this call set it.
+      ``regressed_at = <this call's sighting stamp>``. It is a fact about the
+      *stamp*, not a proof of authorship: the ``DO UPDATE`` writes exactly that
+      stamp and never rewrites an existing ``regressed_at``, so a true value
+      means the row holds the stamp this call wrote — but two sightings in the
+      same microsecond would be indistinguishable by it. That window is
+      accepted rather than papered over; the alternative (a per-call marker
+      column) is a schema change for a case the register does not care about.
 
-    ``recurrence_count == 1`` is deliberately NOT used: it is a fact about the
-    row's history, not about what this call did.
+    ``recurrence_count`` is deliberately NOT used: it is a fact about the row's
+    history, not about what this call did.
     """
     defect_id, recurrence_count, regression_count, inserted_now, regressed_now \
         = row
@@ -378,6 +395,14 @@ def record_defect(repo, defect_class, fingerprint, description, *,
     if not isinstance(description, str) or not description.strip():
         raise ValueError(
             f"description must be a non-empty string, got {description!r}")
+    if not isinstance(severity, str) or not severity.strip():
+        # severity is NOT NULL in postgres, so a None/'' reaching the insert
+        # surfaces as a NotNullViolation from the driver — the wrong layer, and
+        # after the row's uuid has been minted. Reject it here with the argument
+        # named, exactly like description.
+        raise ValueError(
+            "severity must be a non-empty string (use 'ungraded' when a "
+            f"detector cannot grade severity), got {severity!r}")
     validate_fingerprint(fingerprint, detector)
     source = _resolve_discovery_source(detector, discovery_source)
 
