@@ -157,6 +157,47 @@ def test_unknown_defect_class_is_rejected(test_db):
     assert "silent-failure" in DEFECT_CLASSES
 
 
+def test_severity_must_be_a_non_empty_string(test_db):
+    """severity is NOT NULL in postgres; a None/'' must fail here, naming the
+    argument, not as a NotNullViolation from the driver after the uuid is
+    minted."""
+    with pytest.raises(ValueError, match="severity"):
+        _file(test_db, severity=None)
+    with pytest.raises(ValueError, match="severity"):
+        _file(test_db, severity="   ")
+    assert _fetch(test_db, "SELECT count(*) FROM escaped_defects")[0][0] == 0
+
+
+def test_detector_adopts_a_row_it_did_not_file_and_keeps_first_sight_source(
+        test_db):
+    """A detector re-sighting a hand-filed row fills in the detector (that is
+    what makes the row sweepable by #159) but does NOT rewrite discovery_source:
+    the register records how the defect was first discovered.
+
+    This is live row 3976ac52-…'s exact shape — filed by hand through the CLI,
+    adopted by the next sweep."""
+    test_db().cursor().execute(
+        """INSERT INTO escaped_defects (
+               defect_id, repo, defect_class, severity, discovered_at,
+               discovery_source, description, fingerprint, detector,
+               last_seen_at)
+           VALUES ('55555555-5555-5555-5555-555555555555', 'home-portal',
+                   'silent-failure', 'ungraded', '2026-11-19T00:00:00+00:00',
+                   'manual', 'filed by hand', ?, NULL,
+                   '2026-11-19T00:00:00+00:00')""",
+        (FP,),
+    )
+    test_db().commit()
+
+    rec = _file(test_db)
+
+    assert rec.outcome == RECURRED
+    assert _fetch(
+        test_db,
+        "SELECT detector, discovery_source FROM escaped_defects",
+    ) == [("pipeline-health", "manual")]
+
+
 # ── AC1: twice = one row, recurrence 2 ───────────────────────────
 
 

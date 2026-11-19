@@ -175,11 +175,15 @@ assume the one-row invariant covers NULL-fingerprint rows yet.
 | `fix-proposed` | `fix_pr` names a fix PR; the merge is unproven |
 | `new` | discovery only |
 
-`regressed` is a *current* state, not a history flag: a writer clears
-`regressed_at` when a re-fix is verified, and `regression_count` keeps the
-history (#A3 owns that contract). `detector`, `merged_at` and `regressed_at`
-are cross-checked by constraints — a row cannot report a regression it has no
-detector for, nor a regression/verification of a fix it never merged.
+`regressed` is a *current* state, not a history flag: the writer that verifies a
+re-fix clears `regressed_at`, and `regression_count` keeps the history. The
+counter is incremented by **intake, at detection** — the sighting of a verified
+row that sets `regressed_at` — so one regression is counted once. The re-fix
+writer must not touch it (migration 010 replaced the column comment that said the
+reverse; #158/#159 own the clearing side). `detector`, `merged_at` and
+`regressed_at` are cross-checked by constraints — a row cannot report a
+regression it has no detector for, nor a regression/verification of a fix it
+never merged.
 
 `detector` is nullable on purpose: a defect with no re-runnable check may not
 claim automatic regression detection, and the schema enforces the
