@@ -9,8 +9,12 @@
 -- the same DSN. Joins between tms_review and bogocat schemas are
 -- possible without cross-database foreign data wrappers.
 --
+-- NOTE (tms#156): escaped_defects is no longer harness-only. It was built
+-- as this harness's judgement half but now serves as the fleet's defect
+-- register — one row per (repo, fingerprint) forever, with status derived
+-- in tms_review.defects_v. See schema/migrations/008-defect-fingerprint.sql.
+--
 -- Applied by: psql service=pg-superuser -f <this-file>
--- Or via: python3 -c "from tms.review_eval import _apply_migration; _apply_migration()"
 
 BEGIN;
 
@@ -43,7 +47,10 @@ CREATE INDEX idx_reviewer_runs_pr
 CREATE INDEX idx_reviewer_runs_model
     ON tms_review.reviewer_runs (model);
 
--- ── escaped_defects — one row per discovered escaped defect (AC2) ─
+-- ── escaped_defects — the fleet's defect register (AC2) ──────────
+--
+-- Originally the judgement half of this harness; revived as the defect
+-- register in #156 (fingerprint, recurrence, regression, derived status).
 
 CREATE TABLE tms_review.escaped_defects (
     defect_id           UUID PRIMARY KEY,
