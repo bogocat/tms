@@ -43,12 +43,19 @@
 --
 -- Backfill: the 4 pre-#156 rows get a deterministic manual fingerprint,
 --   'manual:' || encode(sha256(repo || defect_class || description), 'hex')
--- (verified collision-free on the live rows), and last_seen_at = created_at.
--- The update is bounded to rows created before the revival cutover
--- (2026-11-19) AND to `fingerprint IS NULL`, so re-running this migration is
--- a no-op: it can never reach a row written by the live writer after the
--- cutover, and it can never re-stamp a row it already fingerprinted. A
--- re-run therefore also cannot collide on the unique index below.
+-- and last_seen_at = created_at. The update is bounded to rows created before
+-- the revival cutover (2026-11-19) AND to `fingerprint IS NULL`, so a re-run
+-- never reaches a row written after the cutover (record_escaped_defect()
+-- leaves created_at to DEFAULT NOW()) and never re-stamps a row it already
+-- fingerprinted.
+--
+-- What the bound does NOT buy: the formula derives identity from prose, so
+-- two pre-cutover rows with the same (repo, defect_class, description) hash
+-- equal. The live population has 4 distinct triples (checked 2026-11-18), but
+-- that is a property of the data, not of the migration. Step 2a therefore
+-- pre-flights for such collisions and RAISEs with the offending defect_ids,
+-- so a bad backfill fails closed with a diagnosis instead of a bare
+-- duplicate-key error from the index built in step 3.
 --
 -- Invariant scope: (repo, fingerprint) uniqueness is enforced for rows that
 -- carry a fingerprint. `record_escaped_defect()` still writes NULL
@@ -109,9 +116,37 @@ ALTER TABLE tms_review.escaped_defects
 -- distinguishable from a detector-derived one. last_seen_at is created_at
 -- because that is the only sighting we can prove for these rows.
 --
--- The created_at bound is what makes the re-run safe: without it, a second
--- run would fingerprint rows the live writer added in the meantime and could
--- abort on the unique index if two of them shared a description.
+-- The created_at bound is what makes a re-run safe against rows the live
+-- writer added in the meantime: without it, a second run would fingerprint
+-- those too and could abort on the unique index if two of them shared a
+-- description.
+
+-- 2a. refuse to run on a colliding pre-cutover population (fail closed with
+-- a diagnosis: which rows, not just 'duplicate key value').
+
+DO $$
+DECLARE
+    collisions TEXT;
+BEGIN
+    SELECT string_agg(format('%s/%s (%s)', repo, defect_class, ids), '; ')
+      INTO collisions
+      FROM (
+          SELECT repo, defect_class, description,
+                 string_agg(defect_id::text, ', ') AS ids
+            FROM tms_review.escaped_defects
+           WHERE fingerprint IS NULL
+             AND created_at < TIMESTAMPTZ '2026-11-19 00:00:00+00'
+           GROUP BY repo, defect_class, description
+          HAVING count(*) > 1
+      ) c;
+
+    IF collisions IS NOT NULL THEN
+        RAISE EXCEPTION
+            'defect backfill would collide on (repo, fingerprint): % -- disambiguate the descriptions before applying',
+            collisions;
+    END IF;
+END
+$$;
 
 UPDATE tms_review.escaped_defects
    SET fingerprint = 'manual:' || encode(
@@ -131,10 +166,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_escaped_defects_repo_fingerprint
 -- ── 4. each status arm must be able to name its fact ─────────────
 --
 -- Same discipline as nullable `detector`: the view will not report a
--- regression or a verification for a row that never proved a merge. A
--- regressed_at or verified_at with merged_at IS NULL claims a fix happened
--- (and got deployed) when the row only shows a named fix PR — the exact
+-- regression or a verification for a row that never proved a merge, and it
+-- will not report a "detector passed" verdict on a row with no detector. A
+-- regressed_at/verified_at with merged_at IS NULL claims a fix happened (and
+-- got deployed) when the row only shows a named fix PR — the exact
 -- unsupported assertion the fix-proposed arm exists to avoid.
+--
+-- Not constrained: `deployed_sha` (evidence of what was running, optional),
+-- and timestamp ordering (merged_at <= verified_at). Ordering belongs to the
+-- #A3 write contract; adding it here would encode a policy this migration
+-- has no writer to honour.
 
 DO $$
 BEGIN
@@ -180,6 +221,27 @@ BEGIN
     END IF;
 END
 $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint
+         WHERE conname = 'escaped_defects_verification_requires_detector'
+           AND conrelid = 'tms_review.escaped_defects'::regclass
+    ) THEN
+        ALTER TABLE tms_review.escaped_defects
+            ADD CONSTRAINT escaped_defects_verification_requires_detector
+            CHECK (verified_at IS NULL OR detector IS NOT NULL);
+    END IF;
+END
+$$;
+
+-- Sequencing note for #A3: the 4 legacy rows carry fix_pr but no merged_at
+-- (we hold no merge fact for them), so the regression/verification arms stay
+-- unreachable for them until a backfill supplies merged_at. That is the
+-- intended order — a deploy fact must exist before anything can claim a fix
+-- was verified or regressed.
 
 -- ── 5. defects_v — status derived, never written ──────────────────
 --
@@ -239,19 +301,16 @@ COMMENT ON COLUMN tms_review.escaped_defects.merged_at IS
     'When a fix for this fingerprint merged. Proves a merge — unlike fix_pr, which only names a PR.';
 
 COMMENT ON COLUMN tms_review.escaped_defects.verified_at IS
-    'When detector passed against the deployed fix.';
+    'When detector passed against the deployed fix. Requires merged_at and detector (CHECKs).';
 
 COMMENT ON COLUMN tms_review.escaped_defects.deployed_sha IS
-    'Commit/image sha the verified fix was actually running as.';
+    'Commit/image sha the fix was actually running as. Optional evidence — verification is gated on merged_at + detector, not on this column.';
 
 COMMENT ON COLUMN tms_review.escaped_defects.regressed_at IS
     'When detector last observed the defect after a merged fix. Requires detector IS NOT NULL and merged_at IS NOT NULL (CHECKs). Currently-regressed state: writers clear it once a re-fix is verified; regression_count keeps the history.';
 
-COMMENT ON COLUMN tms_review.escaped_defects.verified_at IS
-    'When detector passed against the deployed fix. Requires merged_at IS NOT NULL (CHECK).';
-
 COMMENT ON COLUMN tms_review.escaped_defects.regression_count IS
-    'Times the fingerprint regressed after a fix.';
+    'Number of regressions recorded for this fingerprint. The writer increments it when clearing regressed_at (i.e. when a re-fix is verified); #A3 owns that contract.';
 
 COMMENT ON VIEW tms_review.defects_v IS
     'Defect register with derived status (regressed > verified > fixed > fix-proposed > new). Status is never written — it is computed from regressed_at/verified_at/merged_at/fix_pr. One row per (repo, fingerprint), forever.';

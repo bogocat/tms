@@ -149,16 +149,33 @@ def _seed_sql():
     return "\n".join(stmts)
 
 
-def _insert_defect_sql(repo="home-portal", fingerprint=None, description="x"):
+def _insert_defect_sql(repo="home-portal", fingerprint=None, description="x",
+                       created_at="2026-11-20T00:00:00+00:00"):
+    """Insert a row. created_at is explicit (and post-cutover by default) so
+    tests pin the backfill bound's semantics rather than the server clock."""
     defect_id = str(uuid.uuid4())
     fp = "NULL" if fingerprint is None else f"'{fingerprint}'"
     return f"""INSERT INTO tms_review.escaped_defects (
-                    defect_id, repo, introducing_pr, introducing_commit,
-                    defect_class, severity, discovered_at, discovery_source,
-                    description, fingerprint)
-                VALUES ('{defect_id}', '{repo}', 1, 'deadbeef', 'logic',
-                        'minor', '2026-11-18T00:00:00+00:00', 'manual',
-                        '{description}', {fp});"""
+                    defect_id, created_at, repo, introducing_pr,
+                    introducing_commit, defect_class, severity, discovered_at,
+                    discovery_source, description, fingerprint)
+                VALUES ('{defect_id}', '{created_at}', '{repo}', 1, 'deadbeef',
+                        'logic', 'minor', '2026-11-18T00:00:00+00:00',
+                        'manual', '{description}', {fp});"""
+
+
+def _insert_legacy_defect_sql(repo="tms", description="x",
+                              created_at="2026-07-01T00:00:00+00:00"):
+    """Insert a row using only the pre-008 columns (for setup that happens
+    before the migration runs — the fingerprint column does not exist yet)."""
+    return f"""INSERT INTO tms_review.escaped_defects (
+                    defect_id, created_at, repo, introducing_pr,
+                    introducing_commit, defect_class, severity, discovered_at,
+                    discovery_source, description)
+                VALUES ('{uuid.uuid4()}', '{created_at}', '{repo}', 1,
+                        'deadbeef', 'logic', 'minor',
+                        '2026-11-18T00:00:00+00:00', 'manual',
+                        $q${description}$q$);"""
 
 
 @pytest.fixture()
@@ -249,14 +266,20 @@ def test_view_derives_five_arm_status():
 
 def test_backfill_is_guarded_and_uses_fingerprint_formula():
     text = MIGRATION_008.read_text()
-    assert "'manual:'" in text
-    assert "sha256(" in text
+    # pin the WHOLE formula, not just a couple of fragments
+    assert ("sha256(convert_to(repo || defect_class || description, 'UTF8'))"
+            in text)
+    assert "encode(" in text and "'hex'" in text
+    assert "'manual:' || encode(" in text
     assert "last_seen_at = COALESCE(last_seen_at, created_at)" in text
     # Bounded by the revival cutover: an unbounded NULL-fingerprint backfill
     # would re-stamp rows written after the migration and could abort a re-run
     # on the unique index.
     assert "WHERE fingerprint IS NULL" in text
     assert "AND created_at < TIMESTAMPTZ '2026-11-19 00:00:00+00'" in text
+    # ... and the pre-cutover collision is diagnosed before the index exists
+    assert "RAISE EXCEPTION" in text
+    assert "defect backfill would collide" in text
 
 
 def test_status_arms_are_constrained_by_the_schema():
@@ -268,8 +291,13 @@ def test_status_arms_are_constrained_by_the_schema():
          "CHECK (regressed_at IS NULL OR merged_at IS NOT NULL)"),
         ("escaped_defects_verification_requires_merge",
          "CHECK (verified_at IS NULL OR merged_at IS NOT NULL)"),
+        ("escaped_defects_verification_requires_detector",
+         "CHECK (verified_at IS NULL OR detector IS NOT NULL)"),
     ):
-        assert name in text, f"constraint {name} missing"
+        # the constraint must actually be ATTACHED, not merely named
+        assert f"ADD CONSTRAINT {name}" in text, (
+            f"constraint {name} is never added to the table"
+        )
         assert expr in text, f"constraint {name} has no matching CHECK"
 
 
@@ -364,10 +392,11 @@ def test_defects_v_status_vocabulary_after_backfill(scratch_db):
 @_needs_db()
 def test_defects_v_derives_verified_and_regressed(scratch_db):
     service = os.environ[SERVICE_ENV]
-    # detector-less row may not claim a regression
+    # detector-less row may not claim a regression (merged_at set, so the
+    # detector CHECK is the only one that can fire — no ordering dependence)
     bad = _psql(service, "-c", """
         UPDATE tms_review.escaped_defects
-           SET regressed_at = NOW()
+           SET merged_at = NOW() - interval '1 day', regressed_at = NOW()
          WHERE defect_id = '7a80e26e-7663-444e-91e7-ca45a60fc9f5'
     """, dbname=scratch_db, check=False)
     assert bad.returncode != 0
@@ -393,6 +422,16 @@ def test_defects_v_derives_verified_and_regressed(scratch_db):
          WHERE defect_id = '7a80e26e-7663-444e-91e7-ca45a60fc9f5'
     """)
     assert status == "regressed"
+
+    # "detector passed" without a detector is equally unsupported (merged_at
+    # set, so only the detector CHECK can fire)
+    bad = _psql(service, "-c", """
+        UPDATE tms_review.escaped_defects
+           SET merged_at = NOW(), verified_at = NOW()
+         WHERE defect_id = '3508df65-b081-4360-b894-fde0a3d810ef'
+    """, dbname=scratch_db, check=False)
+    assert bad.returncode != 0
+    assert "escaped_defects_verification_requires_detector" in bad.stderr
 
     # verified without a merge is rejected too
     bad = _psql(service, "-c", """
@@ -513,3 +552,44 @@ def test_readme_documents_corrected_vocabulary(scratch_db):
     readme = (MIGRATIONS.parents[1] / "README.md").read_text()
     for status in statuses:
         assert status in readme
+
+
+@_needs_db()
+def test_preflight_rejects_colliding_pre_cutover_rows():
+    """Two pre-cutover rows with the same prose hash equal, so the backfill
+    cannot give both a manual fingerprint. The migration must fail closed with
+    a diagnosis naming the rows — and must not half-apply.
+
+    This is the assertion behind the header's collision caveat; without it the
+    claim would be prose the code cannot falsify.
+    """
+    service = os.environ[SERVICE_ENV]
+    db = f"tms_migtest_col_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    _psql(service, "-c", f'CREATE DATABASE "{db}"')
+    try:
+        for path in sorted(MIGRATIONS.glob("00[1-7]-*.sql")):
+            _psql(service, "-f", str(path), dbname=db)
+        _psql(service, "-c", _seed_sql(), dbname=db)
+        for _ in range(2):
+            _psql(service, "-c", _insert_legacy_defect_sql(
+                repo="tms",
+                description="same prose, filed twice pre-cutover",
+                created_at="2026-07-01T00:00:00+00:00",
+            ), dbname=db)
+
+        bad = _psql(service, "-f", str(MIGRATION_008), dbname=db, check=False)
+        assert bad.returncode != 0
+        assert "defect backfill would collide" in bad.stderr
+        assert "tms" in bad.stderr, "diagnosis must name the colliding repo"
+
+        # fail-closed: the BEGIN/COMMIT rolled back, nothing half-applied
+        (cols,), = _rows(service, db, """
+            SELECT count(*) FROM information_schema.columns
+             WHERE table_schema = 'tms_review'
+               AND table_name = 'escaped_defects'
+               AND column_name = 'fingerprint'
+        """)
+        assert cols == "0"
+    finally:
+        _psql(service, "-c", f'DROP DATABASE IF EXISTS "{db}" WITH (FORCE)',
+              check=False)
