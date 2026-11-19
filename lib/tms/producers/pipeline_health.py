@@ -1,36 +1,57 @@
 """Producer #1 — pipeline-health (tms#157).
 
-Home-portal's ``/admin/pipeline-health`` page computes four silent-failure signal
+Home-portal's ``/admin/pipeline-health`` page computes silent-failure signal
 classes for the V2 book-digest pipeline and then files nothing: someone has to be
 looking at the page. This detector reads the same view that page renders
-(``bogocat.v_pipeline_health_book``) and files one register row per
-``(signal class, book)`` on first sight.
+(``bogocat.v_pipeline_health_book``), plus the run ledger for the reasons the view
+does not carry, and files one register row per ``(signal, book)``.
 
-The four classes, and what each one actually proves:
+The signals, and the fact each one is allowed to claim
+-------------------------------------------------------
+Every signal below states something the query can prove. The distinction between
+``missing-distillation`` and the three reason signals is the whole point: "no
+distillation row" is a fact; **"the pipeline silently failed" is not** — the
+ledger records why for every one of the books that lack a distillation today
+(``insufficient-source-text`` skips and failed ``core-extract`` runs). Filing the
+second claim when only the first is known is the unsupported-assertion pattern
+this register exists to stop, committed by the register itself.
 
-| signal | the view's fact | what it means |
-|---|---|---|
-| ``missing-distillation`` | ``is_missing_distillation`` | a V2 book has no ``book_distillations`` row — the pipeline never finished, silently |
-| ``junction-drift`` | ``is_missing_junctions`` | a distillation exists but a junction table (topics/traditions/quotes) is empty — a pass reported success and wrote nothing |
-| ``quote-decay`` | ``near_verbatim_rate < 0.65`` | the quote-verify pass passed, but the quotes no longer resemble the source |
-| ``stale-run`` | ``stale_running_count > 0`` | passes still marked ``running`` past their per-pass threshold — the batch believes they are in flight |
-
-Fingerprints: ``pipeline-health:<signal>:<item_id>``. The book id is the stable
-key — the same book's junction drift recurring must land on the same row.
+===========================  ===============================================  =====================
+signal                       the fact the query proves                        fingerprint
+===========================  ===============================================  =====================
+``missing-distillation``     no distillation row **and** all 6 required       ``pipeline-health:``
+                             passes recorded success — distillery#173's       ``missing-distillation:``
+                             shape, the pipeline saying OK while writing      ``<item_id>``
+                             no distillation
+``insufficient-source-text``  no distillation, ``core-extract`` never        ``…:insufficient-``
+                             succeeded, and its runs were skipped with        ``source-text:<item_id>``
+                             ``insufficient-source-text: no epub body nor
+                             OCR sidecar found``
+``core-extract-failed``       no distillation, ``core-extract`` never         ``…:core-extract-failed:``
+                             succeeded, and at least one run recorded         ``<item_id>``
+                             ``status='failed'``
+``distillation-stalled``      no distillation although ``core-extract``        ``…:distillation-stalled:``
+                             succeeded (fewer than 6 passes completed)        ``<item_id>``
+``junction-drift``            ``is_missing_junctions``: the junction rows      ``…:junction-drift:<item_id>``
+                             behind the distillation are incomplete
+``quote-decay``               the most recent successful ``quote-verify`` run  ``…:quote-decay:<item_id>``
+                             recorded ``near_verbatim_rate < 0.65``
+``stale-run``                 passes still marked ``running`` past their       ``…:stale-run:<item_id>``
+                             per-pass threshold
+===========================  ===============================================  =====================
 
 Two things this detector deliberately does **not** file:
 
-* the queue-level totals (``v_pipeline_health_queue``) — they are aggregates over
-  the per-book rows below, so filing them would double-count the same fact;
-* anything about a freshly started pipeline. "Not yet run" is not a silent
-  failure, and a row that says otherwise is an assertion the detector cannot
-  support.
+* a book whose pipeline has not run yet — no runs at all is not a silent failure,
+  and a row that says otherwise is an assertion the detector cannot support;
+* the queue-level totals (``v_pipeline_health_queue``) — they aggregate the
+  per-book rows below, so filing them would double-count the same fact.
 
 Repo: ``distillery`` by default. The *detector* is home-portal's health page, but
 the defect is in the book-digest pipeline — distillery writes
 ``book_distillations`` / ``book_topics`` / ``book_traditions`` / ``book_quotes``
-and the run ledger. Filing it against home-portal would send the future reader
-to the wrong repository. ``--repo`` overrides it.
+and the run ledger. Filing it against home-portal would send the future reader to
+the wrong repository. ``--repo`` overrides it.
 
 CLI: ``python3 -m tms.producers.pipeline_health [--repo R] [--dry-run]``
 (scheduled by #159; this module only defines the sweep).
@@ -44,65 +65,161 @@ DETECTOR = "pipeline-health"
 DEFAULT_REPO = "distillery"
 
 #: The floor home-portal's page uses (`near_verbatim_rate < 0.65` counts as
-#: decay, `quotes_count` aside). Kept here as a named constant and mirrored in
-#: the docstring so a threshold change is a visible edit, not a magic number.
+#: decay). Kept here as a named constant so a threshold change is a visible edit.
 NEAR_VERBATIM_FLOOR = 0.65
 
-SQL = """
-    SELECT item_id, title, is_missing_distillation, is_missing_junctions,
-           topics_count, traditions_count, quotes_count,
+#: The six passes the V2 book pipeline requires. `passes_succeeded == 6` is the
+#: only state in which "no distillation" is silent — anything less means the
+#: pipeline recorded a failure or a skip, i.e. it reported.
+REQUIRED_PASSES = 6
+
+#: Column order of :data:`BOOK_SQL`. The rows are turned into dicts through this
+#: tuple so a future SELECT edit fails loudly (see the pinning test) instead of
+#: silently shifting every field one position.
+BOOK_COLUMNS = (
+    "item_id", "title", "passes_succeeded", "is_missing_distillation",
+    "is_missing_junctions", "topics_count", "traditions_count", "quotes_count",
+    "near_verbatim_rate", "stale_running_count",
+)
+
+BOOK_SQL = """
+    SELECT item_id, title, passes_succeeded, is_missing_distillation,
+           is_missing_junctions, topics_count, traditions_count, quotes_count,
            near_verbatim_rate, stale_running_count
       FROM bogocat.v_pipeline_health_book
      ORDER BY item_id
 """
 
+#: Why a distillation is missing lives in the ledger, not the view. `MAX(CASE …)`
+#: keeps this portable (the unit tests run it on sqlite).
+LEDGER_COLUMNS = (
+    "item_id", "skipped_no_source", "core_extract_failed",
+    "core_extract_succeeded",
+)
 
-def find_findings(rows, near_verbatim_floor=NEAR_VERBATIM_FLOOR):
-    """Pure rules: view rows -> findings. No database, no side effects."""
+LEDGER_SQL = """
+    SELECT item_id,
+           MAX(CASE WHEN status = 'skipped'
+                     AND error_detail LIKE 'insufficient-source-text%'
+                    THEN 1 ELSE 0 END) AS skipped_no_source,
+           MAX(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS core_extract_failed,
+           MAX(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS core_extract_succeeded
+      FROM bogocat.media_digest_runs
+     WHERE pass_id = 'core-extract'
+     GROUP BY item_id
+"""
+
+
+def _rows_as_dicts(columns, rows):
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def find_findings(book_rows, ledger_rows, near_verbatim_floor=NEAR_VERBATIM_FLOOR):
+    """Pure rules: view dicts + ledger dicts -> findings. No side effects."""
+    ledger = {row["item_id"]: row for row in ledger_rows}
     findings = []
-    for (item_id, title, missing_distillation, missing_junctions,
-         topics, traditions, quotes, near_verbatim_rate,
-         stale_running) in rows:
+
+    for book in book_rows:
+        item_id = book["item_id"]
         key = str(item_id)
+        title = book.get("title")
         label = f"book {item_id}" + (f" ({title})" if title else "")
 
-        if bool(missing_distillation):
-            findings.append(Finding(
-                "missing-distillation", key,
-                f"{label} has no book_distillations row: the V2 digest pipeline "
-                "never produced a distillation for it and reported no failure",
-            ))
-        if bool(missing_junctions):
+        passes = int(book.get("passes_succeeded") or 0)
+        missing_distillation = bool(book.get("is_missing_distillation"))
+        run = ledger.get(item_id)
+
+        if missing_distillation:
+            findings.extend(_missing_distillation_findings(
+                item_id, label, passes, run))
+
+        if bool(book.get("is_missing_junctions")):
             findings.append(Finding(
                 "junction-drift", key,
-                f"{label} has a distillation but its junctions are incomplete "
-                f"(topics={topics}, traditions={traditions}, quotes={quotes}) — "
-                "a pass recorded success without writing them",
+                f"{label} has a distillation but its junction rows are "
+                f"incomplete (topics={book.get('topics_count')}, "
+                f"traditions={book.get('traditions_count')}, "
+                f"quotes={book.get('quotes_count')}). The view proves the "
+                "junctions are incomplete; it does not say which step dropped "
+                "them (the canonical_map projection, #171, owns that).",
             ))
+
+        near_verbatim_rate = book.get("near_verbatim_rate")
         if near_verbatim_rate is not None and \
                 float(near_verbatim_rate) < near_verbatim_floor:
             findings.append(Finding(
                 "quote-decay", key,
-                f"{label} near_verbatim_rate={float(near_verbatim_rate):.2f} < "
-                f"{near_verbatim_floor}: quote-verify passed but the quotes no "
-                "longer resemble the source",
+                f"{label}: the most recent successful quote-verify run recorded "
+                f"near_verbatim_rate={float(near_verbatim_rate):.2f} < "
+                f"{near_verbatim_floor} — the quotes no longer resemble the "
+                "source",
             ))
-        if int(stale_running or 0) > 0:
+
+        stale_running = int(book.get("stale_running_count") or 0)
+        if stale_running > 0:
             findings.append(Finding(
                 "stale-run", key,
-                f"{label} has {int(stale_running)} run(s) still marked running "
-                "past their per-pass threshold",
+                f"{label} has {stale_running} run(s) still marked running past "
+                "their per-pass threshold",
             ))
+
+    return findings
+
+
+def _missing_distillation_findings(item_id, label, passes, run):
+    """Split "no distillation" into the facts that explain it — never guess."""
+    key = str(item_id)
+    findings = []
+
+    if passes >= REQUIRED_PASSES:
+        findings.append(Finding(
+            "missing-distillation", key,
+            f"{label} has no book_distillations row although all "
+            f"{REQUIRED_PASSES} required passes recorded success — the pipeline "
+            "reported OK and produced no distillation (distillery#173)",
+        ))
+        return findings
+
+    if run is None:
+        # No core-extract runs at all: not yet attempted. Not a silent failure,
+        # and the register will not claim one.
+        return findings
+
+    never_succeeded = not bool(run.get("core_extract_succeeded"))
+    if never_succeeded and bool(run.get("skipped_no_source")):
+        findings.append(Finding(
+            "insufficient-source-text", key,
+            f"{label} has no book_distillations row and {passes} of "
+            f"{REQUIRED_PASSES} passes succeeded: every core-extract run was "
+            "skipped with 'insufficient-source-text: no epub body nor OCR "
+            "sidecar found', so no distillation could be produced",
+        ))
+    if never_succeeded and bool(run.get("core_extract_failed")):
+        findings.append(Finding(
+            "core-extract-failed", key,
+            f"{label} has no book_distillations row and {passes} of "
+            f"{REQUIRED_PASSES} passes succeeded: core-extract never succeeded "
+            "for it and at least one run recorded status='failed'",
+        ))
+    if not never_succeeded:
+        findings.append(Finding(
+            "distillation-stalled", key,
+            f"{label} has no book_distillations row although core-extract "
+            f"succeeded: {passes} of {REQUIRED_PASSES} passes completed and the "
+            "downstream chain never produced a distillation",
+        ))
     return findings
 
 
 def collect(near_verbatim_floor=NEAR_VERBATIM_FLOOR):
-    return find_findings(fetch(SQL), near_verbatim_floor=near_verbatim_floor)
+    books = _rows_as_dicts(BOOK_COLUMNS, fetch(BOOK_SQL))
+    ledger = _rows_as_dicts(LEDGER_COLUMNS, fetch(LEDGER_SQL))
+    return find_findings(books, ledger, near_verbatim_floor=near_verbatim_floor)
 
 
 def sweep(repo=DEFAULT_REPO, dry_run=False, write=print,
           near_verbatim_floor=NEAR_VERBATIM_FLOOR):
-    """Read the pipeline health view and file every finding."""
+    """Read the pipeline health view + ledger and file every finding."""
     findings = collect(near_verbatim_floor=near_verbatim_floor)
     return file_findings(DETECTOR, repo, findings, dry_run=dry_run, write=write)
 

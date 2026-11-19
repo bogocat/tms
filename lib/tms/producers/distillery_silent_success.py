@@ -18,11 +18,11 @@ A pass is judged empty only when **every** field it must write is empty: a
 canonical-map run that mapped topics but no traditions did write something, and
 calling that "wrote nothing" would be an over-claim.
 
-Fingerprints: ``distillery-silent-success:<signal>:<item_id>``. Runs of the same
-pass for the same item are grouped into one finding (with the run count in the
-description), so a book whose mapping silently failed twice is one row with
-``recurrence_count``, not two rows — the item is the stable identity, the run is
-not.
+Fingerprints: ``distillery-silent-success:<signal>:<item_id>``. Only the latest
+successful run per ``(item, pass)`` is judged, so a superseded empty run stops
+being a current finding — the item is the stable identity, the run is not, and a
+re-run that wrote content is the pipeline's own statement that the earlier run
+is no longer the state of the world.
 
 Why the window defaults to the whole ledger: an old silent success is still a
 silent success, and a bounded window would hide exactly the class of defect this
@@ -100,13 +100,31 @@ def _is_empty(value):
 
 
 def find_findings(rows):
-    """Pure rules: run-ledger rows -> findings, grouped per (item, pass)."""
-    grouped = {}
-    for item_id, pass_id, _started_at, ended_at, artifact in rows:
+    """Pure rules: run-ledger rows -> findings, one per (item, pass).
+
+    Only the **latest successful run** per ``(item_id, pass_id)`` is judged. An
+    empty payload from a run that a later run superseded is history, not a
+    current defect: without this, every sweep re-files findings for items that
+    have since been re-run successfully and ``recurrence_count`` climbs for a
+    fixed defect. (There is no "resolved" write path yet — #158/#159 — so the
+    detector has to be honest about what is still true.)
+    """
+    latest = {}
+    for row in rows:
+        item_id, pass_id, started_at, ended_at, artifact = row
         rule = RULES.get(pass_id)
         if rule is None:
             continue
-        payload = _json_payload(artifact)
+        stamp = str(ended_at or started_at or "")
+        key = (item_id, pass_id)
+        if key not in latest or stamp >= latest[key]["stamp"]:
+            latest[key] = {"stamp": stamp, "ended_at": ended_at,
+                           "artifact": artifact, "rule": rule}
+
+    findings = []
+    for (item_id, pass_id), entry in sorted(latest.items()):
+        rule = entry["rule"]
+        payload = _json_payload(entry["artifact"])
         # The fields must be PRESENT and empty. A pass id can be reused by a
         # different pipeline version whose payload has other keys entirely
         # (`core-extract` v3 writes scene_summaries/best_lines, not
@@ -116,23 +134,10 @@ def find_findings(rows):
             continue
         if not all(_is_empty(payload[field]) for field in rule.fields):
             continue
-        entry = grouped.setdefault((item_id, pass_id),
-                                   {"runs": 0, "last_ended": None})
-        entry["runs"] += 1
-        stamp = str(ended_at) if ended_at is not None else None
-        if stamp and (entry["last_ended"] is None
-                      or stamp > str(entry["last_ended"])):
-            entry["last_ended"] = stamp
-
-    findings = []
-    for (item_id, pass_id), entry in sorted(grouped.items()):
-        rule = RULES[pass_id]
-        runs = entry["runs"]
-        run_phrase = "1 run" if runs == 1 else f"{runs} runs"
         findings.append(Finding(
             rule.signal, str(item_id),
-            f"{pass_id} recorded status='success' in {run_phrase} for item "
-            f"{item_id} (last ended {entry['last_ended']}) and {rule.explanation}",
+            f"the most recent successful {pass_id} run for item {item_id} "
+            f"(ended {entry['ended_at']}) wrote nothing and {rule.explanation}",
         ))
     return findings
 
