@@ -14,6 +14,8 @@
 #          --clear-cache  wipe cached issue data
 #   tms events transitions  poll aoe + tmux panes, emit transition events
 #   tms events stats [opts]  compute and print aggregate metrics report
+#   tms defect --repo <r> --class <c> --fingerprint <f> --description <d>
+#                            file a defect into the register (tms#157)
 #   tms events scan-reviews   list open PRs lacking reviewer verdict (#57) + capture verdicts (#71)
 #   tms events capture-verdicts  capture REVIEW-VERDICT markers into reviewer_runs (#71)
 #   tms wraps scan-wraps     scan terminal transitions, dispatch objective wraps (#82)
@@ -1505,6 +1507,15 @@ case "${1:-}" in
         shift
         import_session "$@"
         ;;
+    defect)
+        # tms defect — defect-register intake (tms#157). Same semantics as a
+        # producer's record_defect(): one row per (repo, fingerprint) forever,
+        # a recurrence bumps recurrence_count, and the outcome is printed so
+        # "took ownership" never reads as "recorded fresh".
+        shift
+        PYTHONPATH="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" \
+            python3 -m tms.defects "$@"
+        ;;
     events)
         # tms events — fleet dispatch metrics (issue #53) + independent
         # review poller (issue #57) + dispatch_failed SLO monitor (#84).
@@ -1717,7 +1728,7 @@ EOF
         if is_known_repo "$1"; then
             issue_browser "$1"
         else
-            echo "Usage: tms [ls|kill <name>|rename <name>|stale|clean|compact|issues [repo|--all|--force]|issues --clear-cache|new|import|<repo>]"
+            echo "Usage: tms [ls|kill <name>|rename <name>|stale|clean|compact|issues [repo|--all|--force]|issues --clear-cache|new|import|defect --repo <r> --class <c> --fingerprint <f> --description <d>|<repo>]"
             echo "       tms --all | --raw | --view <mode> | --force"
             exit 1
         fi
