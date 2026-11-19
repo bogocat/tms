@@ -46,13 +46,30 @@ import yaml
 _DB_CONF_PATH = os.path.expanduser("~/.config/bogocat/db.conf")
 
 
+def _db_conf_path():
+    """Path of the db.conf to read.
+
+    ``TMS_DB_CONF`` overrides the fleet's standard path so a throwaway
+    database (migration/integration verification) can be targeted without
+    touching ``~/.config/bogocat/db.conf``. Unset — the normal case for every
+    dispatch, cron and test — this returns exactly the path it always did.
+    """
+    override = os.environ.get("TMS_DB_CONF")
+    if override:
+        return os.path.expanduser(override)
+    return _DB_CONF_PATH
+
+
 def _read_db_config():
     """Parse db.conf into a dict {host, dbname, user, password}.
 
     Format: space-separated key=value pairs on one line.
     Example: host=10.89.97.212 dbname=postgres user=bogocat password=...
+
+    Reads ``_db_conf_path()`` (i.e. ``$TMS_DB_CONF`` if set, else the fleet
+    default).
     """
-    with open(_DB_CONF_PATH) as f:
+    with open(_db_conf_path()) as f:
         raw = f.read().strip()
     config = {}
     for token in raw.split():

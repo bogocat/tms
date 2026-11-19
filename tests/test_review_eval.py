@@ -1199,3 +1199,44 @@ class TestBackjudgeConfirm:
             assert len(defects2) == 1
             attrs2 = _query_all(conn, "defect_attributions")
             assert len(attrs2) == 3
+
+
+# ── db.conf path (TMS_DB_CONF, tms#157) ──────────────────────────
+#
+# review_eval is on the harness's live path, so the env override that lets a
+# throwaway database be targeted must not change the default behaviour by one
+# byte. These tests are the guard: no env var -> the fleet's standard path,
+# read exactly as before; env var set -> that path.
+
+def test_db_conf_path_default_is_the_fleet_path(monkeypatch):
+    from tms import review_eval
+
+    monkeypatch.delenv("TMS_DB_CONF", raising=False)
+    assert review_eval._db_conf_path() == os.path.expanduser(
+        "~/.config/bogocat/db.conf"
+    )
+
+
+def test_read_db_config_uses_the_default_path_when_no_override(
+        monkeypatch, tmp_path):
+    from tms import review_eval
+
+    conf = tmp_path / "db.conf"
+    conf.write_text("host=127.0.0.1 dbname=default-path user=u password=p")
+    monkeypatch.delenv("TMS_DB_CONF", raising=False)
+    monkeypatch.setattr(review_eval, "_DB_CONF_PATH", str(conf))
+
+    assert review_eval._read_db_config() == {
+        "host": "127.0.0.1", "dbname": "default-path",
+        "user": "u", "password": "p",
+    }
+
+
+def test_read_db_config_honours_the_env_override(monkeypatch, tmp_path):
+    from tms import review_eval
+
+    conf = tmp_path / "scratch-db.conf"
+    conf.write_text("host=127.0.0.1 dbname=scratch user=u password=p")
+    monkeypatch.setenv("TMS_DB_CONF", str(conf))
+
+    assert review_eval._read_db_config()["dbname"] == "scratch"
