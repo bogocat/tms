@@ -186,9 +186,16 @@ claim automatic regression detection, and the schema enforces the
 consequence (`regressed_at` requires `detector`). Detector naming lands with
 intake (#A2); verification is #A3.
 
+`introducing_pr` and `introducing_commit` are nullable too (migration 009), for
+the same reason: a defect filed by a detector has **no introducing PR** to name,
+and storing `0` or `''` to satisfy a NOT NULL would be exactly the fabricated
+fact the `fix_pr`-is-not-`fixed` rule exists to prevent.
+
 ```bash
-# Apply (documented path)
+# Apply (documented path) — in order; an operator who stops at 008 leaves the
+# register unable to accept a detector-filed row.
 psql service=pg-superuser -f schema/migrations/008-defect-fingerprint.sql
+psql service=pg-superuser -f schema/migrations/009-defect-intake-nullable.sql
 
 # What the register currently says
 psql service=bogocat_ro \
