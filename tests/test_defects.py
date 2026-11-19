@@ -103,6 +103,18 @@ def test_detector_must_be_a_slug():
         validate_fingerprint("bad detector:x:1", detector="bad detector")
 
 
+def test_detector_shaped_fingerprint_without_a_detector_is_rejected():
+    """A three-segment fingerprint is detector-derived by convention. Filing one
+    without its ``detector`` leaves a row #159 can never re-check — this exact
+    mistake shipped a real CLI call on 2026-11-19 and landed an unsweepable row,
+    because the prefix rule could only fire when a detector was supplied."""
+    with pytest.raises(ValueError, match="detector"):
+        validate_fingerprint("distillery-silent-success:empty-mapping:63")
+
+    # the hand-filed form is unaffected: two segments, 'manual:<hash>'
+    validate_fingerprint("manual:" + "d" * 64)
+
+
 def test_detector_source_requires_a_detector(test_db):
     with pytest.raises(ValueError, match="detector"):
         _file(test_db, detector=None, discovery_source="detector")

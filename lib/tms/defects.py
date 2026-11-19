@@ -215,6 +215,14 @@ def validate_fingerprint(fingerprint, detector=None):
             f"fingerprint has an empty segment: {fingerprint!r}")
 
     if detector is None:
+        if len(segments) >= 3:
+            raise ValueError(
+                f"fingerprint {fingerprint!r} has {len(segments)} segments, "
+                "which by convention means it is detector-derived "
+                "('<detector>:<signal>:<stable-key>') — pass the detector id. "
+                "A detector-prefixed fingerprint filed without its detector "
+                "cannot be swept later (#159 selects on detector IS NOT NULL). "
+                "Hand-filed rows use 'manual:<sha256>'.")
         return
 
     if not _DETECTOR_RE.match(detector):
