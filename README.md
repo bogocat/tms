@@ -71,7 +71,23 @@ tms issues [repo]    browse open GitHub issues + dispatch agents
 tms new              create a GitHub issue (gh issue create wrapper)
 tms import           wrap a legacy c/o/p scratch session as aoe
 tms events           fleet dispatch metrics (issue #53)
+tms defect           file a defect into the register (tms#157)
 ```
+
+### tms defect — defect register intake (tms#157)
+
+```
+tms defect --repo <r> --class <c> --fingerprint <f> --description <d>
+           [--detector <id>] [--severity <s>] [--source <s>]
+           [--introducing-pr <n>] [--introducing-commit <sha>]
+           [--discovered-at <iso>] [--dry-run] [--json]
+```
+
+One row per `(repo, fingerprint)` forever: a second sighting bumps
+`recurrence_count`, a sighting of a verified row sets `regressed_at`. Prints the
+outcome (`inserted` / `recurred` / `regressed`) — never just an id. See
+[docs/defect-intake.md](docs/defect-intake.md) for the fingerprint convention
+and the producer contract.
 
 ### tms events — fleet dispatch metrics + review poller
 
