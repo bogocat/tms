@@ -15,7 +15,6 @@
 -- in tms_review.defects_v. See schema/migrations/008-defect-fingerprint.sql.
 --
 -- Applied by: psql service=pg-superuser -f <this-file>
--- Or via: python3 -c "from tms.review_eval import _apply_migration; _apply_migration()"
 
 BEGIN;
 

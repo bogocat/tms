@@ -16,11 +16,18 @@ Two layers:
       TMS_TEST_PG_SERVICE=pg-superuser pytest \
           tests/test_defect_register_migration.py -v
 
-The integration tests never touch the unified instance: they only create
-and drop a ``tms_migtest_<pid>_<rand>`` database.
+The integration tests do not mutate the unified database: they only create
+and drop their own ``tms_migtest_<pid>_<rand>`` database. Note that the
+``pg-superuser`` service points at the production *server*, so a run does
+create a (throwaway) database there; the fixture drops it in ``finally``.
+If a run is SIGKILLed, clean up with:
+``psql "service=pg-superuser dbname=postgres" -c "\\l tms_migtest*"`` and
+``dropdb`` (no shared objects or privileges are touched — grants and
+``ALTER DEFAULT PRIVILEGES`` inside the scratch DB are per-database).
 """
 
 import os
+import re
 import subprocess
 import uuid
 from pathlib import Path
@@ -43,7 +50,9 @@ NEW_COLUMNS = [
     "regression_count",
 ]
 
-# The four rows exactly as they stood on 2026-11-18 (bogocat_ro read).
+# The four rows exactly as they stood on 2026-11-18 (bogocat_ro read),
+# including their created_at — the backfill is cutover-bounded, so the
+# fixture must carry the real (pre-cutover) timestamps.
 LIVE_ROWS = [
     (
         "7a80e26e-7663-444e-91e7-ca45a60fc9f5", "home-portal", 102,
@@ -54,6 +63,7 @@ LIVE_ROWS = [
         "every render. Fix: commit "
         "ce0d29b61357a93fe0134c77e76a4d56aedbac33",
         102,
+        "2026-07-12T05:09:59.449635+00:00",
     ),
     (
         "bbb46d6b-d302-4a2a-8e3e-bcddf6ef71df", "pi-dotfiles", 9,
@@ -63,6 +73,7 @@ LIVE_ROWS = [
         "panel= provenance rests on model self-report, which the contract "
         "forbids. [prompt-contract] Fix: pi-dotfiles#12",
         None,
+        "2026-07-13T02:05:17.137997+00:00",
     ),
     (
         "3508df65-b081-4360-b894-fde0a3d810ef", "pi-dotfiles", 9,
@@ -72,6 +83,7 @@ LIVE_ROWS = [
         "merged in same PR requires per-dispatch operator decision — both "
         "normative, contradictory. [prompt-contract] Fix: pi-dotfiles#13",
         None,
+        "2026-07-13T02:05:17.149914+00:00",
     ),
     (
         "b7369835-3b66-47d6-9262-c66fe5e78dd5", "pi-dotfiles", 10,
@@ -82,6 +94,7 @@ LIVE_ROWS = [
         "gate-injector's own decision point. [prompt-contract] Fix: "
         "pi-dotfiles#15",
         None,
+        "2026-07-13T02:05:17.164669+00:00",
     ),
 ]
 
@@ -122,16 +135,16 @@ def _seed_sql():
     """INSERT the four live rows using dollar-quoted text (quote-safe)."""
     stmts = []
     for (defect_id, repo, pr, commit, cls, sev, discovered, source,
-         description, fix_pr) in LIVE_ROWS:
+         description, fix_pr, created_at) in LIVE_ROWS:
         fix = "NULL" if fix_pr is None else str(fix_pr)
         stmts.append(
             f"""INSERT INTO tms_review.escaped_defects (
-                    defect_id, repo, introducing_pr, introducing_commit,
-                    defect_class, severity, discovered_at, discovery_source,
-                    description, fix_pr)
-                VALUES ('{defect_id}', '{repo}', {pr}, '{commit}', '{cls}',
-                        '{sev}', '{discovered}', '{source}', $q${description}$q$,
-                        {fix});"""
+                    defect_id, created_at, repo, introducing_pr,
+                    introducing_commit, defect_class, severity, discovered_at,
+                    discovery_source, description, fix_pr)
+                VALUES ('{defect_id}', '{created_at}', '{repo}', {pr},
+                        '{commit}', '{cls}', '{sev}', '{discovered}',
+                        '{source}', $q${description}$q$, {fix});"""
         )
     return "\n".join(stmts)
 
@@ -203,9 +216,12 @@ def test_adds_every_new_column_guarded():
 
 def test_partial_unique_index_on_repo_fingerprint():
     text = MIGRATION_008.read_text()
-    assert "CREATE UNIQUE INDEX IF NOT EXISTS" in text
-    assert "(repo, fingerprint)" in text
-    assert "WHERE fingerprint IS NOT NULL" in text
+    assert re.search(
+        r"CREATE UNIQUE INDEX IF NOT EXISTS \w+\s+"
+        r"ON tms_review\.escaped_defects \(repo, fingerprint\)\s+"
+        r"WHERE fingerprint IS NOT NULL;",
+        text,
+    ), "unique index statement is not on (repo, fingerprint) with the expected predicate"
 
 
 def test_view_derives_five_arm_status():
@@ -216,18 +232,45 @@ def test_view_derives_five_arm_status():
                    "'fix-proposed'", "'new'"):
         assert status in text, f"status arm {status} missing from defects_v"
 
+    # Arm ORDER is the contract (regressed is sticky). Pinned so a reordered
+    # CASE cannot silently change what the register reports.
+    view_sql = text.split("CREATE OR REPLACE VIEW tms_review.defects_v")[1]
+    order = [
+        view_sql.index("'regressed'"),
+        view_sql.index("'verified'"),
+        view_sql.index("'fixed'"),
+        view_sql.index("'fix-proposed'"),
+        view_sql.index("'new'"),
+    ]
+    assert order == sorted(order), (
+        f"status arms are out of precedence order: {order}"
+    )
+
 
 def test_backfill_is_guarded_and_uses_fingerprint_formula():
     text = MIGRATION_008.read_text()
     assert "'manual:'" in text
     assert "sha256(" in text
-    assert "WHERE fingerprint IS NULL" in text
     assert "last_seen_at = COALESCE(last_seen_at, created_at)" in text
+    # Bounded by the revival cutover: an unbounded NULL-fingerprint backfill
+    # would re-stamp rows written after the migration and could abort a re-run
+    # on the unique index.
+    assert "WHERE fingerprint IS NULL" in text
+    assert "AND created_at < TIMESTAMPTZ '2026-11-19 00:00:00+00'" in text
 
 
-def test_regression_requires_detector_check():
+def test_status_arms_are_constrained_by_the_schema():
     text = MIGRATION_008.read_text()
-    assert "CHECK (regressed_at IS NULL OR detector IS NOT NULL)" in text
+    for name, expr in (
+        ("escaped_defects_regression_requires_detector",
+         "CHECK (regressed_at IS NULL OR detector IS NOT NULL)"),
+        ("escaped_defects_regression_requires_merge",
+         "CHECK (regressed_at IS NULL OR merged_at IS NOT NULL)"),
+        ("escaped_defects_verification_requires_merge",
+         "CHECK (verified_at IS NULL OR merged_at IS NOT NULL)"),
+    ):
+        assert name in text, f"constraint {name} missing"
+        assert expr in text, f"constraint {name} has no matching CHECK"
 
 
 def test_grants_cover_both_roles():
@@ -330,9 +373,19 @@ def test_defects_v_derives_verified_and_regressed(scratch_db):
     assert bad.returncode != 0
     assert "escaped_defects_regression_requires_detector" in bad.stderr
 
-    _psql(service, "-c", """
+    # ... nor may a never-merged row (a regression presupposes a merged fix)
+    bad = _psql(service, "-c", """
         UPDATE tms_review.escaped_defects
            SET detector = 'pytest-detector', regressed_at = NOW()
+         WHERE defect_id = '7a80e26e-7663-444e-91e7-ca45a60fc9f5'
+    """, dbname=scratch_db, check=False)
+    assert bad.returncode != 0
+    assert "escaped_defects_regression_requires_merge" in bad.stderr
+
+    _psql(service, "-c", """
+        UPDATE tms_review.escaped_defects
+           SET detector = 'pytest-detector', merged_at = NOW() - interval '2 day',
+               regressed_at = NOW()
          WHERE defect_id = '7a80e26e-7663-444e-91e7-ca45a60fc9f5'
     """, dbname=scratch_db)
     (status,), = _rows(service, scratch_db, """
@@ -340,6 +393,15 @@ def test_defects_v_derives_verified_and_regressed(scratch_db):
          WHERE defect_id = '7a80e26e-7663-444e-91e7-ca45a60fc9f5'
     """)
     assert status == "regressed"
+
+    # verified without a merge is rejected too
+    bad = _psql(service, "-c", """
+        UPDATE tms_review.escaped_defects
+           SET detector = 'pytest-detector', verified_at = NOW()
+         WHERE defect_id = '3508df65-b081-4360-b894-fde0a3d810ef'
+    """, dbname=scratch_db, check=False)
+    assert bad.returncode != 0
+    assert "escaped_defects_verification_requires_merge" in bad.stderr
 
     _psql(service, "-c", """
         UPDATE tms_review.escaped_defects
@@ -352,6 +414,67 @@ def test_defects_v_derives_verified_and_regressed(scratch_db):
          WHERE defect_id = 'bbb46d6b-d302-4a2a-8e3e-bcddf6ef71df'
     """)
     assert status == "verified"
+
+
+@_needs_db()
+def test_regressed_precedence_is_sticky(scratch_db):
+    """Pin the plan-gate arm order: regressed wins over a later verified_at.
+
+    `regressed_at` means *currently regressed*; a re-verified row must clear
+    it (regression_count keeps the history). This test is what makes that
+    contract executable instead of prose.
+    """
+    service = os.environ[SERVICE_ENV]
+    _psql(service, "-c", """
+        UPDATE tms_review.escaped_defects
+           SET detector = 'pytest-detector',
+               merged_at = NOW() - interval '3 day',
+               regressed_at = NOW() - interval '2 day',
+               verified_at = NOW() - interval '1 day'
+         WHERE defect_id = 'b7369835-3b66-47d6-9262-c66fe5e78dd5'
+    """, dbname=scratch_db)
+
+    (status,), = _rows(service, scratch_db, """
+        SELECT status FROM tms_review.defects_v
+         WHERE defect_id = 'b7369835-3b66-47d6-9262-c66fe5e78dd5'
+    """)
+    assert status == "regressed"
+
+    # clearing regressed_at is how the state advances (writer contract, #A3)
+    _psql(service, "-c", """
+        UPDATE tms_review.escaped_defects
+           SET regressed_at = NULL, regression_count = regression_count + 1
+         WHERE defect_id = 'b7369835-3b66-47d6-9262-c66fe5e78dd5'
+    """, dbname=scratch_db)
+    (status, count), = _rows(service, scratch_db, """
+        SELECT status, regression_count FROM tms_review.defects_v
+         WHERE defect_id = 'b7369835-3b66-47d6-9262-c66fe5e78dd5'
+    """)
+    assert (status, count) == ("verified", "1")
+
+
+@_needs_db()
+def test_rerun_does_not_touch_post_cutover_rows(scratch_db):
+    """A re-run must not fingerprint rows the live writer added after #156.
+
+    Those rows carry NULL fingerprints (record_escaped_defect does not set
+    one); stamping them would let two same-description rows collide on the
+    unique index and abort the migration. The backfill is cutover-bounded.
+    """
+    service = os.environ[SERVICE_ENV]
+    for _ in range(2):
+        _psql(service, "-c", _insert_defect_sql(
+            description="identical post-cutover description"),
+            dbname=scratch_db)
+
+    # second application must succeed (the fixture already applied it once)
+    _psql(service, "-f", str(MIGRATION_008), dbname=scratch_db)
+
+    (still_null,), = _rows(service, scratch_db, """
+        SELECT count(*) FROM tms_review.escaped_defects
+         WHERE fingerprint IS NULL
+    """)
+    assert still_null == "2", "re-run must leave post-cutover rows alone"
 
 
 @_needs_db()

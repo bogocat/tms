@@ -155,20 +155,31 @@ in [docs/events-format.md](docs/events-format.md).
 ## Defect register
 
 `tms_review.escaped_defects` is the fleet's defect register (revived in
-tms#156): **one row per `(repo, fingerprint)` forever**. A bug that comes
-back bumps `recurrence_count` — it never inserts a second row. Hand-filed
-pre-#156 rows carry a `manual:` fingerprint derived from
+tms#156): **one row per `(repo, fingerprint)` forever**, enforced by a partial
+unique index for rows that carry a fingerprint. A bug that comes back bumps
+`recurrence_count` — it never inserts a second row. Hand-filed pre-#156 rows
+carry a `manual:` fingerprint derived from
 `repo || defect_class || description`.
+
+Intake is #A2: `record_escaped_defect()` still writes NULL fingerprints, and
+those rows are deliberately unconstrained until the upsert path lands. Do not
+assume the one-row invariant covers NULL-fingerprint rows yet.
 
 `status` is **derived**, never written. It lives in `tms_review.defects_v`:
 
 | status | the fact the row proves |
 |---|---|
-| `regressed` | `regressed_at` — a detector saw the bug come back |
+| `regressed` | `regressed_at` — a detector saw the bug come back after a merged fix |
 | `verified` | `verified_at` — a detector passed against the deployed fix |
 | `fixed` | `merged_at` — a fix is merged |
 | `fix-proposed` | `fix_pr` names a fix PR; the merge is unproven |
 | `new` | discovery only |
+
+`regressed` is a *current* state, not a history flag: a writer clears
+`regressed_at` when a re-fix is verified, and `regression_count` keeps the
+history (#A3 owns that contract). `detector`, `merged_at` and `regressed_at`
+are cross-checked by constraints — a row cannot report a regression it has no
+detector for, nor a regression/verification of a fix it never merged.
 
 `detector` is nullable on purpose: a defect with no re-runnable check may not
 claim automatic regression detection, and the schema enforces the

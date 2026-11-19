@@ -44,8 +44,18 @@
 -- Backfill: the 4 pre-#156 rows get a deterministic manual fingerprint,
 --   'manual:' || encode(sha256(repo || defect_class || description), 'hex')
 -- (verified collision-free on the live rows), and last_seen_at = created_at.
--- The update is guarded by `WHERE fingerprint IS NULL`, so re-running this
--- migration is a no-op on rows it has already touched.
+-- The update is bounded to rows created before the revival cutover
+-- (2026-11-19) AND to `fingerprint IS NULL`, so re-running this migration is
+-- a no-op: it can never reach a row written by the live writer after the
+-- cutover, and it can never re-stamp a row it already fingerprinted. A
+-- re-run therefore also cannot collide on the unique index below.
+--
+-- Invariant scope: (repo, fingerprint) uniqueness is enforced for rows that
+-- carry a fingerprint. `record_escaped_defect()` still writes NULL
+-- fingerprints until intake lands (#A2) — those rows are deliberately
+-- unconstrained so the rollout is not a flag day. Consumers should not
+-- assume the invariant holds for NULL-fingerprint rows; #A2's upsert is what
+-- closes that gap.
 --
 -- Out of scope: intake (#A2), verification (#A3), sweep (#A4). This lands a
 -- schema a writer can target and nothing more. `defect_attributions` is
@@ -56,7 +66,10 @@
 --
 -- Re-runnable: every statement is guarded (ADD COLUMN IF NOT EXISTS /
 -- CREATE INDEX IF NOT EXISTS / CREATE OR REPLACE VIEW / DO-block constraint
--- check / WHERE fingerprint IS NULL backfill).
+-- checks / a backfill bounded by the revival cutover). The single
+-- non-concurrent CREATE INDEX is a SHARE-lock build; fine at 4 rows, and the
+-- CONCURRENTLY form (outside a transaction) is the pattern if the register
+-- ever grows large.
 
 BEGIN;
 
@@ -89,12 +102,16 @@ ALTER TABLE tms_review.escaped_defects
 ALTER TABLE tms_review.escaped_defects
     ADD COLUMN IF NOT EXISTS regression_count INTEGER NOT NULL DEFAULT 0;
 
--- ── 2. backfill the pre-#156 rows (guarded: re-run is a no-op) ────
+-- ── 2. backfill the pre-#156 rows (guarded + cutover-bounded) ────
 --
 -- Fingerprint formula is the issue's: sha256 over repo || class ||
 -- description, hex-encoded, prefixed 'manual:' so a hand-filed row is
 -- distinguishable from a detector-derived one. last_seen_at is created_at
 -- because that is the only sighting we can prove for these rows.
+--
+-- The created_at bound is what makes the re-run safe: without it, a second
+-- run would fingerprint rows the live writer added in the meantime and could
+-- abort on the unique index if two of them shared a description.
 
 UPDATE tms_review.escaped_defects
    SET fingerprint = 'manual:' || encode(
@@ -102,7 +119,8 @@ UPDATE tms_review.escaped_defects
            'hex'
        ),
        last_seen_at = COALESCE(last_seen_at, created_at)
- WHERE fingerprint IS NULL;
+ WHERE fingerprint IS NULL
+   AND created_at < TIMESTAMPTZ '2026-11-19 00:00:00+00';
 
 -- ── 3. one row per (repo, fingerprint), forever ───────────────────
 
@@ -110,10 +128,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_escaped_defects_repo_fingerprint
     ON tms_review.escaped_defects (repo, fingerprint)
     WHERE fingerprint IS NOT NULL;
 
--- ── 4. regression requires a detector ─────────────────────────────
+-- ── 4. each status arm must be able to name its fact ─────────────
 --
--- A regressed_at with detector IS NULL claims automatic regression
--- detection the row cannot support. Enforced by the schema, not by prose.
+-- Same discipline as nullable `detector`: the view will not report a
+-- regression or a verification for a row that never proved a merge. A
+-- regressed_at or verified_at with merged_at IS NULL claims a fix happened
+-- (and got deployed) when the row only shows a named fix PR — the exact
+-- unsupported assertion the fix-proposed arm exists to avoid.
 
 DO $$
 BEGIN
@@ -130,7 +151,44 @@ BEGIN
 END
 $$;
 
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint
+         WHERE conname = 'escaped_defects_regression_requires_merge'
+           AND conrelid = 'tms_review.escaped_defects'::regclass
+    ) THEN
+        ALTER TABLE tms_review.escaped_defects
+            ADD CONSTRAINT escaped_defects_regression_requires_merge
+            CHECK (regressed_at IS NULL OR merged_at IS NOT NULL);
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint
+         WHERE conname = 'escaped_defects_verification_requires_merge'
+           AND conrelid = 'tms_review.escaped_defects'::regclass
+    ) THEN
+        ALTER TABLE tms_review.escaped_defects
+            ADD CONSTRAINT escaped_defects_verification_requires_merge
+            CHECK (verified_at IS NULL OR merged_at IS NOT NULL);
+    END IF;
+END
+$$;
+
 -- ── 5. defects_v — status derived, never written ──────────────────
+--
+-- Precedence is regressed > verified > fixed > fix-proposed > new (the
+-- plan-gate vocabulary). `regressed` therefore means "currently regressed":
+-- it is a state the writer must clear (verified_at set, regressed_at NULL)
+-- once a re-fix is verified — regression_count is what preserves the history.
+-- #A3 owns that write contract; the arm order is pinned by a test so it
+-- cannot drift silently.
 
 CREATE OR REPLACE VIEW tms_review.defects_v AS
 SELECT
@@ -187,7 +245,10 @@ COMMENT ON COLUMN tms_review.escaped_defects.deployed_sha IS
     'Commit/image sha the verified fix was actually running as.';
 
 COMMENT ON COLUMN tms_review.escaped_defects.regressed_at IS
-    'When detector last observed the defect after a fix. Requires detector IS NOT NULL (CHECK).';
+    'When detector last observed the defect after a merged fix. Requires detector IS NOT NULL and merged_at IS NOT NULL (CHECKs). Currently-regressed state: writers clear it once a re-fix is verified; regression_count keeps the history.';
+
+COMMENT ON COLUMN tms_review.escaped_defects.verified_at IS
+    'When detector passed against the deployed fix. Requires merged_at IS NOT NULL (CHECK).';
 
 COMMENT ON COLUMN tms_review.escaped_defects.regression_count IS
     'Times the fingerprint regressed after a fix.';
@@ -197,9 +258,13 @@ COMMENT ON VIEW tms_review.defects_v IS
 
 -- ── 7. grants — same pattern as 001/004/005 ──────────────────────
 --
--- The view is a relation, so the blanket grants cover it; they are
--- re-issued here (not relying solely on ALTER DEFAULT PRIVILEGES) because
--- 001 already regressed once on exactly this: bogocat_ro seeing 0 tables.
+-- The view is a relation, so the blanket grants cover it (in PostgreSQL
+-- "ALL TABLES" includes views); they are re-issued here, after the view
+-- exists, rather than relying on ALTER DEFAULT PRIVILEGES alone — 001
+-- already regressed once on exactly this (bogocat_ro seeing 0 tables).
+-- Note: ALTER DEFAULT PRIVILEGES without FOR ROLE sets defaults for the
+-- role running this migration (pg-superuser), not for `bogocat`; the
+-- explicit grants above are what covers today's objects.
 
 GRANT ALL ON ALL TABLES IN SCHEMA tms_review TO bogocat;
 ALTER DEFAULT PRIVILEGES IN SCHEMA tms_review
