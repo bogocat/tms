@@ -109,8 +109,9 @@ def build_parser(prog, detector, description, default_repo):
         epilog="Detector id: " + detector + ". Findings are filed into "
                "tms_review.escaped_defects keyed by '" + detector +
                ":<signal>:<stable-key>', so a repeated sweep bumps the row's "
-               "recurrence count instead of inserting. See "
-               "docs/defect-intake.md.",
+               "recurrence count instead of inserting. The intake contract "
+               "(fingerprint convention, dedupe, outcomes) is documented in "
+               "tms/defects.py.",
     )
     parser.add_argument("--repo", default=default_repo,
                         help="fleet short name to file under (default: "
