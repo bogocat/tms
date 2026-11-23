@@ -39,6 +39,12 @@ Hand-filed rows use the #156 formula, ``manual:<sha256>``, and pass
 ``detector=None``. ``discovery_source`` defaults to ``detector`` when a detector
 is given and ``manual`` when it is not.
 
+The rule runs in both directions: a detector id **requires** a fingerprint
+prefixed with it, and ``detector=None`` **requires** the ``manual:`` prefix. A
+two-segment fingerprint like ``stale-run:20128`` filed without a detector is a
+detector-shaped identity with no detector — the same unsweepable row as the
+three-segment case, so it is rejected too.
+
 Dedupe contract
 ---------------
 ======================  ============================================  ==============
@@ -80,14 +86,24 @@ the four-call contract end to end on a throwaway database.
 
 Adopting a row this call did not create
 ---------------------------------------
-A sighting by a detector of an existing row that has ``detector IS NULL`` fills
-the detector in (``COALESCE``) — that is what makes a hand-filed row sweepable
-by #159. ``discovery_source`` is **not** rewritten: it keeps the first-sight
-value, because the register records how the defect was first discovered, not who
-re-sighted it. So a row can legitimately read ``discovery_source='manual'`` with
-a detector id set; the live row ``3976ac52-…`` has exactly that shape (a human
-filed it through the CLI, then the detector sweeps adopted it). Pinned by
-``test_detector_adopts_a_row_it_did_not_file_and_keeps_the_first_sight_source``.
+A sighting by a detector of an existing row **already fingerprinted in that
+detector's own namespace** whose ``detector`` is NULL fills the detector in
+(``COALESCE``). ``discovery_source`` is **not** rewritten: it keeps the
+first-sight value, because the register records how the defect was first
+discovered, not who re-sighted it.
+
+What this is **not**: a bridge from hand-filed rows to detectors. A hand-filed
+row is ``manual:<sha256>``, and the prefix rule above refuses to file that
+fingerprint together with a detector id — so a ``manual:<hash>`` row and a later
+detector sighting of the same bug **stay two rows**, deliberately. Adoption only
+reaches an anomaly row that already carries the detector's fingerprint but no
+detector: rows written by an earlier revision of this module (before the prefix
+rule) or by SQL outside the two writers. Neither writer can create one today
+(``record_escaped_defect()`` writes no fingerprint at all), so on a clean
+database this branch does not fire; it is kept as a repair path for rows that
+already exist and as defence at the SQL boundary, not as a documented bridge.
+Pinned by ``test_detector_adopts_a_detector_namespaced_row_without_a_detector``
+and ``test_a_manual_row_and_a_detector_sighting_stay_two_rows``.
 
 CLI: ``tms defect --repo <r> --class <c> --fingerprint <f> --description <d>``
 (``main()`` lands with the CLI in #165; the verb routes to this module). The CLI
@@ -228,14 +244,14 @@ def validate_fingerprint(fingerprint, detector=None):
             f"fingerprint has an empty segment: {fingerprint!r}")
 
     if detector is None:
-        if len(segments) >= 3:
+        if not fingerprint.startswith("manual:"):
             raise ValueError(
-                f"fingerprint {fingerprint!r} has {len(segments)} segments, "
-                "which by convention means it is detector-derived "
-                "('<detector>:<signal>:<stable-key>') — pass the detector id. "
-                "A detector-prefixed fingerprint filed without its detector "
-                "cannot be swept later (#159 selects on detector IS NOT NULL). "
-                "Hand-filed rows use 'manual:<sha256>'.")
+                f"fingerprint {fingerprint!r} was filed without a detector, "
+                "but it is not in the hand-filed form 'manual:<sha256>'. Any "
+                "other prefix is a detector-shaped identity, and a row that "
+                "names a detector it does not have cannot be swept later "
+                "(#159 selects on detector IS NOT NULL) — pass the detector "
+                "id instead, or hand-file as 'manual:<sha256>'.")
         return
 
     if not _DETECTOR_RE.match(detector):
@@ -301,6 +317,12 @@ _UPSERT_SQL = """
     DO UPDATE SET
         recurrence_count = tms_review.escaped_defects.recurrence_count + 1,
         last_seen_at = EXCLUDED.last_seen_at,
+        -- Defensive: a row already in the detector's namespace with no detector
+        -- is adopted. Unreachable through this module's own validation (a
+        -- detector fingerprint always arrives with its detector, and a
+        -- manual row never does), so on a clean database this is a no-op — it
+        -- only repairs rows written before the prefix rule existed, or by SQL
+        -- outside the two writers.
         detector = COALESCE(tms_review.escaped_defects.detector,
                             EXCLUDED.detector),
         regressed_at = CASE
@@ -314,7 +336,7 @@ _UPSERT_SQL = """
              AND tms_review.escaped_defects.regressed_at IS NULL
             THEN 1 ELSE 0
         END
-    RETURNING defect_id, recurrence_count, regression_count,
+    RETURNING defect_id, recurrence_count, regression_count, detector,
               (defect_id = %s) AS inserted_now,
               (regressed_at = %s) AS regressed_now
 """
@@ -342,15 +364,16 @@ def _classify(row, new_defect_id):
     ``recurrence_count`` is deliberately NOT used: it is a fact about the row's
     history, not about what this call did.
     """
-    defect_id, recurrence_count, regression_count, inserted_now, regressed_now \
-        = row
+    (defect_id, recurrence_count, regression_count, detector, inserted_now,
+     regressed_now) = row
     if str(defect_id) == str(new_defect_id):
         outcome = INSERTED
     elif bool(regressed_now):
         outcome = REGRESSED
     else:
         outcome = RECURRED
-    return outcome, defect_id, int(recurrence_count), int(regression_count)
+    return (outcome, defect_id, int(recurrence_count), int(regression_count),
+            detector)
 
 
 def record_defect(repo, defect_class, fingerprint, description, *,
@@ -361,6 +384,8 @@ def record_defect(repo, defect_class, fingerprint, description, *,
 
     Args:
         repo: fleet short name the defect lives in (``home-portal``, ``tms``).
+            Surrounding whitespace is rejected, not trimmed: dedupe is per
+            ``(repo, fingerprint)``, so a padded repo would fork the register.
         defect_class: one of :data:`DEFECT_CLASSES`.
         fingerprint: producer-owned identity — see the module docstring.
             **Rejected** (``ValueError``) when ``detector`` is set and the
@@ -370,7 +395,8 @@ def record_defect(repo, defect_class, fingerprint, description, *,
             found, and when).
         detector: the re-runnable check that observed this defect. ``None``
             means no automatic re-check exists, which also means a later
-            sighting can never be a regression.
+            sighting can never be a regression. When ``None``, the fingerprint
+            must be ``manual:<sha256>``.
         severity: free-form. Defaults to ``ungraded`` — a detector that does not
             grade severity must not claim one.
         discovery_source: ``detector`` (default when ``detector`` is set),
@@ -379,15 +405,27 @@ def record_defect(repo, defect_class, fingerprint, description, *,
         introducing_pr / introducing_commit: only when actually known. Both are
             nullable since migration 009 precisely because a detector-sourced
             defect has no introducing change; pass ``None`` rather than 0/''.
-        discovered_at: ISO 8601 sighting time. Defaults to now.
+        discovered_at: ISO 8601 sighting time. Defaults to now. The caller's
+            value becomes the row's ``discovered_at``; ``last_seen_at`` and a
+            ``regressed_at`` this call sets are stamped with intake time (wall
+            clock), so a replayed historical sighting records "observed now"
+            for those two columns.
 
     Returns:
         :class:`DefectRecord` — ``outcome`` is ``inserted``, ``recurred`` or
         ``regressed``. Never a bare id: "it took ownership" must not read as
-        "recorded fresh".
+        "recorded fresh". Its ``detector`` is the **row's** detector as read
+        back, not the argument, so a record cannot understate ownership.
     """
     if not isinstance(repo, str) or not repo.strip():
         raise ValueError(f"repo must be a non-empty string, got {repo!r}")
+    if repo != repo.strip():
+        # Dedupe is per (repo, fingerprint), so a padded repo forks the register:
+        # the same bug becomes two rows and every `WHERE repo = …` query misses
+        # one. Rejecting names the caller's bug; silently stripping would file a
+        # row under a repo the caller never asked for.
+        raise ValueError(f"repo may not have surrounding whitespace, "
+                         f"got {repo!r}")
     if defect_class not in DEFECT_CLASSES:
         raise ValueError(
             f"defect_class must be one of {sorted(DEFECT_CLASSES)}, "
@@ -428,15 +466,15 @@ def record_defect(repo, defect_class, fingerprint, description, *,
             "defect intake returned no row — the upsert neither inserted nor "
             f"updated ({repo}/{fingerprint})")
 
-    outcome, defect_id, recurrence_count, regression_count = _classify(
-        row, new_defect_id)
+    outcome, defect_id, recurrence_count, regression_count, row_detector = \
+        _classify(row, new_defect_id)
 
     return DefectRecord(
         outcome=outcome,
         defect_id=defect_id,
         repo=repo,
         fingerprint=fingerprint,
-        detector=detector,
+        detector=row_detector,
         recurrence_count=recurrence_count,
         regression_count=regression_count,
     )

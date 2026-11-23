@@ -156,15 +156,16 @@ def test_derived_status_after_the_four_calls(intake_db):
 
 
 @INTEGRATION
-def test_a_manual_row_is_adopted_but_keeps_its_source(intake_db):
-    """A detector re-sighting a hand-filed row fills `detector` (sweepable) and
-    leaves `discovery_source` alone (how it was first discovered).
+def test_an_anomaly_row_is_adopted_but_keeps_its_source(intake_db):
+    """A detector re-sighting an anomaly row — the detector's own fingerprint,
+    NULL detector — fills `detector` (sweepable) and leaves `discovery_source`
+    alone (how it was first discovered).
 
-    The row is seeded with SQL because the guard added after the live incident
-    (a three-segment fingerprint with no detector is now rejected) makes it
-    impossible to *create* this shape through intake. It still exists in
-    production — `3976ac52-…` was filed before that guard — so adoption has to
-    keep working for it.
+    This is **not** a hand-filed row being adopted: a hand-filed row is
+    `manual:<hash>`, and the two-direction prefix rule means a detector cannot
+    file or adopt one. The row is seeded with SQL because intake cannot create
+    this shape (a three-segment fingerprint with no detector is rejected), and
+    it only exists in production from before that guard.
     """
     service, db = intake_db
 
@@ -179,7 +180,10 @@ def test_a_manual_row_is_adopted_but_keeps_its_source(intake_db):
 
     adopted = _defect()
     assert adopted.outcome == "recurred", (
-        "a detector re-sighting a manual row must not insert a second row"
+        "a detector re-sighting the anomaly row must not insert a second row"
+    )
+    assert adopted.detector == "pipeline-health", (
+        "the record reports the row's detector, not the caller's argument"
     )
     assert _rows(service, db, """
         SELECT detector, discovery_source, recurrence_count

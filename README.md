@@ -161,9 +161,11 @@ unique index for rows that carry a fingerprint. A bug that comes back bumps
 carry a `manual:` fingerprint derived from
 `repo || defect_class || description`.
 
-Intake is #A2: `record_escaped_defect()` still writes NULL fingerprints, and
-those rows are deliberately unconstrained until the upsert path lands. Do not
-assume the one-row invariant covers NULL-fingerprint rows yet.
+Intake has landed (#157): `record_defect()` in `tms/defects.py` is the upsert
+path that enforces the one-row invariant for every row a **producer** or the
+`tms defect` CLI files. `record_escaped_defect()` (the review-eval harness) is
+unchanged and still writes NULL fingerprints, and those rows remain deliberately
+unconstrained — do not assume the one-row invariant covers NULL-fingerprint rows.
 
 `status` is **derived**, never written. It lives in `tms_review.defects_v`:
 
@@ -187,8 +189,10 @@ never merged.
 
 `detector` is nullable on purpose: a defect with no re-runnable check may not
 claim automatic regression detection, and the schema enforces the
-consequence (`regressed_at` requires `detector`). Detector naming lands with
-intake (#A2); verification is #A3.
+consequence (`regressed_at` requires `detector`). The naming convention is live
+with intake (#157): a producer supplies `<detector>:<signal>:<stable-key>` and
+intake rejects a detector-sourced fingerprint that is not prefixed with its own
+detector id. Verification is #158/#159.
 
 `introducing_pr` and `introducing_commit` are nullable too (migration 009), for
 the same reason: a defect filed by a detector has **no introducing PR** to name,
@@ -197,9 +201,11 @@ fact the `fix_pr`-is-not-`fixed` rule exists to prevent.
 
 ```bash
 # Apply (documented path) — in order; an operator who stops at 008 leaves the
-# register unable to accept a detector-filed row.
+# register unable to accept a detector-filed row, and one who stops at 009
+# leaves the regression counter documented as the re-fix writer's business.
 psql service=pg-superuser -f schema/migrations/008-defect-fingerprint.sql
 psql service=pg-superuser -f schema/migrations/009-defect-intake-nullable.sql
+psql service=pg-superuser -f schema/migrations/010-defect-regression-count-semantics.sql
 
 # What the register currently says
 psql service=bogocat_ro \

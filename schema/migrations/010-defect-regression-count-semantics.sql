@@ -2,8 +2,9 @@
 --
 -- `regression_count`'s live column comment (008) says the opposite of what
 -- intake does: "the writer increments it when clearing `regressed_at` (i.e. when
--- a re-fix is verified); #A3 owns that contract". 008 §5 says the same thing in
--- prose, and README repeated it.
+-- a re-fix is verified); #A3 owns that contract". README repeated that
+-- sentence, and 008's prose describes `regressed` only as a current state, so
+-- nothing in the repo said when the counter moves.
 --
 -- #157's intake is now the writer, and it increments the counter at DETECTION —
 -- the sighting of a `verified` row that sets `regressed_at`. That is the only
@@ -12,17 +13,16 @@
 -- when a re-fix is verified, and must NOT touch this counter.
 --
 -- Why this correction is a migration and not a code change: the wrong contract
--- is written down in three places a future author will read *instead of* the
--- code — the column comment (live in every database), 008 §5's prose, and the
--- README. If #A3 is implemented against any of them, one regression is counted
+-- is written down in places a future author will read *instead of* the code —
+-- the column comment (live in every database) and the README. If the re-fix
+-- writer is implemented against either of them, one regression is counted
 -- twice (0 -> 1 at detection, 1 -> 2 at re-verify) and the register's only
 -- history of regressions is silently inflated. No test can catch a
 -- documentation/code divergence; only the documentation can be fixed.
 --
 -- 008's comments are NOT edited: they are the record of what #156 shipped and
 -- the migration is already applied. This migration supersedes the column
--- comment, 008 §5 is annotated below in words, and the README is corrected in
--- the same commit.
+-- comment, and the README is corrected in the same commit.
 --
 -- Re-runnable: `COMMENT ON` replaces the comment, so applying it twice is a
 -- no-op.

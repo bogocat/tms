@@ -104,14 +104,20 @@ def test_detector_must_be_a_slug():
 
 
 def test_detector_shaped_fingerprint_without_a_detector_is_rejected():
-    """A three-segment fingerprint is detector-derived by convention. Filing one
-    without its ``detector`` leaves a row #159 can never re-check — this exact
-    mistake shipped a real CLI call on 2026-11-19 and landed an unsweepable row,
-    because the prefix rule could only fire when a detector was supplied."""
-    with pytest.raises(ValueError, match="detector"):
+    """A detector-shaped fingerprint is detector-derived by convention. Filing
+    one without its ``detector`` leaves a row #159 can never re-check — this
+    exact mistake shipped a real CLI call on 2026-11-19 and landed an
+    unsweepable row, because the prefix rule could only fire when a detector
+    was supplied."""
+    with pytest.raises(ValueError, match="manual:"):
         validate_fingerprint("distillery-silent-success:empty-mapping:63")
 
-    # the hand-filed form is unaffected: two segments, 'manual:<hash>'
+    # the same class of row, two segments: '<signal>:<key>' is just as
+    # detector-shaped, and just as unsweepable without a detector
+    with pytest.raises(ValueError, match="manual:"):
+        validate_fingerprint("stale-run:20128")
+
+    # the hand-filed form is unaffected: 'manual:<hash>'
     validate_fingerprint("manual:" + "d" * 64)
 
 
@@ -128,6 +134,17 @@ def test_detector_rows_default_to_the_detector_source(test_db):
         (rec.defect_id,),
     )
     assert row == [("detector",)]
+
+
+def test_repo_with_surrounding_whitespace_is_rejected(test_db):
+    """Dedupe is per ``(repo, fingerprint)``, so a padded repo forks the
+    register: the same bug becomes two rows and every ``WHERE repo = …`` query
+    misses one. Rejecting names the caller's bug instead of filing a row under a
+    repo the caller never typed."""
+    with pytest.raises(ValueError, match="whitespace"):
+        _file(test_db, repo="  home-portal  ")
+
+    assert _fetch(test_db, "SELECT count(*) FROM escaped_defects") == [(0,)]
 
 
 def test_manual_rows_default_to_the_manual_source(test_db):
@@ -168,14 +185,17 @@ def test_severity_must_be_a_non_empty_string(test_db):
     assert _fetch(test_db, "SELECT count(*) FROM escaped_defects")[0][0] == 0
 
 
-def test_detector_adopts_a_row_it_did_not_file_and_keeps_first_sight_source(
+def test_detector_adopts_a_detector_namespaced_row_without_a_detector(
         test_db):
-    """A detector re-sighting a hand-filed row fills in the detector (that is
-    what makes the row sweepable by #159) but does NOT rewrite discovery_source:
-    the register records how the defect was first discovered.
+    """A detector re-sighting an **anomaly** row — one that already carries the
+    detector's own fingerprint but has NULL detector — fills the detector in
+    (which is what makes the row sweepable by #159) and does NOT rewrite
+    discovery_source: the register records how the defect was first discovered.
 
-    This is live row 3976ac52-…'s exact shape — filed by hand through the CLI,
-    adopted by the next sweep."""
+    This is a repair path, not a bridge: the row cannot be created through
+    intake any more (see the two-direction fingerprint rule), so it is seeded
+    directly to stand in for a row written by an earlier revision or by SQL.
+    """
     test_db().cursor().execute(
         """INSERT INTO escaped_defects (
                defect_id, repo, defect_class, severity, discovered_at,
@@ -192,10 +212,36 @@ def test_detector_adopts_a_row_it_did_not_file_and_keeps_first_sight_source(
     rec = _file(test_db)
 
     assert rec.outcome == RECURRED
+    assert rec.detector == "pipeline-health", (
+        "the record describes the row, whose detector was just filled in"
+    )
     assert _fetch(
         test_db,
         "SELECT detector, discovery_source FROM escaped_defects",
     ) == [("pipeline-health", "manual")]
+
+
+def test_a_manual_row_and_a_detector_sighting_stay_two_rows(test_db):
+    """The documented consequence of the prefix rule: a hand-filed
+    ``manual:<hash>`` row has an identity that does not name a detector, so a
+    detector cannot file it and cannot adopt it. The same bug seen both ways is
+    two rows — a design decision kept so that every row's identity names the
+    thing that can re-check it."""
+    hand = record_defect(
+        repo="home-portal", defect_class="silent-failure",
+        fingerprint="manual:" + "c" * 64,
+        description="Oathbringer has no book_topics rows",
+    )
+    assert hand.outcome == INSERTED
+    assert hand.detector is None
+
+    with pytest.raises(ValueError, match="manual:"):
+        _file(test_db, fingerprint="manual:" + "c" * 64)
+
+    detected = _file(test_db)
+    assert detected.outcome == INSERTED
+    assert _fetch(
+        test_db, "SELECT count(*) FROM escaped_defects") == [(2,)]
 
 
 # ── AC1: twice = one row, recurrence 2 ───────────────────────────
