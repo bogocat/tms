@@ -26,11 +26,48 @@
 -- If a sweep ran first it would file fresh `insufficient-source-text` rows and
 -- this UPDATE would collide on the (repo, fingerprint) unique index. Running
 -- this file first means step 3 recurs those 14 rows and adds the 4
--- `core-extract-failed` rows the corrected producer also finds.
+-- `core-extract-failed` rows the corrected producer also finds. The pre-flight
+-- block below fails with that reason instead of letting the UPDATE abort on a
+-- unique violation.
+--
+-- WHAT THE REPLACED SENTENCE SAID (kept here because the UPDATE overwrites
+-- `description` and the register keeps no history of the text):
+--   'book <id> (<title>) has no book_distillations row: the V2 digest pipeline
+--    never produced a distillation for it and reported no failure'
+-- It is false for all 14: the ledger records a skip for every one of them.
 --
 -- Applied by: psql service=pg-superuser -f schema/repairs/2026-11-19-relabel-unproven-missing-distillation.sql
 
 BEGIN;
+
+-- Pre-flight: refuse to start if the corrected producer has already swept *for
+-- the books this file relabels* — those rows would collide on the
+-- (repo, fingerprint) unique index. Scoped to the actual collision rather than
+-- to the prefix, so a second run (no rows left to relabel) is a clean no-op.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM tms_review.escaped_defects d
+          JOIN bogocat.v_pipeline_health_book b
+            ON d.fingerprint =
+               'pipeline-health:missing-distillation:' || b.item_id
+         WHERE d.repo = 'distillery'
+           AND b.is_missing_distillation
+           AND b.passes_succeeded < 6
+           AND EXISTS (
+                SELECT 1
+                  FROM tms_review.escaped_defects e
+                 WHERE e.repo = 'distillery'
+                   AND e.fingerprint =
+                       'pipeline-health:insufficient-source-text:' || b.item_id
+           )
+    ) THEN
+        RAISE EXCEPTION
+            'the corrected producer already swept: an insufficient-source-text row exists for a book this repair would relabel, so the UPDATE would collide on (repo, fingerprint). Resolve those rows deliberately; do not force this through.';
+    END IF;
+END
+$$;
 
 -- Pre-flight: what is about to change (and nothing else).
 SELECT d.fingerprint AS old_fingerprint,
@@ -50,9 +87,10 @@ UPDATE tms_review.escaped_defects d
                      || coalesce(' (' || b.title || ')', '')
                      || ' has no book_distillations row and '
                      || b.passes_succeeded || ' of 6 passes succeeded: '
-                     || 'every core-extract run was skipped with '
-                     || '''insufficient-source-text: no epub body nor OCR '
-                     || 'sidecar found'', so no distillation could be produced'
+                     || 'no core-extract run ever succeeded, and at least one '
+                     || 'was skipped with ''insufficient-source-text: no epub '
+                     || 'body nor OCR sidecar found'', so no distillation '
+                     || 'could be produced'
   FROM bogocat.v_pipeline_health_book b
  WHERE d.repo = 'distillery'
    AND d.fingerprint = 'pipeline-health:missing-distillation:' || b.item_id
@@ -69,10 +107,11 @@ SELECT repo, fingerprint, recurrence_count, detection_status
  WHERE fingerprint LIKE 'pipeline-health:insufficient-source-text:%'
  ORDER BY fingerprint;
 
--- Post-check 2: MUST return 0 rows. Anything listed here is an unproven
--- `missing-distillation` claim this repair deliberately did not touch (the book
--- has since gained a distillation, or all six passes now succeed) and needs a
--- human look.
+-- Post-check 2: the unproven `missing-distillation` rows this repair
+-- deliberately does NOT touch — the book has since gained a distillation, or all
+-- six passes now succeed (that one is the genuine #173 shape and keeps its
+-- claim). Zero rows means every remaining `missing-distillation` row is proven;
+-- anything listed here needs a human look.
 SELECT d.fingerprint, b.is_missing_distillation, b.passes_succeeded
   FROM tms_review.escaped_defects d
   LEFT JOIN bogocat.v_pipeline_health_book b

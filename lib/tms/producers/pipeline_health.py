@@ -24,9 +24,10 @@ signal                       the fact the query proves                        fi
                              shape, the pipeline saying OK while writing      ``<item_id>``
                              no distillation
 ``insufficient-source-text``  no distillation, ``core-extract`` never        ``…:insufficient-``
-                             succeeded, and its runs were skipped with        ``source-text:<item_id>``
-                             ``insufficient-source-text: no epub body nor
-                             OCR sidecar found``
+                             succeeded, and **at least one** run was         ``source-text:<item_id>``
+                             skipped with ``insufficient-source-text: no epub
+                             body nor OCR sidecar found`` (not "every run":
+                             4 of the 14 live rows also had real failures)
 ``core-extract-failed``       no distillation, ``core-extract`` never         ``…:core-extract-failed:``
                              succeeded, and at least one run recorded         ``<item_id>``
                              ``status='failed'``
@@ -40,12 +41,32 @@ signal                       the fact the query proves                        fi
                              per-pass threshold
 ===========================  ===============================================  =====================
 
+The ledger query is scoped to ``pipeline_version = 2`` because the view it is
+joined against is (``v2_books`` = items with a v2 run). Without the scope, an
+item reprocessed under v3 could be reported ``distillation-stalled`` because its
+v3 ``core-extract`` succeeded while its v2 chain never did — the same
+unsupported-claim shape, one join over.
+
 Two things this detector deliberately does **not** file:
 
 * a book whose pipeline has not run yet — no runs at all is not a silent failure,
   and a row that says otherwise is an assertion the detector cannot support;
 * the queue-level totals (``v_pipeline_health_queue``) — they aggregate the
   per-book rows below, so filing them would double-count the same fact.
+
+Known gap, deliberately unfiled (review of #166)
+-----------------------------------------------
+One ledger state matches no signal: no distillation, ``passes_succeeded < 6``,
+``core-extract`` never succeeded, **no** skip with a reason, **no** ``failed``
+run — only ``running``/``partial`` rows. It is not "not yet attempted" (runs
+exist), and it is not filed, because the only fact the ledger proves is absence:
+a ``running`` run may be in flight right now, and "no failure was recorded yet"
+is not "a failure happened" (ADR-003: absence of evidence may not select a
+negative claim). Filing it would be the unsupported assertion this module exists
+to stop. Zero live rows match it today; if one appears, the honest fix is a
+detector that can distinguish "still running past the threshold" (which the view
+already reports as ``stale-run``) from "finished without a status worth naming".
+Pinned by ``test_an_unexplained_missing_distillation_is_a_known_gap``.
 
 Repo: ``distillery`` by default. The *detector* is home-portal's health page, but
 the defect is in the book-digest pipeline — distillery writes
@@ -59,7 +80,8 @@ CLI: ``python3 -m tms.producers.pipeline_health [--repo R] [--dry-run]``
 
 import sys
 
-from tms.producers import (Finding, build_parser, fetch, file_findings)
+from tms.producers import (Finding, build_parser, fetch, file_findings,
+                          rows_as_dicts)
 
 DETECTOR = "pipeline-health"
 DEFAULT_REPO = "distillery"
@@ -106,12 +128,9 @@ LEDGER_SQL = """
            MAX(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS core_extract_succeeded
       FROM bogocat.media_digest_runs
      WHERE pass_id = 'core-extract'
+       AND pipeline_version = 2
      GROUP BY item_id
 """
-
-
-def _rows_as_dicts(columns, rows):
-    return [dict(zip(columns, row)) for row in rows]
 
 
 def find_findings(book_rows, ledger_rows, near_verbatim_floor=NEAR_VERBATIM_FLOOR):
@@ -190,9 +209,10 @@ def _missing_distillation_findings(item_id, label, passes, run):
         findings.append(Finding(
             "insufficient-source-text", key,
             f"{label} has no book_distillations row and {passes} of "
-            f"{REQUIRED_PASSES} passes succeeded: every core-extract run was "
-            "skipped with 'insufficient-source-text: no epub body nor OCR "
-            "sidecar found', so no distillation could be produced",
+            f"{REQUIRED_PASSES} passes succeeded: no core-extract run ever "
+            "succeeded, and at least one was skipped with "
+            "'insufficient-source-text: no epub body nor OCR sidecar found', "
+            "so no distillation could be produced",
         ))
     if never_succeeded and bool(run.get("core_extract_failed")):
         findings.append(Finding(
@@ -212,8 +232,8 @@ def _missing_distillation_findings(item_id, label, passes, run):
 
 
 def collect(near_verbatim_floor=NEAR_VERBATIM_FLOOR):
-    books = _rows_as_dicts(BOOK_COLUMNS, fetch(BOOK_SQL))
-    ledger = _rows_as_dicts(LEDGER_COLUMNS, fetch(LEDGER_SQL))
+    books = rows_as_dicts(BOOK_COLUMNS, fetch(BOOK_SQL))
+    ledger = rows_as_dicts(LEDGER_COLUMNS, fetch(LEDGER_SQL))
     return find_findings(books, ledger, near_verbatim_floor=near_verbatim_floor)
 
 

@@ -6,7 +6,8 @@ signal the dashboard draws — so it needs a detector that reads the payload,
 not the status.
 
 This detector reads ``bogocat.media_digest_runs`` and, for the passes that must
-write content, flags ``status='success'`` runs whose written payload is empty:
+write content, flags ``status='success'`` runs whose **required content fields**
+are empty:
 
 | pass | the payload that must exist | signal |
 |---|---|---|
@@ -15,8 +16,12 @@ write content, flags ``status='success'`` runs whose written payload is empty:
 | ``review-synthesis`` | ``review_html`` | ``empty-review`` |
 
 A pass is judged empty only when **every** field it must write is empty: a
-canonical-map run that mapped topics but no traditions did write something, and
-calling that "wrote nothing" would be an over-claim.
+canonical-map run that mapped topics but no traditions did write something. The
+claim is about those fields and nothing else — a ``core-extract`` run with an
+empty ``chapter_summaries``/``best_quotes`` pair can still carry a 700-character
+``high_level_summary``, so the finding says "these fields are empty", never "the
+run wrote nothing" (review of #166: all three live findings contradicted the
+stronger sentence their own artifacts disproved).
 
 Fingerprints: ``distillery-silent-success:<signal>:<item_id>``. Only the latest
 successful run per ``(item, pass)`` is judged, so a superseded empty run stops
@@ -38,8 +43,8 @@ import datetime
 import sys
 from dataclasses import dataclass
 
-from tms.producers import (Finding, _json_payload, build_parser, fetch,
-                           file_findings, utc_now)
+from tms.producers import (Finding, build_parser, fetch, file_findings,
+                           json_payload, rows_as_dicts, utc_now)
 
 DETECTOR = "distillery-silent-success"
 DEFAULT_REPO = "distillery"
@@ -58,21 +63,26 @@ RULES = {
     "canonical-map": EmptyRule(
         "empty-mapping",
         ("canonical_topics", "canonical_traditions"),
-        "canonical_topics and canonical_traditions are both empty — the pass "
-        "mapped nothing",
+        "canonical_topics and canonical_traditions are both empty — no topics "
+        "or traditions were mapped",
     ),
     "core-extract": EmptyRule(
         "empty-extraction",
         ("chapter_summaries", "best_quotes"),
-        "chapter_summaries and best_quotes are both empty — the pass extracted "
-        "nothing",
+        "chapter_summaries and best_quotes are both empty — no per-chapter "
+        "summaries and no quotes were extracted",
     ),
     "review-synthesis": EmptyRule(
         "empty-review",
         ("review_html",),
-        "review_html is blank — the pass produced no review",
+        "review_html is blank — no review was written",
     ),
 }
+
+#: Column order of :data:`SQL`. Rows become dicts through this tuple (see
+#: ``rows_as_dicts``), so a SELECT reorder fails the pinning test instead of
+#: shifting ``started_at``/``ended_at``/``artifact`` one field along.
+SQL_COLUMNS = ("item_id", "pass_id", "started_at", "ended_at", "artifact")
 
 SQL = """
     SELECT item_id, pass_id, started_at, ended_at, artifact
@@ -111,33 +121,36 @@ def find_findings(rows):
     """
     latest = {}
     for row in rows:
-        item_id, pass_id, started_at, ended_at, artifact = row
+        item_id, pass_id = row["item_id"], row["pass_id"]
         rule = RULES.get(pass_id)
         if rule is None:
             continue
-        stamp = str(ended_at or started_at or "")
+        stamp = str(row["ended_at"] or row["started_at"] or "")
         key = (item_id, pass_id)
         if key not in latest or stamp >= latest[key]["stamp"]:
-            latest[key] = {"stamp": stamp, "ended_at": ended_at,
-                           "artifact": artifact, "rule": rule}
+            latest[key] = {"stamp": stamp, "artifact": row["artifact"],
+                           "rule": rule}
 
     findings = []
     for (item_id, pass_id), entry in sorted(latest.items()):
         rule = entry["rule"]
-        payload = _json_payload(entry["artifact"])
+        payload = json_payload(entry["artifact"])
         # The fields must be PRESENT and empty. A pass id can be reused by a
         # different pipeline version whose payload has other keys entirely
         # (`core-extract` v3 writes scene_summaries/best_lines, not
         # chapter_summaries) — an absent key is not an empty one, and reading it
-        # as empty files "wrote nothing" against runs that wrote plenty.
+        # as empty files an empty-fields claim against runs whose payload has a
+        # different shape.
         if not all(field in payload for field in rule.fields):
             continue
         if not all(_is_empty(payload[field]) for field in rule.fields):
             continue
+        # No run stamp: descriptions are first-sight-wins, so "the most recent
+        # run (ended …)" would still be on the row after a later run superseded
+        # it — a stale claim about a run the finding no longer describes.
         findings.append(Finding(
             rule.signal, str(item_id),
-            f"the most recent successful {pass_id} run for item {item_id} "
-            f"(ended {entry['ended_at']}) wrote nothing and {rule.explanation}",
+            f"item {item_id} (pass {pass_id}): {rule.explanation}",
         ))
     return findings
 
@@ -159,8 +172,8 @@ def collect(since_days=0, now=None):
         # of the sort expression (silently unfiltered) and postgres rejects it.
         window = "AND started_at >= %s"
         params.append(cutoff.isoformat())
-    return find_findings(fetch(SQL.format(placeholders=placeholders,
-                                          window=window), tuple(params)))
+    return find_findings(rows_as_dicts(SQL_COLUMNS, fetch(
+        SQL.format(placeholders=placeholders, window=window), tuple(params))))
 
 
 def sweep(repo=DEFAULT_REPO, dry_run=False, since_days=0, now=None, write=print):

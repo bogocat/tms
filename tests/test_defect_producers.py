@@ -20,6 +20,8 @@ AC4 is also pinned here: every row a producer files must have a non-null
 sweeps on ``detector IS NOT NULL``.
 """
 
+import json
+
 import pytest
 
 from tms.producers import distillery_silent_success, pipeline_health
@@ -41,14 +43,15 @@ CREATE TABLE IF NOT EXISTS v_pipeline_health_book (
 
 RUN_LEDGER = """
 CREATE TABLE IF NOT EXISTS media_digest_runs (
-    id          INTEGER,
-    item_id     INTEGER,
-    pass_id     TEXT,
-    status      TEXT,
-    error_detail TEXT,
-    started_at  TEXT,
-    ended_at    TEXT,
-    artifact    TEXT
+    id               INTEGER,
+    item_id          INTEGER,
+    pass_id          TEXT,
+    status           TEXT,
+    error_detail     TEXT,
+    started_at       TEXT,
+    ended_at         TEXT,
+    artifact         TEXT,
+    pipeline_version INTEGER
 )
 """
 
@@ -96,13 +99,14 @@ def _book(conn, item_id, title="A Book", passes_succeeded=6, **overrides):
 
 def _run(conn, run_id, item_id, pass_id, artifact=None, status="success",
          error_detail=None, started_at="2026-05-25T00:00:00+00:00",
-         ended_at="2026-05-25T00:10:00+00:00"):
+         ended_at="2026-05-25T00:10:00+00:00", pipeline_version=2):
     _exec(
         conn,
         "INSERT INTO media_digest_runs (id, item_id, pass_id, status, "
-        "error_detail, started_at, ended_at, artifact) VALUES (?,?,?,?,?,?,?,?)",
+        "error_detail, started_at, ended_at, artifact, pipeline_version) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
         (run_id, item_id, pass_id, status, error_detail, started_at, ended_at,
-         artifact),
+         artifact, pipeline_version),
     )
     conn.commit()
 
@@ -153,6 +157,10 @@ def test_a_skipped_book_is_not_filed_as_missing_distillation(producers_db):
     description = _register(producers_db)[0][6]
     assert "no book_distillations row" in description
     assert "skipped with 'insufficient-source-text" in description
+    assert "no core-extract run ever succeeded" in description
+    assert "every core-extract run" not in description, (
+        "4 of the 14 live rows had real failures beside their skips"
+    )
     assert "reported OK" not in description
     assert "no failure" not in description
 
@@ -185,6 +193,48 @@ def test_a_book_with_both_a_skip_and_a_failure_files_both_facts(producers_db):
         "pipeline-health:core-extract-failed:315",
         "pipeline-health:insufficient-source-text:315",
     ]
+    by_fingerprint = {row[1]: row[6] for row in _register(producers_db)}
+    skip_claim = by_fingerprint["pipeline-health:insufficient-source-text:315"]
+    fail_claim = by_fingerprint["pipeline-health:core-extract-failed:315"]
+    assert "every core-extract run was skipped" not in skip_claim, (
+        "the sibling row proves at least one run failed, not that all skipped"
+    )
+    assert "at least one was skipped" in skip_claim
+    assert "at least one run recorded status='failed'" in fail_claim
+
+
+def test_the_ledger_query_judges_only_pipeline_version_2_runs(producers_db):
+    """The view this producer mirrors is v2-only (`v2_books` = items with a
+    `pipeline_version = 2` run), so the ledger join has to be too — otherwise an
+    item reprocessed under v3 looks 'stalled' because its v3 core-extract
+    succeeded while its v2 chain never did."""
+    _book(producers_db, 351, passes_succeeded=2, is_missing_distillation=1)
+    _run(producers_db, 1, 351, "core-extract", status="success",
+         pipeline_version=3)
+    _run(producers_db, 2, 351, "core-extract", status="skipped",
+         error_detail=SOURCE_TEXT_SKIP, pipeline_version=2)
+
+    pipeline_health.sweep()
+
+    assert _fingerprints(producers_db) == [
+        "pipeline-health:insufficient-source-text:351"
+    ]
+
+
+def test_an_unexplained_missing_distillation_is_a_known_gap(producers_db):
+    """One ledger state matches no signal: no distillation, fewer than six
+    passes, core-extract never succeeded, no skip with a reason, no failed run —
+    only running/partial rows. It is not 'not yet attempted', and it is
+    deliberately unfiled: a running run may be in flight, and 'no failure was
+    recorded yet' does not prove a failure happened (ADR-003). This test keeps
+    the gap visible instead of letting it look like coverage."""
+    _book(producers_db, 700, passes_succeeded=0, is_missing_distillation=1)
+    _run(producers_db, 1, 700, "core-extract", status="running")
+    _run(producers_db, 2, 700, "core-extract", status="partial")
+
+    pipeline_health.sweep()
+
+    assert _register(producers_db) == []
 
 
 def test_a_book_that_has_not_run_yet_files_nothing(producers_db):
@@ -322,10 +372,19 @@ def test_ledger_column_order_matches_the_select_list():
         list(pipeline_health.LEDGER_COLUMNS)
 
 
+def test_distillery_column_order_matches_the_select_list():
+    """`distillery_silent_success.SQL` used to be a 5-field positional unpack, so
+    swapping `started_at`/`ended_at` in the SELECT shifted every field and no
+    test noticed. The rows are dicts now, built through `SQL_COLUMNS`."""
+    assert _select_aliases(distillery_silent_success.SQL) == \
+        list(distillery_silent_success.SQL_COLUMNS)
+
+
 # ── producer #2: distillery silent success ───────────────────────
 
 
-def test_distillery_files_a_success_run_with_an_empty_payload(producers_db):
+def test_distillery_files_a_success_run_with_empty_required_fields(
+        producers_db):
     _run(producers_db, 6113, 63, "canonical-map",
          '{"canonical_topics": [], "canonical_traditions": []}')
 
@@ -338,7 +397,35 @@ def test_distillery_files_a_success_run_with_an_empty_payload(producers_db):
     assert fingerprint == "distillery-silent-success:empty-mapping:63"
     assert detector == "distillery-silent-success"
     assert source == "detector"
-    assert "most recent successful canonical-map run" in description
+    assert "pass canonical-map" in description
+    assert ("canonical_topics and canonical_traditions are both empty"
+            in description)
+
+
+def test_extraction_description_claims_only_the_two_empty_fields(
+        producers_db):
+    """P1 from the #166 review: the live artifacts for items 63 and 258 carry a
+    700+ character ``high_level_summary``, ``core_thesis_or_premise`` and
+    ``methodology`` beside the empty ``chapter_summaries``/``best_quotes`` pair.
+    "The pass extracted nothing" / "wrote nothing" was false for every one of
+    them. The row states the field-level fact and stays silent about the rest.
+    """
+    _run(producers_db, 6117, 63, "core-extract", json.dumps({
+        "chapter_summaries": [],
+        "best_quotes": [],
+        "high_level_summary": "x" * 716,
+        "core_thesis_or_premise": "y" * 490,
+        "methodology": "z" * 233,
+    }))
+
+    distillery_silent_success.sweep()
+
+    (description,) = [_register(producers_db)[0][6]]
+    assert ("chapter_summaries and best_quotes are both empty" in description)
+    assert "no per-chapter summaries and no quotes were extracted" in description
+    for over_claim in ("wrote nothing", "extracted nothing",
+                       "the pass extracted", "wrote an empty payload"):
+        assert over_claim not in description, over_claim
 
 
 def test_latest_successful_run_supersedes_an_earlier_silent_one(producers_db):
@@ -359,19 +446,26 @@ def test_latest_successful_run_supersedes_an_earlier_silent_one(producers_db):
 
 
 def test_distillery_judges_only_the_latest_run_per_pass(producers_db):
-    """Two empty runs are still one finding, and the description points at the
-    most recent one — the run count is not the identity."""
-    for run_id, ended in ((6113, "2026-05-25T23:46:32+00:00"),
-                          (6119, "2026-05-25T23:49:51+00:00")):
-        _run(producers_db, run_id, 63, "canonical-map",
-             '{"canonical_topics": [], "canonical_traditions": []}',
-             ended_at=ended)
+    """The latest run decides, in both directions: an empty run superseded by a
+    populated one is history (above), and a populated run superseded by an empty
+    one is a current finding. The run count is never the identity."""
+    _run(producers_db, 6113, 63, "canonical-map",
+         '{"canonical_topics": ["stoicism"], "canonical_traditions": []}',
+         ended_at="2026-05-25T23:46:32+00:00")
+    _run(producers_db, 6119, 63, "canonical-map",
+         '{"canonical_topics": [], "canonical_traditions": []}',
+         ended_at="2026-11-01T00:00:00+00:00")
 
     distillery_silent_success.sweep()
 
     rows = _register(producers_db)
     assert len(rows) == 1
-    assert "2026-05-25T23:49:51" in rows[0][6]
+    assert rows[0][1] == "distillery-silent-success:empty-mapping:63", (
+        "the latest run is the empty one, so the finding stands"
+    )
+    assert "2026-11-01" not in rows[0][6], (
+        "descriptions are first-sight-wins, so a run stamp would go stale"
+    )
 
 
 def test_distillery_ignores_payloads_of_a_different_shape(producers_db):
