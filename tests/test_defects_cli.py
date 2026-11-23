@@ -172,3 +172,133 @@ def test_bin_tms_usage_line_lists_defect():
     assert "defect" in usage_lines[-1], (
         "`tms defect` is missing from the top-level usage line"
     )
+
+
+# ── the one-way-to-get-it-wrong cases ────────────────────────────
+
+
+def test_cli_rejects_a_detector_shaped_fingerprint_without_a_detector(
+        test_db, capsys):
+    """The P1 from review: `--fingerprint pipeline-health:152` with no
+    `--detector` used to file a row that names a detector it does not have —
+    `detector = NULL`, invisible to #159's sweep, permanently `new` because
+    `regressed_at` requires a detector. Dry run and write must both refuse."""
+    for extra in (["--dry-run"], []):
+        rc = main(["--repo", "home-portal", "--class", "silent-failure",
+                   "--fingerprint", "pipeline-health:152",
+                   "--description", "a row nobody can re-check"] + extra)
+
+        assert rc == 2, extra
+        assert "manual:" in capsys.readouterr().err
+
+    assert _rows(test_db, "SELECT count(*) FROM escaped_defects")[0][0] == 0
+
+
+def test_cli_rejects_the_detector_source_without_a_detector(test_db, capsys):
+    rc = main(_argv(detector=None, source="detector",
+                    fingerprint="manual:" + "e" * 64))
+
+    assert rc == 2
+    assert "detector" in capsys.readouterr().err
+    assert _rows(test_db, "SELECT count(*) FROM escaped_defects")[0][0] == 0
+
+
+def test_cli_passes_severity_through(test_db, capsys):
+    assert main(_argv(severity="major")) == 0
+    capsys.readouterr()
+
+    assert _rows(test_db, "SELECT severity FROM escaped_defects") == [
+        ("major",)
+    ]
+
+
+def test_cli_rejects_an_unparseable_discovered_at(test_db, capsys):
+    """`--discovered-at` used to pass a dry run and die inside postgres on a
+    real write — a traceback and exit 1, neither documented status."""
+    for extra in (["--dry-run"], []):
+        rc = main(_argv(discovered_at="not-a-date") + extra)
+
+        assert rc == 2, extra
+        assert "discovered_at" in capsys.readouterr().err
+
+    assert _rows(test_db, "SELECT count(*) FROM escaped_defects")[0][0] == 0
+
+
+def test_cli_reports_a_regression(test_db, capsys):
+    """The third outcome, through the CLI: a sighting of a verified row."""
+    test_db().cursor().execute(
+        """INSERT INTO escaped_defects (
+               defect_id, repo, introducing_pr, introducing_commit,
+               defect_class, severity, discovered_at, discovery_source,
+               description, fingerprint, detector, last_seen_at,
+               merged_at, verified_at)
+           VALUES ('11111111-1111-1111-1111-111111111111', 'home-portal',
+                   NULL, NULL, 'silent-failure', 'ungraded',
+                   '2026-11-01T00:00:00+00:00', 'detector', 'first sight', ?,
+                   'pipeline-health', '2026-11-01T00:00:00+00:00',
+                   '2026-11-10T00:00:00+00:00',
+                   '2026-11-11T00:00:00+00:00')""",
+        (FP,),
+    )
+    test_db().commit()
+
+    assert main(_argv(json=True)) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["outcome"] == "regressed"
+    assert payload["regression_count"] == 1
+    assert _rows(
+        test_db,
+        "SELECT count(*), regressed_at IS NOT NULL FROM escaped_defects",
+    ) == [(1, 1)]
+
+
+def test_cli_dry_run_plan_lists_every_field(test_db, capsys):
+    """A dry run is the producer checklist's "lists what would be filed" — so
+    it carries the fields, not just the identity."""
+    assert main(_argv(dry_run=True, json=True, severity="major",
+                      introducing_pr=102, introducing_commit="deadbeef",
+                      discovered_at="2026-11-19T00:00:00+00:00")) == 0
+
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["outcome"] == "would-file"
+    assert plan["description"] == (
+        "Oathbringer has no book_topics/book_traditions rows")
+    assert plan["severity"] == "major"
+    assert plan["introducing_pr"] == 102
+    assert plan["introducing_commit"] == "deadbeef"
+    assert plan["discovered_at"] == "2026-11-19T00:00:00+00:00"
+
+
+def test_cli_reports_a_driver_failure_as_exit_2(test_db, capsys, monkeypatch):
+    """A connection error is the same operator-facing fact as a bad argument:
+    "nothing was written, here is why" — not a traceback and exit 1."""
+    def _boom():
+        raise RuntimeError("could not connect to server")
+
+    monkeypatch.setattr("tms.defects._review_eval._get_conn", _boom)
+
+    assert main(_argv()) == 2
+    assert "could not connect" in capsys.readouterr().err
+
+
+def test_bin_tms_executes_the_defect_verb(tmp_path):
+    """Run the shell verb, not a slice of its text: a `;;` or PYTHONPATH edit
+    that the string assertions above would happily pass breaks here."""
+    import os
+    import subprocess
+
+    result = subprocess.run(
+        [str(BIN_TMS), "defect",
+         "--repo", "tms", "--class", "convention",
+         "--fingerprint", "pipeline-health:152",
+         "--description", "routing smoke test",
+         "--dry-run"],
+        capture_output=True, text=True, timeout=120,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    # exit 2 is the intake rejection the fingerprint rule produces; the point is
+    # that the shell arm reached the module and its exit status propagated.
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert "manual:" in result.stderr

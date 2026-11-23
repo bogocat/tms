@@ -9,6 +9,9 @@ recurred?" is a query instead of a memory.
   (`tms_review.defects_v`, status ∈ `new | fix-proposed | fixed | verified | regressed`).
 - Nullable introducing columns for detector-sourced rows:
   `schema/migrations/009-defect-intake-nullable.sql`.
+- Which writer increments `regression_count`, and when:
+  `schema/migrations/010-defect-regression-count-semantics.sql` (intake, at
+  detection — the re-fix writer must not touch it).
 - Intake (this document): `lib/tms/defects.py`.
 - Verification against a deployed fix (#158) and the nightly detector sweep
   (#159) are **not** part of intake.
@@ -69,9 +72,24 @@ and pass `detector=None`.
 Intake **rejects** a producer-supplied fingerprint that is not prefixed with its
 own detector id (`ValueError`, or exit 2 from the CLI). #159 sweeps on
 `detector IS NOT NULL`; a row whose identity does not name its detector can never
-be re-checked, so accepting one would plant a row that is never swept. Also
-rejected: fewer than two `:`-separated segments, an empty segment, whitespace, a
-non-slug detector, and `discovery_source='detector'` with no detector.
+be re-checked, so accepting one would plant a row that is never swept.
+
+The full rejection list — everything below is exit 2 / `ValueError`, and the CLI's
+`--dry-run` applies exactly the same checks as a write, so nothing here can pass a
+dry run and fail later:
+
+| rejected | why |
+|---|---|
+| a fingerprint that does not start with the given `detector` | its identity does not name the check that can re-sweep it |
+| a fingerprint with a detector prefix and **no** `--detector` | same row, unsweepable; the fix is to pass `--detector` or hand-file as `manual:<hash>` |
+| any non-`manual:` fingerprint with no `--detector` (including two-segment `<signal>:<key>`) | detector-shaped identity without a detector |
+| fewer than two `:`-separated segments, or an empty segment | no signal/key to speak of |
+| a fingerprint containing whitespace, or longer than 400 characters | not a stable key |
+| a `--detector` that is not a slug `[a-z0-9][a-z0-9-]*` | convention; also makes the prefix rule decidable |
+| a `--repo` with surrounding whitespace | dedupe is per `(repo, fingerprint)`; a padded repo would fork the register |
+| an unknown `--class`, an empty `--description`/`--severity` | the column vocabulary and NOT NULL constraints, named early |
+| `discovery_source='detector'` with no detector | a row that claims a detector it does not name |
+| a `--discovered-at` that is not ISO 8601 | found in the CLI, not by `TIMESTAMPTZ` after the row's uuid was minted |
 
 ## Vocabulary
 
@@ -101,17 +119,32 @@ tms defect … --dry-run     # validate + print the plan, write nothing
 ```
 
 Exit status `0` means the sighting was recorded (any of the three outcomes);
-`2` means intake rejected it and nothing was written. Exit status does **not**
+`2` means intake rejected it and nothing was written — including a driver or
+connection failure, which is reported as `tms defect: <message>` rather than a
+traceback (set `TMS_DEBUG=1` to keep the traceback). Exit status does **not**
 distinguish "new" from "recurred" — a caller that needs to react reads `outcome`
 from `--json`. Both are successful intakes; only one is news.
 
-Hand-filing without a detector:
+`--dry-run` prints the same fields a write would use — `repo`, `defect_class`,
+`fingerprint`, `description`, `detector`, `discovery_source`, `severity`,
+`introducing_pr`, `introducing_commit`, `discovered_at` — and with `--json` the
+payload carries `"outcome": "would-file"` instead of one of the three recorded
+outcomes. Nothing is written.
+
+Hand-filing without a detector. The hash covers all three inputs in 008's order
+(`repo || defect_class || description`) — `printf '%s'` concatenates its
+arguments with no separator, so this reproduces the backfill formula exactly:
 
 ```bash
-tms defect --repo tms --class convention \
-           --fingerprint "manual:$(printf '%s' 'what I saw' | sha256sum | cut -d' ' -f1)" \
-           --description "what I saw"
+repo=tms; class=convention; desc='what I saw'
+fp="manual:$(printf '%s' "$repo" "$class" "$desc" | sha256sum | cut -d' ' -f1)"
+tms defect --repo "$repo" --class "$class" --fingerprint "$fp" --description "$desc"
 ```
+
+A hand-filed row and a later detector sighting of the same bug are **two rows**:
+the row's identity must name the check that can re-sweep it, and a `manual:`
+hash does not. That is a deliberate cost, not an oversight — see the adoption note
+in `lib/tms/defects.py`.
 
 ## Adding a producer
 
@@ -130,7 +163,7 @@ Producers wired by #157 (both read the same postgres state their dashboards read
 
 | detector id | source of truth | signals |
 |---|---|---|
-| `pipeline-health` | `bogocat.v_pipeline_health_book` / `_queue` | `missing-distillation`, `junction-drift`, `quote-decay`, `stale-run` |
+| `pipeline-health` | `bogocat.v_pipeline_health_book` + `bogocat.media_digest_runs` | `missing-distillation`, `insufficient-source-text`, `core-extract-failed`, `distillation-stalled`, `junction-drift`, `quote-decay`, `stale-run` |
 | `distillery-silent-success` | `bogocat.media_digest_runs` | `empty-mapping`, `empty-extraction`, `empty-review` |
 
 ## Reading the register
