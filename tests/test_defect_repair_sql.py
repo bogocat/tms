@@ -33,7 +33,24 @@ SEED = """
         (163, 'The Old Man And The Sea', 0, true),   -- skipped, no source text
         (240, 'Necropolitics', 1, true),             -- partial, no distillation
         (152, 'Oathbringer', 6, true),               -- genuine silent case (#173)
-        (999, 'Gained a distillation since', 3, false);
+        (999, 'Gained a distillation since', 3, false),
+        (555, 'Retried and core-extract worked', 3, true);  -- success since filing
+
+    -- The ledger: the sentence repair #1 writes asserts two facts about these
+    -- rows, so the repair only fires where they hold (see the WHERE clause).
+    CREATE TABLE bogocat.media_digest_runs (
+        item_id bigint, pass_id text, status text, error_detail text,
+        pipeline_version int);
+
+    INSERT INTO bogocat.media_digest_runs VALUES
+        (163, 'core-extract', 'skipped',
+         'insufficient-source-text: no epub body nor OCR sidecar found', 2),
+        (240, 'core-extract', 'skipped',
+         'insufficient-source-text: no epub body nor OCR sidecar found', 2),
+        (240, 'core-extract', 'failed', '{"error": "exit 1"}', 2),
+        (152, 'core-extract', 'success', NULL, 2),
+        (999, 'core-extract', 'success', NULL, 2),
+        (555, 'core-extract', 'success', NULL, 2);
 
     INSERT INTO tms_review.escaped_defects (
         defect_id, repo, defect_class, severity, discovered_at,
@@ -55,6 +72,10 @@ SEED = """
         (gen_random_uuid(), 'distillery', 'silent-failure', 'ungraded',
          '2026-11-19T00:00:00+00:00', 'detector', 'OLD unproven claim, book fixed',
          'pipeline-health:missing-distillation:999', 'pipeline-health',
+         NOW(), 2),
+        (gen_random_uuid(), 'distillery', 'silent-failure', 'ungraded',
+         '2026-11-19T00:00:00+00:00', 'detector', 'OLD unproven claim, retried',
+         'pipeline-health:missing-distillation:555', 'pipeline-health',
          NOW(), 2);
 """
 
@@ -95,6 +116,7 @@ def test_repair_relabels_the_unproven_rows_and_keeps_their_history(repair_db):
         "pipeline-health:insufficient-source-text:240",
         "pipeline-health:missing-distillation:152",
         "pipeline-health:missing-distillation:999",
+        "pipeline-health:missing-distillation:555",
     }, "the repair touched a row it should have left alone"
 
     label, recurrence, description = rows[
@@ -284,3 +306,162 @@ def test_the_preflight_refuses_to_run_after_the_corrected_producer_swept(
 
     assert "already swept" in excinfo.value.stderr
     assert "collide on (repo, fingerprint)" in excinfo.value.stderr
+
+
+def test_repair_leaves_a_missing_distillation_row_alone_if_extract_later_worked(
+        repair_db):
+    """The sentence repair #1 writes asserts `no core-extract run ever
+    succeeded`. Books are retried, so the UPDATE is guarded on that ledger fact:
+    a success between review and apply must leave the old row for a human, not
+    write a sentence the ledger already contradicts (and not make the next sweep
+    file a different signal for the same book)."""
+    service, db = repair_db
+
+    _psql(service, "-f", str(REPAIR), dbname=db)
+
+    (description,) = _rows(service, db, """
+        SELECT description FROM tms_review.escaped_defects
+         WHERE fingerprint = 'pipeline-health:missing-distillation:555'
+    """)[0]
+    assert description == "OLD unproven claim, retried"
+
+
+# ── the third one-shot repair: producer #1's junction-drift claim ─────
+
+JUNCTION = (Path(__file__).resolve().parent.parent / "schema" / "repairs"
+            / "2026-11-27-restate-junction-drift-claims.sql")
+
+JUNCTION_SEED = """
+    CREATE SCHEMA IF NOT EXISTS bogocat;
+    CREATE TABLE bogocat.v_pipeline_health_book (
+        item_id bigint, title text, passes_succeeded int,
+        is_missing_distillation boolean, is_missing_junctions boolean,
+        topics_count int, traditions_count int, quotes_count int);
+
+    INSERT INTO bogocat.v_pipeline_health_book VALUES
+        (152, 'Oathbringer', 6, false, true, 0, 4, 0),
+        (178, 'The Holy Bible', 6, false, true, 39, 0, 16),
+        (200, 'Healed since filing', 6, false, false, 6, 2, 3),
+        (300, 'The Sunlit Man', 6, false, true, 0, 4, 0);
+
+    INSERT INTO tms_review.escaped_defects (
+        defect_id, repo, defect_class, severity, discovered_at,
+        discovery_source, description, fingerprint, detector, last_seen_at,
+        recurrence_count)
+    VALUES
+        (gen_random_uuid(), 'distillery', 'silent-failure', 'ungraded',
+         '2026-11-19T00:00:00+00:00', 'detector',
+         'book 152 (Oathbringer) has a distillation but its junctions are incomplete (topics=0, traditions=4, quotes=0) — a pass recorded success without writing them',
+         'pipeline-health:junction-drift:152', 'pipeline-health', NOW(), 2),
+        (gen_random_uuid(), 'distillery', 'silent-failure', 'ungraded',
+         '2026-11-19T00:00:00+00:00', 'detector',
+         'book 178 (The Holy Bible) has a distillation but its junctions are incomplete (topics=39, traditions=0, quotes=16) — a pass recorded success without writing them',
+         'pipeline-health:junction-drift:178', 'pipeline-health', NOW(), 2),
+        (gen_random_uuid(), 'distillery', 'silent-failure', 'ungraded',
+         '2026-11-19T00:00:00+00:00', 'detector',
+         'book 200 (Healed since filing) has a distillation but its junctions are incomplete (topics=0, traditions=2, quotes=0) — a pass recorded success without writing them',
+         'pipeline-health:junction-drift:200', 'pipeline-health', NOW(), 2),
+        (gen_random_uuid(), 'distillery', 'silent-failure', 'ungraded',
+         '2026-11-19T00:00:00+00:00', 'detector',
+         'book 300 (The Sunlit Man) has a distillation but its junction rows are incomplete (topics=0, traditions=4, quotes=0). The view proves the junctions are incomplete; it does not say which step dropped them (the canonical_map projection, #171, owns that).',
+         'pipeline-health:junction-drift:300', 'pipeline-health', NOW(), 1);
+"""
+
+
+@pytest.fixture()
+def junction_db():
+    service = os.environ.get(SERVICE_ENV)
+    if not service:
+        pytest.skip(f"set {SERVICE_ENV} to run the repair SQL")
+
+    db = f"tms_junctiontest_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    _psql(service, "-c", f'CREATE DATABASE "{db}"')
+    try:
+        for path in sorted(MIGRATIONS.glob("0*.sql")):
+            _psql(service, "-f", str(path), dbname=db)
+        _psql(service, "-c", JUNCTION_SEED, dbname=db)
+        yield service, db
+    finally:
+        _psql(service, "-c",
+              f'DROP DATABASE IF EXISTS "{db}" WITH (FORCE)', check=False)
+
+
+def _junction_rows(service, db):
+    return {row[0]: row for row in _rows(service, db, """
+        SELECT fingerprint, defect_id, recurrence_count, description
+          FROM tms_review.escaped_defects
+         WHERE fingerprint LIKE 'pipeline-health:junction-drift:%'
+    """)}
+
+
+def test_junction_repair_restates_only_the_proven_half(junction_db):
+    service, db = junction_db
+    before = _junction_rows(service, db)
+
+    _psql(service, "-f", str(JUNCTION), dbname=db)
+
+    rows = _junction_rows(service, db)
+    for item, traditions in ((152, 4), (178, 0)):
+        fingerprint = f"pipeline-health:junction-drift:{item}"
+        _, defect_id, recurrence, description = rows[fingerprint]
+        assert defect_id == before[fingerprint][1], "defect_id must not change"
+        assert recurrence == "2", "recurrence history must survive the restate"
+        assert "a pass recorded success without writing them" not in description
+        assert "The view proves the junctions are incomplete" in description
+        assert "#171" in description
+        assert f"traditions={traditions}, " in description, (
+            "the counts must come from the view, not the old sentence"
+        )
+
+
+def test_junction_repair_writes_the_producers_own_sentence(junction_db):
+    """The repair's SQL literal and the producer's f-string cannot drift: the
+    point of the repair is that the live rows say what a fresh sweep says."""
+    from tms.producers import pipeline_health
+
+    service, db = junction_db
+    _psql(service, "-f", str(JUNCTION), dbname=db)
+
+    (description,) = _rows(service, db, """
+        SELECT description FROM tms_review.escaped_defects
+         WHERE fingerprint = 'pipeline-health:junction-drift:178'
+    """)[0]
+
+    (finding,) = pipeline_health.find_findings(
+        [{"item_id": 178, "title": "The Holy Bible",
+          "passes_succeeded": 6, "is_missing_distillation": 0,
+          "is_missing_junctions": 1, "topics_count": 39,
+          "traditions_count": 0, "quotes_count": 16,
+          "near_verbatim_rate": None, "stale_running_count": 0}],
+        [],
+    )
+    assert finding.description == description
+
+
+def test_junction_repair_leaves_healed_books_and_corrected_rows_alone(
+        junction_db):
+    service, db = junction_db
+    before = _junction_rows(service, db)
+
+    _psql(service, "-f", str(JUNCTION), dbname=db)
+
+    rows = _junction_rows(service, db)
+    assert rows["pipeline-health:junction-drift:200"] == \
+        before["pipeline-health:junction-drift:200"], (
+        "a book whose junctions healed must keep its old row for a human, not be "
+        "given a sentence the view now contradicts"
+    )
+    assert rows["pipeline-health:junction-drift:300"] == \
+        before["pipeline-health:junction-drift:300"], (
+        "a row the corrected producer already filed must not be rewritten"
+    )
+
+
+def test_junction_repair_is_a_no_op_the_second_time(junction_db):
+    service, db = junction_db
+
+    _psql(service, "-f", str(JUNCTION), dbname=db)
+    after_first = _junction_rows(service, db)
+    _psql(service, "-f", str(JUNCTION), dbname=db)
+
+    assert _junction_rows(service, db) == after_first

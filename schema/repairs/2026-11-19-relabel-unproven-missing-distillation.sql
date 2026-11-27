@@ -95,7 +95,27 @@ UPDATE tms_review.escaped_defects d
  WHERE d.repo = 'distillery'
    AND d.fingerprint = 'pipeline-health:missing-distillation:' || b.item_id
    AND b.is_missing_distillation
-   AND b.passes_succeeded < 6;
+   AND b.passes_succeeded < 6
+   -- The new sentence asserts two ledger facts, so the UPDATE only fires where
+   -- they are true *now*. Books are actively being retried: a single successful
+   -- core-extract between review and apply would otherwise make this write a
+   -- false sentence, and the next sweep would file a second, different signal
+   -- for the same book. Same predicate the corrected producer applies.
+   AND NOT EXISTS (
+        SELECT 1 FROM bogocat.media_digest_runs r
+         WHERE r.item_id = b.item_id
+           AND r.pass_id = 'core-extract'
+           AND r.pipeline_version = 2
+           AND r.status = 'success'
+   )
+   AND EXISTS (
+        SELECT 1 FROM bogocat.media_digest_runs r
+         WHERE r.item_id = b.item_id
+           AND r.pass_id = 'core-extract'
+           AND r.pipeline_version = 2
+           AND r.status = 'skipped'
+           AND r.error_detail LIKE 'insufficient-source-text%'
+   );
 
 -- Post-check 1: the relabelled rows, as the register now reports them.
 SELECT repo, fingerprint, recurrence_count, detection_status
@@ -108,10 +128,11 @@ SELECT repo, fingerprint, recurrence_count, detection_status
  ORDER BY fingerprint;
 
 -- Post-check 2: the unproven `missing-distillation` rows this repair
--- deliberately does NOT touch — the book has since gained a distillation, or all
--- six passes now succeed (that one is the genuine #173 shape and keeps its
--- claim). Zero rows means every remaining `missing-distillation` row is proven;
--- anything listed here needs a human look.
+-- deliberately does NOT touch — the book has since gained a distillation, all
+-- six passes now succeed (the genuine #173 shape, which keeps its claim), or a
+-- core-extract run has succeeded since (so the new sentence would be false).
+-- Zero rows means every remaining `missing-distillation` row is proven; anything
+-- listed here needs a human look.
 SELECT d.fingerprint, b.is_missing_distillation, b.passes_succeeded
   FROM tms_review.escaped_defects d
   LEFT JOIN bogocat.v_pipeline_health_book b

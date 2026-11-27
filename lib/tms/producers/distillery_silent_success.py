@@ -36,7 +36,11 @@ finds). ``since_days`` exists for callers that want a cheap nightly sweep over
 recent runs only.
 
 CLI:
-``python3 -m tms.producers.distillery_silent_success [--repo R] [--since-days N] [--dry-run]``
+``PYTHONPATH=lib python3 -m tms.producers.distillery_silent_success [--repo R] [--since-days N] [--dry-run]``
+
+(The ``PYTHONPATH=lib`` is required from the repo root — the package is under
+``lib/``, so omitting it makes the scheduled sweep die at import and report no
+findings.)
 """
 
 import datetime

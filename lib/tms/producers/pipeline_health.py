@@ -63,10 +63,12 @@ exist), and it is not filed, because the only fact the ledger proves is absence:
 a ``running`` run may be in flight right now, and "no failure was recorded yet"
 is not "a failure happened" (ADR-003: absence of evidence may not select a
 negative claim). Filing it would be the unsupported assertion this module exists
-to stop. Zero live rows match it today; if one appears, the honest fix is a
-detector that can distinguish "still running past the threshold" (which the view
-already reports as ``stale-run``) from "finished without a status worth naming".
-Pinned by ``test_an_unexplained_missing_distillation_is_a_known_gap``.
+to stop. As of 2026-11-27 exactly one live book is in this state (item 21586,
+`passes_succeeded = 1`, no successful, failed or skip-with-reason core-extract
+run) and it stays unfiled — the gap is observable rather than hypothetical, and
+that is the honest answer until a detector can distinguish "still running" from
+"finished without a status worth naming". Pinned by
+``test_an_unexplained_missing_distillation_is_a_known_gap``.
 
 Repo: ``distillery`` by default. The *detector* is home-portal's health page, but
 the defect is in the book-digest pipeline — distillery writes
@@ -74,8 +76,13 @@ the defect is in the book-digest pipeline — distillery writes
 and the run ledger. Filing it against home-portal would send the future reader to
 the wrong repository. ``--repo`` overrides it.
 
-CLI: ``python3 -m tms.producers.pipeline_health [--repo R] [--dry-run]``
+CLI: ``PYTHONPATH=lib python3 -m tms.producers.pipeline_health [--repo R] [--dry-run]``
 (scheduled by #159; this module only defines the sweep).
+
+The ``PYTHONPATH`` is part of the documented invocation, not a local habit: the
+package lives in ``lib/``, so a scheduler that runs the module from the repo root
+without it dies with ``ModuleNotFoundError: No module named 'tms'`` — a silent
+non-sweep that looks exactly like "no defects today".
 """
 
 import sys
