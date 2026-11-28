@@ -112,6 +112,8 @@ exist yet.
 """
 
 import datetime
+import json
+import os
 import re
 import sys
 import uuid
@@ -376,6 +378,63 @@ def _classify(row, new_defect_id):
             detector)
 
 
+def _validate_intake(repo, defect_class, fingerprint, description, detector,
+                     discovery_source, severity=UNGRADED, discovered_at=None):
+    """Everything intake refuses to write must be refused here first.
+
+    Shared by :func:`record_defect` and the CLI's ``--dry-run``, so a dry run is
+    a real validation and not a cheaper approximation of one. The note that
+    matters for a dry run is ``discovered_at``: it is the one argument the
+    database, not this module, would otherwise be the first to judge
+    (``TIMESTAMPTZ`` input syntax), which turned a dry-run pass into a
+    write-time traceback rather than the documented exit 2.
+    """
+    if not isinstance(repo, str) or not repo.strip():
+        raise ValueError(f"repo must be a non-empty string, got {repo!r}")
+    if repo != repo.strip():
+        raise ValueError(f"repo may not have surrounding whitespace, "
+                         f"got {repo!r}")
+    if defect_class not in DEFECT_CLASSES:
+        raise ValueError(
+            f"defect_class must be one of {sorted(DEFECT_CLASSES)}, "
+            f"got {defect_class!r}")
+    if not isinstance(description, str) or not description.strip():
+        raise ValueError(
+            f"description must be a non-empty string, got {description!r}")
+    if not isinstance(severity, str) or not severity.strip():
+        # severity is NOT NULL in postgres, so a None/'' reaching the insert
+        # surfaces as a NotNullViolation from the driver — the wrong layer, and
+        # after the row's uuid has been minted. Reject it here with the argument
+        # named, exactly like description.
+        raise ValueError(
+            "severity must be a non-empty string (use 'ungraded' when a "
+            f"detector cannot grade severity), got {severity!r}")
+    validate_fingerprint(fingerprint, detector)
+    _resolve_discovery_source(detector, discovery_source)
+    _validate_discovered_at(discovered_at)
+
+
+def _validate_discovered_at(value):
+    """ISO 8601 or nothing. Postgres is the wrong layer to find this out.
+
+    Accepts what ``psycopg2`` accepts for a ``TIMESTAMPTZ`` in practice: an ISO
+    8601 string (``2026-11-19T00:00:00+00:00``, with a space separator, a
+    ``Z`` suffix, or a naive local-ish value). A ``datetime`` is passed through
+    untouched; it is already the right type.
+    """
+    if value is None or isinstance(value, datetime.datetime):
+        return
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            f"discovered_at must be an ISO 8601 timestamp, got {value!r}")
+    try:
+        datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(
+            f"discovered_at must be an ISO 8601 timestamp "
+            f"(e.g. 2026-11-19T00:00:00+00:00), got {value!r}") from None
+
+
 def record_defect(repo, defect_class, fingerprint, description, *,
                   detector=None, severity=UNGRADED, discovery_source=None,
                   introducing_pr=None, introducing_commit=None,
@@ -417,31 +476,8 @@ def record_defect(repo, defect_class, fingerprint, description, *,
         "recorded fresh". Its ``detector`` is the **row's** detector as read
         back, not the argument, so a record cannot understate ownership.
     """
-    if not isinstance(repo, str) or not repo.strip():
-        raise ValueError(f"repo must be a non-empty string, got {repo!r}")
-    if repo != repo.strip():
-        # Dedupe is per (repo, fingerprint), so a padded repo forks the register:
-        # the same bug becomes two rows and every `WHERE repo = …` query misses
-        # one. Rejecting names the caller's bug; silently stripping would file a
-        # row under a repo the caller never asked for.
-        raise ValueError(f"repo may not have surrounding whitespace, "
-                         f"got {repo!r}")
-    if defect_class not in DEFECT_CLASSES:
-        raise ValueError(
-            f"defect_class must be one of {sorted(DEFECT_CLASSES)}, "
-            f"got {defect_class!r}")
-    if not isinstance(description, str) or not description.strip():
-        raise ValueError(
-            f"description must be a non-empty string, got {description!r}")
-    if not isinstance(severity, str) or not severity.strip():
-        # severity is NOT NULL in postgres, so a None/'' reaching the insert
-        # surfaces as a NotNullViolation from the driver — the wrong layer, and
-        # after the row's uuid has been minted. Reject it here with the argument
-        # named, exactly like description.
-        raise ValueError(
-            "severity must be a non-empty string (use 'ungraded' when a "
-            f"detector cannot grade severity), got {severity!r}")
-    validate_fingerprint(fingerprint, detector)
+    _validate_intake(repo, defect_class, fingerprint, description, detector,
+                     discovery_source, severity, discovered_at)
     source = _resolve_discovery_source(detector, discovery_source)
 
     sighting = _iso(discovered_at or _now())
@@ -480,5 +516,133 @@ def record_defect(repo, defect_class, fingerprint, description, *,
     )
 
 
-if __name__ == "__main__":  # pragma: no cover - CLI lands in the next commit
-    sys.exit("tms defect: CLI wiring not implemented yet")
+# ── CLI ──────────────────────────────────────────────────────────
+
+
+def _build_parser():
+    """``tms defect`` — file one defect with full intake semantics.
+
+    The escape hatch that keeps the register complete when a detector does not
+    exist yet: same validation, same dedupe, same outcome report as a producer
+    calling :func:`record_defect` directly.
+
+    argparse rather than the hand-rolled parsers used elsewhere in ``lib/tms``:
+    eleven flags with two required-word options and a boolean, where a typo'd
+    flag must fail loudly instead of being silently ignored.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="tms defect",
+        description="File a defect into tms_review.escaped_defects. "
+                    "Idempotent per (repo, fingerprint): a second sighting "
+                    "bumps the row's recurrence count, it never inserts.",
+        epilog="Fingerprint convention: <detector>:<signal>:<stable-key>, e.g. "
+               "pipeline-health:junction-drift:152. Hand-filed rows use "
+               "manual:<sha256> and omit --detector. Exit status is 0 for all "
+               "three outcomes (inserted/recurred/regressed) — 'recurred' is "
+               "a successful intake, not a failure.",
+    )
+    parser.add_argument("--repo", required=True,
+                        help="fleet short name (home-portal, distillery, tms, ...)")
+    parser.add_argument("--class", dest="defect_class", required=True,
+                        help="one of: " + ", ".join(sorted(DEFECT_CLASSES)))
+    parser.add_argument("--fingerprint", required=True,
+                        help="stable identity of the bug '<detector>:<signal>:<key>'")
+    parser.add_argument("--description", required=True,
+                        help="what was observed (first sight is kept forever)")
+    parser.add_argument("--detector", default=None,
+                        help="id of the re-runnable check that saw this; "
+                             "omit when no automatic re-check exists")
+    parser.add_argument("--severity", default=UNGRADED,
+                        help=f"free-form severity (default: {UNGRADED})")
+    parser.add_argument("--source", dest="discovery_source", default=None,
+                        help="discovery_source (default: detector if "
+                             "--detector given, else manual); one of: "
+                             + ", ".join(sorted(DISCOVERY_SOURCES)))
+    parser.add_argument("--introducing-pr", type=int, default=None,
+                        help="PR that introduced the defect, when known")
+    parser.add_argument("--introducing-commit", default=None,
+                        help="commit that introduced the defect, when known")
+    parser.add_argument("--discovered-at", default=None,
+                        help="ISO 8601 sighting time (default: now)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="validate and print what would be filed; write nothing")
+    parser.add_argument("--json", action="store_true",
+                        help="machine-readable output")
+    return parser
+
+
+def main(argv=None):
+    """Entry point for ``tms defect``. Returns a process exit status.
+
+    0 = the sighting was recorded (any of inserted/recurred/regressed).
+    2 = intake rejected it (bad fingerprint, unknown class/source, ...); nothing
+        was written.
+
+    A caller that needs to *react* to a new defect should read ``outcome`` from
+    ``--json`` — exit status deliberately does not conflate "recorded" with
+    "this bug is new", because both are success and only one is news.
+
+    Anything that escapes as an exception (driver down, connection refused) is
+    reported as ``tms defect: <message>`` with status 2 rather than a traceback
+    and status 1: a script that parses stderr should not have to tell a
+    ``ValueError`` from a ``psycopg2.OperationalError``. Set ``TMS_DEBUG=1`` to
+    keep the traceback.
+    """
+    args = _build_parser().parse_args(argv)
+
+    try:
+        if args.dry_run:
+            _validate_intake(
+                args.repo, args.defect_class, args.fingerprint,
+                args.description, args.detector, args.discovery_source,
+                args.severity, args.discovered_at)
+            source = _resolve_discovery_source(args.detector,
+                                               args.discovery_source)
+            plan = {
+                "outcome": "would-file",
+                "repo": args.repo,
+                "defect_class": args.defect_class,
+                "fingerprint": args.fingerprint,
+                "description": args.description,
+                "detector": args.detector,
+                "discovery_source": source,
+                "severity": args.severity,
+                "introducing_pr": args.introducing_pr,
+                "introducing_commit": args.introducing_commit,
+                "discovered_at": args.discovered_at,
+            }
+            print(json.dumps(plan) if args.json else
+                  f"would file {args.repo}/{args.fingerprint} "
+                  f"class={args.defect_class} detector={args.detector or '-'} "
+                  f"source={source} severity={args.severity} "
+                  f"discovered_at={args.discovered_at or 'now'} "
+                  f"description={args.description!r} "
+                  "(dry run — nothing written)")
+            return 0
+
+        record = record_defect(
+            repo=args.repo,
+            defect_class=args.defect_class,
+            fingerprint=args.fingerprint,
+            description=args.description,
+            detector=args.detector,
+            severity=args.severity,
+            discovery_source=args.discovery_source,
+            introducing_pr=args.introducing_pr,
+            introducing_commit=args.introducing_commit,
+            discovered_at=args.discovered_at,
+        )
+    except Exception as exc:  # noqa: BLE001 - the CLI's edge, by design
+        if os.environ.get("TMS_DEBUG"):
+            raise
+        print(f"tms defect: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(record.as_dict()) if args.json else str(record))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
