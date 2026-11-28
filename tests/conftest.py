@@ -48,6 +48,41 @@ CREATE TABLE IF NOT EXISTS reviewer_runs (
 );
 """
 
+# Defect register, 008/009 shape (tms#156/#157). The 008 partial unique
+# index and the four status-arm CHECKs are reproduced here because the intake
+# upsert's ON CONFLICT target is that index — a shim table without it would
+# let a broken conflict target pass the unit tests.
+_CREATE_ESCAPED_DEFECTS_TABLE = """
+CREATE TABLE IF NOT EXISTS escaped_defects (
+    defect_id           TEXT PRIMARY KEY,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    repo                TEXT NOT NULL,
+    introducing_pr      INTEGER,
+    introducing_commit  TEXT,
+    defect_class        TEXT NOT NULL,
+    severity            TEXT NOT NULL,
+    discovered_at       TEXT NOT NULL,
+    discovery_source    TEXT NOT NULL,
+    description         TEXT NOT NULL,
+    fix_pr              INTEGER,
+    fingerprint         TEXT,
+    recurrence_count    INTEGER NOT NULL DEFAULT 1,
+    detector            TEXT,
+    last_seen_at        TEXT,
+    merged_at           TEXT,
+    verified_at         TEXT,
+    deployed_sha        TEXT,
+    regressed_at        TEXT,
+    regression_count    INTEGER NOT NULL DEFAULT 0,
+    CHECK (regressed_at IS NULL OR detector IS NOT NULL),
+    CHECK (regressed_at IS NULL OR merged_at IS NOT NULL),
+    CHECK (verified_at IS NULL OR merged_at IS NOT NULL),
+    CHECK (verified_at IS NULL OR detector IS NOT NULL)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_escaped_defects_repo_fingerprint
+    ON escaped_defects (repo, fingerprint) WHERE fingerprint IS NOT NULL;
+"""
+
 _CREATE_EVENTS_TABLE = """
 CREATE TABLE IF NOT EXISTS events (
     id              TEXT PRIMARY KEY,
@@ -141,7 +176,8 @@ def test_db(monkeypatch):
 
     _conn = sqlite3.connect(":memory:")
     for schema_sql in [_CREATE_EVENTS_TABLE, _CREATE_OUTCOMES_TABLE,
-                       _CREATE_REVIEWER_RUNS_TABLE, _CREATE_LLM_CALL_LOG_TABLE]:
+                       _CREATE_REVIEWER_RUNS_TABLE, _CREATE_LLM_CALL_LOG_TABLE,
+                       _CREATE_ESCAPED_DEFECTS_TABLE]:
         for stmt in schema_sql.split(";"):
             stmt = stmt.strip()
             if stmt:
